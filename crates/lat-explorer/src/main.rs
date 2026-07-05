@@ -20,8 +20,6 @@ use lat_types::{Address, Network, Transaction};
 use lat_wallet::Wallet;
 use rand::rngs::OsRng;
 
-const ACCENT: &str = "#F5A03C";
-
 /// The Latebra logo mark as an inline SVG data-URI — used for the browser
 /// favicon and the header brand mark. Orange rounded "LD" monogram whose right
 /// edge dissolves into pixels (privacy: data scattering away).
@@ -89,33 +87,39 @@ fn handle(stream: TcpStream, cfg: &Config) -> std::io::Result<()> {
     };
     let node = cfg.node(net);
 
-    let body = if path == "/search" {
+    let (ctype, body): (&str, String) = if path == "/feed" {
+        // Live JSON feed for the home page's client-side poller — this is what
+        // makes new blocks/transactions slide in smoothly without a full reload.
+        ("application/json", render_feed_json(node, net))
+    } else if path == "/search" {
         // A search query is either a block height (a number) or an address.
         let q = params.get("q").map(|q| q.trim().to_string()).unwrap_or_default();
-        if let Ok(h) = q.parse::<u64>() {
+        let html = if let Ok(h) = q.parse::<u64>() {
             render_block(node, h, net)
         } else if Address::parse(&q).is_ok() {
             render_address(node, &q, net)
         } else {
             render_home(node, net)
-        }
+        };
+        ("text/html; charset=utf-8", html)
     } else if let Some(rest) = path.strip_prefix("/address/") {
-        render_address(node, rest.trim_end_matches('/'), net)
+        ("text/html; charset=utf-8", render_address(node, rest.trim_end_matches('/'), net))
     } else if let Some(rest) = path.strip_prefix("/block/") {
-        match rest.trim_end_matches('/').parse::<u64>() {
+        let html = match rest.trim_end_matches('/').parse::<u64>() {
             Ok(h) => render_block(node, h, net),
             Err(_) => render_home(node, net),
-        }
+        };
+        ("text/html; charset=utf-8", html)
     } else if path == "/faucet" {
-        render_faucet(node, net, &params)
+        ("text/html; charset=utf-8", render_faucet(node, net, &params))
     } else {
-        render_home(node, net)
+        ("text/html; charset=utf-8", render_home(node, net))
     };
 
     let mut stream = stream;
     write!(
         stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+        "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
         body.len(),
         body
     )
@@ -147,7 +151,7 @@ fn render_home(node: &str, net: &str) -> String {
 
     // Fetch the latest blocks once; reuse for stats, block rows and tx rows.
     let start = height;
-    let end = start.saturating_sub(19);
+    let end = start.saturating_sub(11);
     let mut blocks: Vec<(u64, Block)> = Vec::new();
     for h in (end..=start).rev() {
         if let Some(b) = fetch_block(node, h) {
@@ -160,42 +164,39 @@ fn render_home(node: &str, net: &str) -> String {
     let net_label = if net == "mainnet" { "Mainnet" } else { "Testnet" };
 
     let stats = format!(
-        "<div class='stats'>{}{}{}{}</div>",
-        scard(IC_BLOCK, "Latest block", &format!("#{}", commafy(height))),
-        scard(IC_COIN, "Block reward", &format!("{} LAT", fmt_lat(reward))),
-        scard(IC_CLOCK, "Avg block time", &avg.map(|s| format!("{s:.1}s")).unwrap_or_else(|| "—".into())),
-        scard(IC_NET, "Network", net_label),
+        "<div class='stats'>
+           <div class='scard'><div class='sic'>{IC_BLOCK}</div><div class='sbody'><div class='lab'>Latest block</div><div class='val mono' id='st-h'>#{}</div></div></div>
+           <div class='scard'><div class='sic'>{IC_CLOCK}</div><div class='sbody'><div class='lab'>Avg block time</div><div class='val mono' id='st-avg'>{}</div></div></div>
+           <div class='scard'><div class='sic'>{IC_COIN}</div><div class='sbody'><div class='lab'>Block reward</div><div class='val mono' id='st-rw'>{} <small>LAT</small></div></div></div>
+           <div class='scard'><div class='sic'>{IC_NET}</div><div class='sbody'><div class='lab'>Network</div><div class='val'>{} <span class='live'></span></div></div></div>
+         </div>",
+        commafy(height),
+        avg.map(|s| format!("{s:.1}s")).unwrap_or_else(|| "—".into()),
+        fmt_lat(reward),
+        net_label,
     );
 
-    // Latest blocks panel.
+    // Latest blocks + transactions — the same row markup the /feed poller emits,
+    // so freshly-arrived rows match the server-rendered ones exactly.
     let mut brows = String::new();
     for (h, b) in blocks.iter().take(8) {
-        let miner = if b.header.miner == [0u8; 32] { "—".to_string() } else { short(&b.header.miner) };
-        brows.push_str(&format!(
-            "<div class='row'>
-               <div class='ic'>{IC_BLOCK}</div>
-               <div class='mid'><div class='t1'><a href='/block/{h}?net={net}'>#{h}</a></div>
-                 <div class='t2'>{} ago</div></div>
-               <div class='rt'>{} txns<br><span class='muted hash'>{}</span></div>
-             </div>",
-            ago(b.header.timestamp), b.txs.len(), miner
-        ));
+        brows.push_str(&home_block_row(*h, b, net));
     }
-    if brows.is_empty() { brows.push_str("<div class='row muted'>No blocks yet.</div>"); }
+    if brows.is_empty() { brows.push_str("<div class='empty'>No blocks yet.</div>"); }
 
-    // Latest transactions panel (flatten recent blocks' txs).
     let mut trows = String::new();
     let mut count = 0;
     'outer: for (h, b) in &blocks {
-        for tx in &b.txs {
+        for (i, tx) in b.txs.iter().enumerate() {
             if count >= 8 { break 'outer; }
-            trows.push_str(&tx_row(tx, *h, net, &b.header.timestamp));
+            trows.push_str(&home_tx_row(tx, *h, i, net));
             count += 1;
         }
     }
-    if trows.is_empty() { trows.push_str("<div class='row muted'>No transactions yet.</div>"); }
+    if trows.is_empty() { trows.push_str("<div class='empty'>No transactions yet.</div>"); }
 
     let latest = format!("/block/{height}?net={net}");
+    let script = feed_script(net);
     let body = format!(
         "<div class='hero'><div class='wrap'>
            <h1>The Latebra {net_label} explorer</h1>
@@ -208,14 +209,15 @@ fn render_home(node: &str, net: &str) -> String {
          <div class='wrap'>
            {stats}
            <div class='cols'>
-             <div class='panel'><div class='ph'>Latest blocks</div>{brows}
-               <a class='pf' href='{latest}'>View latest block</a></div>
-             <div class='panel'><div class='ph'>Latest transactions</div>{trows}
-               <a class='pf' href='{latest}'>View latest block</a></div>
+             <div class='panel'><div class='ph'>Latest blocks<span class='live'></span></div><div class='feed' id='feed-blocks'>{brows}</div><a class='pf' href='{latest}'>View latest block →</a></div>
+             <div class='panel'><div class='ph'>Latest transactions<span class='live'></span></div><div class='feed' id='feed-txs'>{trows}</div><a class='pf' href='{latest}'>View latest block →</a></div>
            </div>
-         </div>"
+         </div>
+         <script>{script}</script>"
     );
-    page("Latscan — Latebra explorer", &body, net, &format!("Height {}", commafy(height)), true)
+    // refresh=false: the client-side poller keeps this page live now, so no crude
+    // full-page meta-refresh (which would reset scroll and kill the animations).
+    page("Latscan — Latebra explorer", &body, net, &format!("Height {}", commafy(height)), false)
 }
 
 // --- block page ------------------------------------------------------------
@@ -678,81 +680,275 @@ fn page(title: &str, body: &str, net: &str, status: &str, refresh: bool) -> Stri
     )
 }
 
-fn scard(icon: &str, label: &str, value: &str) -> String {
-    format!("<div class='scard'><div class='ic'>{icon}</div><div><div class='lab'>{label}</div><div class='val'>{value}</div></div></div>")
+// --- live home feed (client-polled for smooth new-row motion) ---------------
+
+/// JSON payload the home page's poller fetches every few seconds: the current
+/// height/avg/reward, plus the newest block and transaction rows (same markup as
+/// the server-rendered ones, each carrying a `data-k` so the client only
+/// animates in rows it hasn't seen).
+fn render_feed_json(node: &str, net: &str) -> String {
+    let height = match lat_p2p::get_height(node) {
+        Ok(h) => h,
+        Err(_) => return "{\"height\":0,\"blocks\":[],\"txs\":[]}".to_string(),
+    };
+    let end = height.saturating_sub(11);
+    let mut blocks: Vec<(u64, Block)> = Vec::new();
+    for h in (end..=height).rev() {
+        if let Some(b) = fetch_block(node, h) {
+            blocks.push((h, b));
+        }
+    }
+    let avg = avg_block_time(&blocks).map(|s| format!("{s:.1}s")).unwrap_or_else(|| "—".into());
+    let reward = fmt_lat(emission(height));
+    let mut brows: Vec<String> = Vec::new();
+    for (h, b) in blocks.iter().take(8) {
+        brows.push(json_string(&home_block_row(*h, b, net)));
+    }
+    let mut trows: Vec<String> = Vec::new();
+    'outer: for (h, b) in &blocks {
+        for (i, tx) in b.txs.iter().enumerate() {
+            if trows.len() >= 8 {
+                break 'outer;
+            }
+            trows.push(json_string(&home_tx_row(tx, *h, i, net)));
+        }
+    }
+    format!(
+        "{{\"height\":{height},\"avg\":\"{avg}\",\"reward\":\"{reward}\",\"blocks\":[{}],\"txs\":[{}]}}",
+        brows.join(","),
+        trows.join(",")
+    )
 }
 
-fn css() -> String {
+/// One block row for the home feed. Single-line (so it embeds cleanly in JSON)
+/// and keyed by height so the poller can dedupe.
+fn home_block_row(h: u64, b: &Block, net: &str) -> String {
+    let miner = if b.header.miner == [0u8; 32] { "—".to_string() } else { short(&b.header.miner) };
     format!(
-        ":root{{--accent:{ACCENT};--accent-d:#ffbe6e;--bg:#131316;--surface:#1c1c22;--surface2:#26262e;--ink:#f3f3f6;--muted:#9a9aa6;--faint:#6c6c78;--line:rgba(255,255,255,.08);--soft:rgba(245,160,60,.13)}}
-        *{{box-sizing:border-box}}
-        body{{margin:0;background:radial-gradient(1100px 520px at 50% -8%,#2c2114 0%,rgba(44,33,20,0) 60%),var(--bg);color:var(--ink);font:14px/1.55 'Inter',system-ui,-apple-system,Segoe UI,sans-serif}}
-        a{{color:var(--accent);text-decoration:none}} a:hover{{color:var(--accent-d)}}
-        .wrap{{max-width:1200px;margin:0 auto;padding:0 16px}}
-        .strip{{background:rgba(255,255,255,.02);border-bottom:1px solid var(--line);font-size:12px;color:var(--muted)}}
-        .strip .wrap{{display:flex;justify-content:space-between;align-items:center;height:34px}}
-        .netbadge{{color:var(--accent);margin-left:6px}}
-        .hdr{{background:rgba(19,19,22,.7);backdrop-filter:blur(10px);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:10}}
-        .hdr .wrap{{display:flex;align-items:center;height:62px}}
-        .brand{{display:flex;align-items:center;gap:10px;font-weight:700;font-size:18px;color:var(--ink)}}
-        .brand:hover{{color:var(--ink)}}
-        .brandlogo{{width:26px;height:26px;display:block;filter:drop-shadow(0 2px 6px rgba(245,160,60,.35))}}
-        .nav{{display:flex;gap:14px;margin-left:auto;align-items:center;font-weight:500}}
-        .nav a{{color:var(--ink)}} .nav a:hover{{color:var(--accent)}}
-        .pill{{padding:5px 12px;border-radius:999px;border:1px solid var(--line);font-size:13px;font-weight:600;color:var(--muted)}}
-        .pill:hover{{color:var(--accent)}}
-        .pill.active{{background:var(--soft);color:var(--accent);border-color:rgba(245,160,60,.4)}}
-        .hero{{background:linear-gradient(180deg,rgba(245,160,60,.10),rgba(245,160,60,0));border-bottom:1px solid var(--line);padding:30px 0 78px}}
-        .hero h1{{font-size:22px;margin:0 0 16px;font-weight:700;letter-spacing:-.2px}}
-        .searchbar{{display:flex;max-width:720px;background:var(--surface);border:1px solid var(--line);border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,.35);overflow:hidden}}
-        .searchbar input{{flex:1;border:0;padding:13px 15px;font-size:14px;outline:none;background:transparent;color:var(--ink)}}
-        .searchbar input::placeholder{{color:var(--faint)}}
-        .searchbar button{{border:0;background:var(--accent);color:#2a1a05;padding:0 22px;font-weight:700;cursor:pointer}}
-        .searchbar button:hover{{background:var(--accent-d)}}
-        .stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-top:-50px;margin-bottom:24px}}
-        @media(max-width:820px){{.stats{{grid-template-columns:repeat(2,1fr)}}}}
-        .scard{{background:var(--surface);border:1px solid var(--line);border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.28);padding:16px 17px;display:flex;gap:12px;align-items:center}}
-        .scard .ic{{width:42px;height:42px;border-radius:12px;background:var(--soft);color:var(--accent);display:flex;align-items:center;justify-content:center;flex:none}}
-        .scard .ic svg{{width:21px;height:21px}}
-        .scard .lab{{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}}
-        .scard .val{{font-size:17px;font-weight:700;margin-top:2px}}
-        .cols{{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:28px}}
-        @media(max-width:820px){{.cols{{grid-template-columns:1fr}}}}
-        .panel,.card{{background:var(--surface);border:1px solid var(--line);border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.24);overflow:hidden}}
-        .card{{margin-bottom:20px}}
-        .panel .ph,.card .ph{{padding:15px 18px;border-bottom:1px solid var(--line);font-weight:700;font-size:15px}}
-        .row{{display:flex;align-items:center;gap:12px;padding:13px 18px;border-bottom:1px solid var(--line)}}
-        .row:last-of-type{{border-bottom:none}}
-        .row:hover{{background:rgba(255,255,255,.02)}}
-        .row .ic{{width:38px;height:38px;border-radius:11px;background:var(--soft);color:var(--accent);display:flex;align-items:center;justify-content:center;flex:none}}
-        .row .ic svg{{width:19px;height:19px}}
-        .row .mid{{flex:1;min-width:0;overflow:hidden}}
-        .row .t1{{font-weight:600}} .row .t2{{font-size:12.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
-        .row .rt{{text-align:right;font-size:12.5px;color:var(--muted);white-space:nowrap}}
-        .pf{{display:block;padding:13px 18px;text-align:center;font-weight:600;border-top:1px solid var(--line);background:rgba(255,255,255,.02);color:var(--accent)}}
-        .kv{{display:grid;grid-template-columns:210px 1fr;gap:10px;padding:13px 18px;border-bottom:1px solid var(--line);font-size:13.5px}}
-        .kv:last-child{{border-bottom:none}} .kv .k{{color:var(--muted)}}
-        .bnav{{display:flex;justify-content:space-between;align-items:center;background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:11px 16px;margin-bottom:16px;font-weight:600}}
-        table{{width:100%;border-collapse:collapse}}
-        th,td{{text-align:left;padding:12px 18px;border-bottom:1px solid var(--line);font-size:13.5px}}
-        th{{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;background:rgba(255,255,255,.02)}}
-        tr:last-child td{{border-bottom:none}}
-        .hash{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#b7b7c4;word-break:break-all}}
-        .muted{{color:var(--muted)}}
-        .tag{{display:inline-block;padding:2px 9px;border-radius:7px;font-size:12px;font-weight:600;background:rgba(255,255,255,.05);border:1px solid var(--line);color:var(--muted)}}
-        .tag.xfer{{background:rgba(245,160,60,.14);color:#ffca8a;border-color:rgba(245,160,60,.3)}}
-        .tag.tok{{background:rgba(47,212,127,.12);color:#6fe3a8;border-color:rgba(47,212,127,.25)}}
-        .tag.reg{{background:rgba(120,150,255,.13);color:#a0b6ff;border-color:rgba(120,150,255,.28)}}
-        .tag.roll{{background:rgba(240,180,90,.12);color:#f0c58a;border-color:rgba(240,180,90,.25)}}
-        .tag.ct{{background:rgba(90,190,220,.14);color:#8fd4e8;border-color:rgba(90,190,220,.3)}}
-        .pill-amt{{background:var(--soft);color:var(--accent);border:1px solid rgba(245,160,60,.28);border-radius:7px;padding:1px 8px;font-size:12px;font-weight:600}}
-        code{{background:rgba(255,255,255,.06);padding:2px 6px;border-radius:6px;font-size:13px;color:#ffca8a}}
-        .fmsg{{border-radius:12px;padding:13px 16px;margin-bottom:18px;font-weight:600;border:1px solid}}
-        .fmsg.ok{{background:rgba(47,212,127,.1);color:#6fe3a8;border-color:rgba(47,212,127,.3)}}
-        .fmsg.err{{background:rgba(240,97,109,.1);color:#f4a3a9;border-color:rgba(240,97,109,.3)}}
-        footer{{background:rgba(255,255,255,.02);border-top:1px solid var(--line);margin-top:24px;padding:26px 0;color:var(--muted);font-size:13px}}
-        footer .cols2{{display:flex;justify-content:space-between;flex-wrap:wrap;gap:20px}} footer b{{color:var(--ink)}}"
+        "<div class='brow' data-k='{h}'><span class='bic'>{IC_BLOCK}</span><div class='bmid'><div class='bh'><a href='/block/{h}?net={net}'>#{h}</a></div><div class='bt'>{} ago</div></div><div class='brt'><span class='txns'>{} txns</span><div class='bm mono'>{}</div></div></div>",
+        ago(b.header.timestamp),
+        b.txs.len(),
+        miner
     )
+}
+
+/// One transaction row for the home feed: a method badge, the public route, and
+/// an honest amount (confidential/anonymous transfers read as such — the whole
+/// point of the chain). Keyed by `height-index` for dedup.
+fn home_tx_row(tx: &Transaction, h: u64, idx: usize, net: &str) -> String {
+    let (cls, label) = feed_badge(tx);
+    let route = tx_detail(tx).0;
+    let amount = feed_amount(tx);
+    format!(
+        "<div class='trow' data-k='{h}-{idx}'><span class='badge {cls}'>{label}</span><div class='tmid'><div class='troute mono'><a href='/block/{h}?net={net}'>{route}</a></div></div>{amount}</div>"
+    )
+}
+
+/// Method badge (colour class + short label) for the home feed. Colour splits
+/// the dual-state model at a glance: blue = transparent, violet = confidential.
+fn feed_badge(tx: &Transaction) -> (&'static str, &'static str) {
+    match tx {
+        Transaction::Register { .. } => ("b-reg", "Register"),
+        Transaction::Rollover { .. } => ("b-reg", "Rollover"),
+        Transaction::CreateToken { .. } => ("b-tk", "Token"),
+        Transaction::SolventTransfer { .. } => ("b-prv", "Private"),
+        Transaction::Shield { .. } => ("b-prv", "Shield"),
+        Transaction::ShieldStealth { .. } => ("b-prv", "Shield"),
+        Transaction::AnonTransfer { .. } => ("b-prv", "Anon"),
+        Transaction::PublicTransfer { .. } => ("b-pub", "Public"),
+        Transaction::Unshield { .. } => ("b-pub", "Unshield"),
+        Transaction::DeployContract { .. } => ("b-ct", "Deploy"),
+        Transaction::CallContract { .. } => ("b-ct", "Call"),
+    }
+}
+
+/// The right-hand amount cell for the home feed — visible amounts in LAT, but
+/// confidential/anonymous transfers reveal nothing (that is the feature).
+fn feed_amount(tx: &Transaction) -> String {
+    match tx {
+        Transaction::PublicTransfer { amount, .. } | Transaction::Unshield { amount, .. } => {
+            format!("<span class='tamt pos'>{} LAT</span>", fmt_lat(*amount))
+        }
+        Transaction::Shield { amount, .. } | Transaction::ShieldStealth { amount, .. } => {
+            format!("<span class='tamt'>{} LAT</span>", fmt_lat(*amount))
+        }
+        Transaction::SolventTransfer { .. } => "<span class='enc'>encrypted</span>".to_string(),
+        Transaction::AnonTransfer { .. } => "<span class='enc'>anonymous</span>".to_string(),
+        Transaction::CreateToken { supply, .. } => format!("<span class='tamt'>{}</span>", commafy(*supply)),
+        Transaction::DeployContract { code, .. } => format!("<span class='tamt muted'>{} B</span>", code.len()),
+        Transaction::CallContract { .. } => "<span class='tamt muted'>call</span>".to_string(),
+        Transaction::Register { .. } | Transaction::Rollover { .. } => "<span class='tamt muted'>—</span>".to_string(),
+    }
+}
+
+/// The home page's live poller: fetch `/feed` every few seconds, animate in the
+/// block/tx rows it hasn't shown yet, and tick the stat cards. `__NET__` is
+/// substituted (net is a fixed literal, so no escaping needed).
+fn feed_script(net: &str) -> String {
+    let js = r#"(function(){
+  var net='__NET__';
+  var h=document.getElementById('st-h'),av=document.getElementById('st-avg'),rw=document.getElementById('st-rw');
+  var bf=document.getElementById('feed-blocks'),tf=document.getElementById('feed-txs');
+  if(!bf||!tf)return;
+  var reduce=window.matchMedia&&matchMedia('(prefers-reduced-motion:reduce)').matches;
+  function merge(feed,rows){
+    var have={};for(var i=0;i<feed.children.length;i++){have[feed.children[i].getAttribute('data-k')]=1;}
+    for(var j=rows.length-1;j>=0;j--){
+      var t=document.createElement('div');t.innerHTML=rows[j];
+      var el=t.firstElementChild;if(!el)continue;
+      var k=el.getAttribute('data-k');if(have[k])continue;
+      el.className+=' fresh';feed.insertBefore(el,feed.firstChild);have[k]=1;
+    }
+    while(feed.children.length>8){feed.removeChild(feed.lastChild);}
+  }
+  function poll(){
+    fetch('/feed?net='+net).then(function(r){return r.json();}).then(function(d){
+      if(d.height&&h){h.textContent='#'+Number(d.height).toLocaleString();}
+      if(d.avg&&av){av.textContent=d.avg;}
+      if(d.reward&&rw){rw.innerHTML=d.reward+' <small>LAT</small>';}
+      merge(bf,d.blocks||[]);merge(tf,d.txs||[]);
+    }).catch(function(){});
+  }
+  if(!reduce){setInterval(poll,3000);}
+})();"#;
+    js.replace("__NET__", net)
+}
+
+/// Escape a string as a JSON string literal (quotes included). Used to embed
+/// server-rendered row HTML in the `/feed` payload.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn css() -> &'static str {
+    // High-contrast "Latscan" theme: near-black canvas, Space Grotesk display +
+    // JetBrains Mono for all data, one disciplined amber accent, blue/violet to
+    // split transparent vs confidential. Braces are literal (this is a value
+    // substituted into page()'s format!, not itself a format string).
+    r#"@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+:root{--bg:#08080a;--el:#0f0f12;--el2:#151519;--ln:rgba(255,255,255,.08);--ln2:rgba(255,255,255,.15);--tx:#fafafc;--mut:#6f6f7b;--am:#FFB43C;--am2:#ffc25e;--gr:#35d07f;--bl:#4c9bf5;--vi:#b98cf6;--rd:#ff5d6c}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(900px 420px at 50% -12%,#171019 0,#050506 62%),var(--bg);color:var(--tx);font:14px/1.55 'Space Grotesk',system-ui,-apple-system,Segoe UI,sans-serif;-webkit-font-smoothing:antialiased}
+a{color:var(--am);text-decoration:none}a:hover{color:var(--am2)}
+.wrap{max-width:1160px;margin:0 auto;padding:0 18px}
+.mono{font-family:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;font-variant-numeric:tabular-nums}
+.muted{color:var(--mut)}
+.strip{border-bottom:1px solid var(--ln);font-size:12px;color:var(--mut)}
+.strip .wrap{display:flex;justify-content:space-between;align-items:center;height:34px}
+.netbadge{color:var(--am);margin-left:6px}
+.hdr{background:rgba(8,8,10,.72);backdrop-filter:blur(12px);border-bottom:1px solid var(--ln);position:sticky;top:0;z-index:10}
+.hdr .wrap{display:flex;align-items:center;height:60px;gap:14px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:600;font-size:17px;color:var(--tx);letter-spacing:-.01em}
+.brand:hover{color:var(--tx)}
+.brandlogo{width:26px;height:26px;border-radius:7px;display:block}
+.nav{display:flex;gap:6px;margin-left:auto;align-items:center;font-weight:500}
+.nav a{color:var(--mut);padding:7px 11px;border-radius:9px}
+.nav a:hover{color:var(--tx);background:var(--el)}
+.pill{padding:6px 13px;border-radius:9px;font-size:12.5px;font-weight:600;color:var(--mut);border:1px solid var(--ln)}
+.pill:hover{color:var(--tx)}
+.pill.active{background:var(--am);color:#1a1200;border-color:transparent}
+.hero{padding:34px 0 26px;border-bottom:1px solid var(--ln)}
+.hero h1{font-size:26px;margin:0 0 16px;font-weight:600;letter-spacing:-.02em}
+.searchbar{display:flex;max-width:760px;background:var(--el);border:1px solid var(--ln);border-radius:13px;overflow:hidden;transition:border-color .18s}
+.searchbar:focus-within{border-color:var(--ln2)}
+.searchbar input{flex:1;border:0;padding:14px 16px;font-size:14px;outline:none;background:transparent;color:var(--tx);font-family:inherit}
+.searchbar input::placeholder{color:var(--mut)}
+.searchbar button{border:0;background:var(--am);color:#1a1200;padding:0 24px;font-weight:600;font-family:inherit;font-size:14px;cursor:pointer;transition:background .18s}
+.searchbar button:hover{background:var(--am2)}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:22px 0}
+.scard{background:var(--el);border:1px solid var(--ln);border-radius:14px;padding:15px 16px;display:flex;gap:12px;align-items:center;animation:rise .5s cubic-bezier(.2,.8,.2,1) both}
+.scard:nth-child(2){animation-delay:.06s}.scard:nth-child(3){animation-delay:.12s}.scard:nth-child(4){animation-delay:.18s}
+.sic{width:40px;height:40px;border-radius:11px;background:rgba(255,180,60,.12);color:var(--am);display:flex;align-items:center;justify-content:center;flex:none}
+.sic svg{width:20px;height:20px}
+.lab{font-size:10.5px;text-transform:uppercase;letter-spacing:.12em;color:var(--mut);font-weight:500}
+.val{font-size:20px;font-weight:600;margin-top:4px;letter-spacing:-.01em}
+.val small{font-size:12px;color:var(--mut);font-weight:500}
+.live{width:7px;height:7px;border-radius:50%;background:var(--gr);display:inline-block;vertical-align:middle;box-shadow:0 0 0 0 rgba(53,208,127,.6);animation:beat 2.2s infinite}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:30px}
+.panel,.card{background:var(--el);border:1px solid var(--ln);border-radius:16px;overflow:hidden;animation:rise .5s cubic-bezier(.2,.8,.2,1) both}
+.cols .panel:nth-child(2){animation-delay:.08s}
+.card{margin-bottom:18px}
+.panel .ph,.card .ph{display:flex;align-items:center;gap:9px;padding:15px 17px;border-bottom:1px solid var(--ln);font-weight:600;font-size:14.5px}
+.panel .ph .live{margin-left:auto}
+.feed{padding:5px 8px}
+.brow,.trow{display:flex;align-items:center;gap:11px;padding:11px 9px;border-radius:11px}
+.brow+.brow,.trow+.trow{border-top:1px solid var(--ln)}
+.brow:hover,.trow:hover{background:var(--el2)}
+.fresh{animation:slidein .55s cubic-bezier(.2,.8,.2,1),flash 1.6s ease}
+.bic{width:34px;height:34px;border-radius:9px;flex:none;display:flex;align-items:center;justify-content:center;background:#17171d;color:var(--mut)}
+.bic svg{width:17px;height:17px}
+.bmid{flex:1;min-width:0}
+.bh{font-size:14px;font-weight:600}
+.bt{font-size:11.5px;color:var(--mut);margin-top:2px}
+.brt{text-align:right;font-size:12px;white-space:nowrap}
+.txns{color:var(--tx);font-weight:500}
+.bm{font-size:11px;color:var(--mut);margin-top:3px}
+.badge{font-size:10.5px;font-weight:600;padding:5px 8px;border-radius:7px;flex:none;min-width:62px;text-align:center}
+.b-pub{color:var(--bl);background:rgba(76,155,245,.13)}
+.b-prv{color:var(--vi);background:rgba(185,140,246,.14)}
+.b-tk{color:var(--am);background:rgba(255,180,60,.13)}
+.b-reg{color:var(--mut);background:rgba(255,255,255,.06)}
+.b-ct{color:#5dd6c0;background:rgba(93,214,192,.13)}
+.tmid{flex:1;min-width:0}
+.troute{font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.troute a{color:#c8c8d2}.troute a:hover{color:var(--am)}
+.tamt{margin-left:auto;text-align:right;font-size:12.5px;font-weight:600;flex:none;font-family:'JetBrains Mono',monospace;font-variant-numeric:tabular-nums;white-space:nowrap}
+.tamt.pos{color:var(--gr)}
+.enc{margin-left:auto;font-size:11.5px;font-weight:500;color:var(--vi);white-space:nowrap;flex:none}
+.pf{display:block;padding:13px 17px;text-align:center;font-weight:600;border-top:1px solid var(--ln);color:var(--am)}
+.pf:hover{background:var(--el2)}
+.empty{padding:22px 14px;color:var(--mut);text-align:center;font-size:13px}
+.kv{display:grid;grid-template-columns:200px 1fr;gap:10px;padding:13px 18px;border-bottom:1px solid var(--ln);font-size:13.5px}
+.kv:last-child{border-bottom:none}.kv .k{color:var(--mut)}
+.bnav{display:flex;justify-content:space-between;align-items:center;background:var(--el);border:1px solid var(--ln);border-radius:12px;padding:11px 16px;margin-bottom:16px;font-weight:600}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:12px 18px;border-bottom:1px solid var(--ln);font-size:13.5px}
+th{color:var(--mut);font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.08em}
+tr:last-child td{border-bottom:none}
+tbody tr:hover{background:var(--el2)}
+.hash{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;color:#b7b7c4;word-break:break-all}
+.row{display:flex;align-items:center;gap:12px;padding:13px 17px;border-bottom:1px solid var(--ln)}
+.row:last-of-type{border-bottom:none}
+.row:hover{background:var(--el2)}
+.row .ic{width:36px;height:36px;border-radius:10px;background:#17171d;color:var(--mut);display:flex;align-items:center;justify-content:center;flex:none}
+.row .ic svg{width:18px;height:18px}
+.row .mid{flex:1;min-width:0;overflow:hidden}
+.row .t1{font-weight:600}
+.row .t2{font-size:12.5px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.row .rt{text-align:right;font-size:12.5px;color:var(--mut);white-space:nowrap}
+.tag{display:inline-block;padding:3px 9px;border-radius:7px;font-size:11.5px;font-weight:600;background:rgba(255,255,255,.05);color:var(--mut)}
+.tag.xfer{background:rgba(185,140,246,.14);color:var(--vi)}
+.tag.tok{background:rgba(255,180,60,.13);color:var(--am)}
+.tag.reg{background:rgba(76,155,245,.13);color:var(--bl)}
+.tag.roll{background:rgba(255,255,255,.06);color:var(--mut)}
+.tag.ct{background:rgba(93,214,192,.13);color:#5dd6c0}
+.pill-amt{background:rgba(255,180,60,.13);color:var(--am);border-radius:6px;padding:1px 8px;font-size:12px;font-weight:600}
+code{background:var(--el2);padding:2px 6px;border-radius:6px;font-size:13px;color:var(--am2);font-family:'JetBrains Mono',monospace}
+.fmsg{border-radius:12px;padding:13px 16px;margin-bottom:18px;font-weight:500;border:1px solid}
+.fmsg.ok{background:rgba(53,208,127,.1);color:var(--gr);border-color:rgba(53,208,127,.3)}
+.fmsg.err{background:rgba(255,93,108,.1);color:#ff97a1;border-color:rgba(255,93,108,.3)}
+footer{border-top:1px solid var(--ln);margin-top:26px;padding:26px 0;color:var(--mut);font-size:13px}
+footer .cols2{display:flex;justify-content:space-between;flex-wrap:wrap;gap:20px}footer b{color:var(--tx)}
+@keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+@keyframes slidein{from{opacity:0;transform:translateY(-14px)}to{opacity:1;transform:none}}
+@keyframes flash{0%{background:rgba(255,180,60,.14)}100%{background:transparent}}
+@keyframes beat{0%,100%{box-shadow:0 0 0 0 rgba(53,208,127,.55)}50%{box-shadow:0 0 0 5px rgba(53,208,127,0)}}
+@media(max-width:820px){.stats{grid-template-columns:repeat(2,1fr)}.cols{grid-template-columns:1fr}}
+@media(prefers-reduced-motion:reduce){.scard,.panel,.fresh,.live{animation:none}}"#
 }
 
 // --- helpers ---------------------------------------------------------------
