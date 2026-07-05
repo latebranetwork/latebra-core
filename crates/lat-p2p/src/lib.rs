@@ -1155,12 +1155,14 @@ mod tests {
     fn submit_gates_out_consensus_invalid_txs() {
         // A transaction a block could never legally contain must be refused at
         // submit, not merely dropped later at block-build — otherwise it occupies
-        // mempool space for free. The legacy unsound `Transfer` is one such tx.
+        // mempool space for free. A transfer paying below the fee floor is one
+        // such tx (rejected by the stateless `check_tx` consensus rule).
         let mut node = NodeState::new(fresh_chain());
-        let sk = lat_crypto::SecretKey::random(&mut OsRng);
-        let rk = lat_crypto::SecretKey::random(&mut OsRng);
-        let xfer = lat_crypto::ConfidentialTransfer::create(&sk, &rk.public_key(), 1, &mut OsRng);
-        let tx = lat_types::Transaction::Transfer { token: 0, xfer };
+        let from = lat_crypto::SecretKey::random(&mut OsRng).public_key().to_bytes();
+        let to = lat_crypto::SecretKey::random(&mut OsRng).public_key().to_bytes();
+        let tx = lat_types::Transaction::PublicTransfer {
+            token: 0, from, to, amount: 1, fee: 0, nonce: 0, sig: [0u8; 64],
+        };
         assert!(!node.submit_tx(tx), "consensus-invalid tx refused at submit");
         assert_eq!(node.mempool.len(), 0, "and never enters the mempool");
     }

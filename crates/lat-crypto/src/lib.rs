@@ -41,7 +41,6 @@ mod ring;
 mod schnorr;
 mod solvent;
 mod stealth;
-mod transfer;
 pub use anon_transfer::AnonTransfer;
 pub use conservation::ConservedDeltas;
 pub use hidden_solvency::HiddenSolventSpend;
@@ -52,7 +51,6 @@ pub use ring::{LinkableRingSignature, RingSignature};
 pub use schnorr::Signature;
 pub use solvent::SolventTransfer;
 pub use stealth::{stealth_receive, stealth_send, StealthOutput};
-pub use transfer::{ConfidentialTransfer, TransferProof};
 
 /// An account secret key (a ristretto255 scalar).
 #[derive(Clone)]

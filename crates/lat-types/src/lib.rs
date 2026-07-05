@@ -4,7 +4,7 @@
 //! with human-readable prefixes `lat` (mainnet) / `latt` (testnet).
 
 use bech32::{Bech32m, Hrp};
-use lat_crypto::{AnonTransfer, ConfidentialTransfer, PublicKey, SolventTransfer};
+use lat_crypto::{AnonTransfer, PublicKey, SolventTransfer};
 
 /// Which network an address / transaction belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -106,11 +106,10 @@ pub enum Transaction {
         /// Schnorr signature by `creator` over the signing bytes.
         sig: [u8; 64],
     },
-    Transfer {
-        token: u32,
-        xfer: ConfidentialTransfer,
-    },
-    /// The production transfer: also proves the sender is solvent (no overspend).
+    /// The confidential transfer: proves value conservation AND that the sender
+    /// is solvent (no overspend of a hidden balance). The only confidential
+    /// transfer type — an earlier `Transfer` that skipped the solvency proof was
+    /// removed (wire tag `0x01` is retired and rejected on decode).
     SolventTransfer {
         token: u32,
         xfer: SolventTransfer,
@@ -234,13 +233,6 @@ impl Transaction {
                 v.push(0x00);
                 v.extend_from_slice(pubkey);
                 v.extend_from_slice(&pow_nonce.to_le_bytes());
-                v
-            }
-            Transaction::Transfer { token, xfer } => {
-                let mut v = Vec::with_capacity(1 + 4 + 12 * 32);
-                v.push(0x01);
-                v.extend_from_slice(&token.to_le_bytes());
-                v.extend_from_slice(&xfer.to_bytes());
                 v
             }
             Transaction::CreateToken {
@@ -390,11 +382,7 @@ impl Transaction {
                 let pow_nonce = u64::from_le_bytes(rest[32..40].try_into().ok()?);
                 Some(Transaction::Register { pubkey, pow_nonce })
             }
-            0x01 => {
-                let token = u32::from_le_bytes(rest.get(0..4)?.try_into().ok()?);
-                let xfer = ConfidentialTransfer::from_bytes(rest.get(4..)?)?;
-                Some(Transaction::Transfer { token, xfer })
-            }
+            // 0x01 (legacy unsound `Transfer`) is retired — decoding it fails.
             0x02 => {
                 let len = u16::from_le_bytes(rest.get(0..2)?.try_into().ok()?) as usize;
                 let ticker = String::from_utf8(rest.get(2..2 + len)?.to_vec()).ok()?;

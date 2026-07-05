@@ -408,7 +408,6 @@ fn tx_involves(tx: &Transaction, id: &[u8; 32]) -> bool {
         // ring members are visible (as the anonymity set), but membership is
         // not involvement, so an anonymous transfer never links to an address.
         Transaction::AnonTransfer { .. } => false,
-        Transaction::Transfer { .. } => false,
     }
 }
 
@@ -566,7 +565,6 @@ fn tag(tx: &Transaction) -> (&'static str, &'static str) {
         Transaction::ShieldStealth { .. } => ("xfer", "Stealth Shield"),
         Transaction::Unshield { .. } => ("xfer", "Unshield"),
         Transaction::AnonTransfer { .. } => ("xfer", "Anonymous Transfer"),
-        Transaction::Transfer { .. } => ("", "Transfer (legacy)"),
     }
 }
 
@@ -608,7 +606,6 @@ fn tx_detail(tx: &Transaction) -> (String, String) {
             format!("(ring of {}) → (stealth)", xfer.ring.len()),
             format!("<span class='pill-amt'>{}</span> anonymous · token {token}", commafy(xfer.amount)),
         ),
-        Transaction::Transfer { .. } => ("—".to_string(), "—".to_string()),
     }
 }
 

@@ -101,8 +101,6 @@ pub fn check_tx(tx: &Transaction) -> Result<(), ChainError> {
                 return Err(ChainError::BadRegistrationPow);
             }
         }
-        // Consensus refuses the legacy unsound transfer outright.
-        Transaction::Transfer { .. } => return Err(ChainError::UnsoundTransfer),
         // The fee floor. (The fee itself is bound into the transfer's proof, so
         // it can't be lowered after the fact; here we require it was set high
         // enough in the first place.)
@@ -426,9 +424,6 @@ pub enum ChainError {
     Ledger(LedgerError),
     /// Failed to persist the block to the durable store.
     Storage,
-    /// Block contains a legacy non-solvent `Transfer`. Consensus accepts only
-    /// `SolventTransfer` (which proves the sender can afford the amount).
-    UnsoundTransfer,
     /// A transfer pays less than [`MIN_TRANSFER_FEE`].
     FeeTooLow,
     /// A contract deploy exceeds [`MAX_CONTRACT_CODE_BYTES`].
@@ -1229,19 +1224,6 @@ mod tests {
             Err(ChainError::Ledger(lat_state::LedgerError::WrongEpoch))
         );
         assert!(chain.height() == 1, "invalid blocks never advanced the tip");
-    }
-
-    #[test]
-    fn consensus_rejects_unsound_transfer() {
-        let mut rng = OsRng;
-        let genesis_sk = SecretKey::random(&mut rng);
-        let genesis_id = genesis_sk.public_key().to_bytes();
-        let receiver_pk = SecretKey::random(&mut rng).public_key();
-        let mut chain = Blockchain::genesis(&[(genesis_id, 1_000_000)], DEFAULT_DIFFICULTY);
-
-        let xfer = lat_crypto::ConfidentialTransfer::create(&genesis_sk, &receiver_pk, 1, &mut rng);
-        let block = chain.mine(vec![Transaction::Transfer { token: lat_state::LAT_TOKEN, xfer }]);
-        assert_eq!(chain.apply_block(&block), Err(ChainError::UnsoundTransfer));
     }
 
     #[test]

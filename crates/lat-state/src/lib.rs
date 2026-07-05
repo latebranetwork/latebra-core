@@ -9,14 +9,17 @@
 //! * `CreateToken` — mint a new token under a unique ticker; fails if the ticker
 //!   is already taken (this is the uniqueness guarantee), crediting the whole
 //!   initial supply to the creator.
-//! * `Transfer { token, .. }` — move a hidden amount of one token by homomorphic
-//!   arithmetic, after verifying its zero-knowledge proof.
+//! * `SolventTransfer { token, .. }` — move a hidden amount of one token by
+//!   homomorphic arithmetic, after verifying a zero-knowledge proof of value
+//!   conservation **and sender solvency** (`balance − amount − fee ≥ 0`).
 //!
-//! ## Security scope (honest, unchanged from before)
-//! Transfers enforce value conservation + account ownership (sound) but NOT
-//! sender solvency (`balance − amount ≥ 0`) — see [`SOLVENCY_TODO`]. The token id
-//! is named in the transaction but not bound inside the ZK proof; the ledger
-//! applies it consistently to both sides, so value is conserved within a token.
+//! ## Security scope
+//! The confidential `SolventTransfer` enforces value conservation, account
+//! ownership (nonce-bound), AND sender solvency, so a hidden balance cannot be
+//! overspent. (An earlier `Transfer` that proved conservation but not solvency
+//! has been removed from the type system entirely.) The token id is named in the
+//! transaction but not bound inside the ZK proof; the ledger applies it
+//! consistently to both sides, so value is conserved within a token.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -25,10 +28,6 @@ use std::sync::Arc;
 use lat_crypto::{Ciphertext, PublicKey, Signature};
 use lat_store::{Column, KVStore, OverlayStore, Smt, WriteBatch};
 use lat_types::{normalize_ticker, Transaction};
-
-/// Reminder that sender-solvency enforcement is deliberately not yet implemented.
-pub const SOLVENCY_TODO: &str =
-    "balance >= amount is NOT enforced yet; needs integrated range-proof (audited) milestone";
 
 /// The native coin LAT is token id 0.
 pub const LAT_TOKEN: u32 = 0;
@@ -390,9 +389,6 @@ impl Ledger {
                     DirtyKey::Meta,
                 ]
             }
-            Transaction::Transfer { xfer, .. } => {
-                vec![DirtyKey::Account(xfer.sender.to_bytes()), DirtyKey::Account(xfer.receiver.to_bytes())]
-            }
             Transaction::SolventTransfer { xfer, .. } => {
                 vec![DirtyKey::Account(xfer.sender.to_bytes()), DirtyKey::Account(xfer.receiver.to_bytes())]
             }
@@ -597,19 +593,6 @@ impl Ledger {
                 acct.set(id, new);
                 self.put_account(creator, acct);
                 Ok(())
-            }
-
-            Transaction::Transfer { token, xfer } => {
-                if !xfer.verify() {
-                    return Err(LedgerError::InvalidProof);
-                }
-                self.move_value(
-                    xfer.sender.to_bytes(),
-                    xfer.receiver.to_bytes(),
-                    *token,
-                    &xfer.sender_ciphertext(),
-                    &xfer.receiver_ciphertext(),
-                )
             }
 
             Transaction::SolventTransfer { token, xfer } => {
@@ -946,37 +929,6 @@ impl Ledger {
                 Ok(())
             }
         }
-    }
-
-    /// Shared debit/credit step for both transfer kinds. Assumes the proof has
-    /// already been verified.
-    fn move_value(
-        &mut self,
-        sender_id: [u8; 32],
-        receiver_id: [u8; 32],
-        token: u32,
-        debit: &Ciphertext,
-        credit: &Ciphertext,
-    ) -> Result<(), LedgerError> {
-        if !self.is_registered(&sender_id) {
-            return Err(LedgerError::SenderNotRegistered);
-        }
-        if !self.is_registered(&receiver_id) {
-            return Err(LedgerError::ReceiverNotRegistered);
-        }
-        // Debit written back before the credit is read, so `sender == receiver`
-        // nets out exactly as the sequential `get_mut` pair used to.
-        if let Some(mut s) = self.account(&sender_id) {
-            let new = s.balance(token).sub(debit);
-            s.set(token, new);
-            self.put_account(&sender_id, s);
-        }
-        if let Some(mut r) = self.account(&receiver_id) {
-            let new = r.balance(token).add(credit);
-            r.set(token, new);
-            self.put_account(&receiver_id, r);
-        }
-        Ok(())
     }
 
     // -- state commitment ------------------------------------------------------
@@ -1428,28 +1380,8 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lat_crypto::{ConfidentialTransfer, SecretKey};
+    use lat_crypto::SecretKey;
     use rand::rngs::OsRng;
-
-    #[test]
-    fn confidential_transfer_moves_hidden_value() {
-        let mut rng = OsRng;
-        let sender_sk = SecretKey::random(&mut rng);
-        let receiver_sk = SecretKey::random(&mut rng);
-        let sender_id = sender_sk.public_key().to_bytes();
-        let receiver_id = receiver_sk.public_key().to_bytes();
-
-        let mut ledger = Ledger::new();
-        ledger.register(sender_id).unwrap();
-        ledger.register(receiver_id).unwrap();
-        ledger.credit_genesis(&sender_id, 1_000_000).unwrap();
-
-        let xfer = ConfidentialTransfer::create(&sender_sk, &receiver_sk.public_key(), 250_000, &mut rng);
-        ledger.apply(&Transaction::Transfer { token: LAT_TOKEN, xfer }).unwrap();
-
-        assert_eq!(sender_sk.decrypt(&ledger.balance(&sender_id, LAT_TOKEN).unwrap(), 24), Some(750_000));
-        assert_eq!(receiver_sk.decrypt(&ledger.balance(&receiver_id, LAT_TOKEN).unwrap(), 24), Some(250_000));
-    }
 
     /// Build + sign a transparent tx with `sk`, filling the `sig` field the way
     /// a wallet would.
@@ -2054,6 +1986,7 @@ mod tests {
 
     #[test]
     fn rejects_transfer_from_unregistered_sender() {
+        use lat_crypto::SolventTransfer;
         let mut rng = OsRng;
         let sender_sk = SecretKey::random(&mut rng);
         let receiver_sk = SecretKey::random(&mut rng);
@@ -2061,31 +1994,13 @@ mod tests {
         let mut ledger = Ledger::new();
         ledger.register(receiver_sk.public_key().to_bytes()).unwrap();
 
-        let xfer = ConfidentialTransfer::create(&sender_sk, &receiver_sk.public_key(), 1, &mut rng);
+        // Sender is NOT registered — rejected before the proof is even checked.
+        let bal = sender_sk.public_key().encrypt(1_000, &mut rng);
+        let xfer =
+            SolventTransfer::create(&sender_sk, &receiver_sk.public_key(), 1, 0, 1_000, &bal, 0, &mut rng).unwrap();
         assert_eq!(
-            ledger.apply(&Transaction::Transfer { token: LAT_TOKEN, xfer }),
+            ledger.apply(&Transaction::SolventTransfer { token: LAT_TOKEN, xfer }),
             Err(LedgerError::SenderNotRegistered)
-        );
-    }
-
-    #[test]
-    fn rejects_tampered_proof() {
-        let mut rng = OsRng;
-        let sender_sk = SecretKey::random(&mut rng);
-        let receiver_sk = SecretKey::random(&mut rng);
-        let sender_id = sender_sk.public_key().to_bytes();
-        let receiver_id = receiver_sk.public_key().to_bytes();
-
-        let mut ledger = Ledger::new();
-        ledger.register(sender_id).unwrap();
-        ledger.register(receiver_id).unwrap();
-        ledger.credit_genesis(&sender_id, 100).unwrap();
-
-        let mut xfer = ConfidentialTransfer::create(&sender_sk, &receiver_sk.public_key(), 10, &mut rng);
-        xfer.c_receiver += xfer.c_sender;
-        assert_eq!(
-            ledger.apply(&Transaction::Transfer { token: LAT_TOKEN, xfer }),
-            Err(LedgerError::InvalidProof)
         );
     }
 
