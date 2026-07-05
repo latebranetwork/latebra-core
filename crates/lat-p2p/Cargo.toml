@@ -1,0 +1,16 @@
+[package]
+name = "lat-p2p"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+lat-chain.workspace = true
+lat-types.workspace = true
+lat-crypto.workspace = true
+
+[dev-dependencies]
+lat-wallet.workspace = true
+lat-vm.workspace = true
+rand.workspace = true

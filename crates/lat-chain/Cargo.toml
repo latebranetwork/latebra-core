@@ -1,0 +1,22 @@
+[package]
+name = "lat-chain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+# Real ASIC-resistant RandomX proof-of-work. Requires the native RandomX library
+# (CMake + a C/C++ toolchain) to build. Off by default (uses BLAKE3).
+randomx = ["dep:randomx-rs"]
+
+[dependencies]
+lat-crypto.workspace = true
+lat-types.workspace = true
+lat-state.workspace = true
+lat-store.workspace = true
+blake3.workspace = true
+randomx-rs = { version = "1.3", optional = true }
+
+[dev-dependencies]
+rand.workspace = true

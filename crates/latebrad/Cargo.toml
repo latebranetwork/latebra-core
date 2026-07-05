@@ -1,0 +1,16 @@
+[package]
+name = "latebrad"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "latebrad"
+path = "src/main.rs"
+
+[dependencies]
+lat-chain.workspace = true
+lat-p2p.workspace = true
+lat-wallet.workspace = true
+lat-types.workspace = true

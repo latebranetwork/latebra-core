@@ -1,0 +1,15 @@
+[package]
+name = "lat-contracts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Standard on-chain contracts for Latebra, compiled to lat-vm bytecode. The
+# bonding curve powers the latfun launchpad's on-chain pricing/accounting.
+
+[dependencies]
+lat-vm.workspace = true
+
+[dev-dependencies]
+blake3.workspace = true

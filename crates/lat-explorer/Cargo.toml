@@ -1,0 +1,18 @@
+[package]
+name = "lat-explorer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "lat-explorer"
+path = "src/main.rs"
+
+[dependencies]
+lat-chain.workspace = true
+lat-p2p.workspace = true
+lat-types.workspace = true
+lat-crypto.workspace = true
+lat-wallet.workspace = true
+rand.workspace = true

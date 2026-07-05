@@ -1,0 +1,31 @@
+[package]
+name = "lat-attack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# A passive-observer PRIVACY RED-TEAM. It builds a realistic "private" economy
+# using the real wallet/chain/crypto, then puts on the attacker hat: given ONLY
+# the serialized block log (exactly what any peer, explorer, or full node sees),
+# it reconstructs the transaction graph and recovers "hidden" amounts. This is a
+# security-audit tool for our OWN chain — it decrypts nothing it isn't given.
+
+[[bin]]
+name = "lat-attack"
+path = "src/main.rs"
+
+# Real-workload micro-benchmark over the actual wallet/chain/crypto/VM stack.
+# Run with: cargo run --release --example bench -p lat-attack
+[[example]]
+name = "bench"
+path = "examples/bench.rs"
+
+[dependencies]
+lat-crypto.workspace = true
+lat-types.workspace = true
+lat-state.workspace = true
+lat-chain.workspace = true
+lat-wallet.workspace = true
+lat-vm.workspace = true
+rand.workspace = true

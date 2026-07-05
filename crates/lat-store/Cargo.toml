@@ -1,0 +1,15 @@
+[package]
+name = "lat-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Pluggable key/value storage layer. Every persistent subsystem (state trie,
+# block DB, tx index, snapshots) is written against the `KVStore` trait so the
+# physical backend can evolve — in-memory today, RocksDB/MDBX later — without
+# touching consensus. See PROJECT_CHECKPOINT.md milestone M1.
+
+[dependencies]
+blake3.workspace = true
+redb.workspace = true

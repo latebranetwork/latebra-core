@@ -1,0 +1,810 @@
+//! Latscan — the Latebra block explorer, Etherscan / BscScan-style.
+//!
+//! A web server that queries live `latebrad` nodes over RPC and renders the chain
+//! with a mainnet/testnet switcher. Amounts and balances stay encrypted — the
+//! explorer shows what is public and marks confidential values.
+//!
+//! Run:
+//!   `lat-explorer --testnet 127.0.0.1:4040 --mainnet 127.0.0.1:4041 --listen 127.0.0.1:8080`
+
+use std::collections::HashMap;
+use std::env;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::{Mutex, OnceLock};
+use std::thread;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use lat_chain::{emission, mine_registration, Block, MIN_TRANSFER_FEE};
+use lat_types::{Address, Network, Transaction};
+use lat_wallet::Wallet;
+use rand::rngs::OsRng;
+
+const ACCENT: &str = "#F5A03C";
+
+/// The Latebra logo mark as an inline SVG data-URI — used for the browser
+/// favicon and the header brand mark. Orange rounded "LD" monogram whose right
+/// edge dissolves into pixels (privacy: data scattering away).
+const LOGO: &str = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><defs><mask id='latm'><rect width='512' height='512' fill='%23000'/><rect x='108' y='104' width='230' height='304' rx='52' fill='%23fff'/><path fill='%23000' d='M192 180H362V292a24 24 0 0 1-24 24H216a24 24 0 0 1-24-24Z'/><rect x='192' y='104' width='34' height='80' fill='%23000'/></mask></defs><g mask='url(%23latm)'><rect width='512' height='512' fill='%23F5A03C'/></g><g fill='%23F5A03C'><rect x='410' y='150' width='30' height='30' rx='5'/><rect x='360' y='182' width='24' height='24' rx='4'/><rect x='404' y='216' width='22' height='22' rx='4'/><rect x='356' y='238' width='18' height='18' rx='3'/><rect x='392' y='262' width='30' height='30' rx='5'/><rect x='352' y='298' width='16' height='16' rx='3'/><rect x='404' y='300' width='14' height='14' rx='3'/><rect x='368' y='330' width='18' height='18' rx='3'/></g></svg>";
+
+// Small line icons (24x24, currentColor stroke).
+const IC_BLOCK: &str = "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.7' stroke-linejoin='round'><path d='M12 2 3 7v10l9 5 9-5V7z'/><path d='M3 7l9 5 9-5M12 12v10'/></svg>";
+const IC_COIN: &str = "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.7'><circle cx='12' cy='12' r='9'/><path d='M12 7.5v9M14.5 9.7c0-1-1.1-1.7-2.5-1.7s-2.5.7-2.5 1.7 1.1 1.6 2.5 1.6 2.5.7 2.5 1.7-1.1 1.7-2.5 1.7-2.5-.7-2.5-1.7'/></svg>";
+const IC_CLOCK: &str = "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.7' stroke-linecap='round'><circle cx='12' cy='12' r='9'/><path d='M12 7v5l3.5 2'/></svg>";
+const IC_NET: &str = "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.7'><circle cx='12' cy='12' r='9'/><path d='M3 12h18M12 3c2.6 3 2.6 15 0 18M12 3c-2.6 3-2.6 15 0 18'/></svg>";
+const IC_TX: &str = "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'><path d='M17 3v12M17 15l4-4M17 15l-4-4M7 21V9M7 9 3 13M7 9l4 4'/></svg>";
+
+struct Config {
+    mainnet: String,
+    testnet: String,
+    listen: String,
+}
+
+impl Config {
+    fn node(&self, net: &str) -> &str {
+        if net == "mainnet" { &self.mainnet } else { &self.testnet }
+    }
+}
+
+fn main() {
+    let mut cfg = Config {
+        mainnet: "127.0.0.1:4041".to_string(),
+        testnet: "127.0.0.1:4040".to_string(),
+        listen: "127.0.0.1:8080".to_string(),
+    };
+    let args: Vec<String> = env::args().skip(1).collect();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--mainnet" => { i += 1; cfg.mainnet = args.get(i).cloned().unwrap_or(cfg.mainnet); }
+            "--testnet" => { i += 1; cfg.testnet = args.get(i).cloned().unwrap_or(cfg.testnet); }
+            "--listen" => { i += 1; cfg.listen = args.get(i).cloned().unwrap_or(cfg.listen); }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let listener = TcpListener::bind(&cfg.listen).expect("bind explorer listen address");
+    println!("Latscan explorer  →  http://{}", cfg.listen);
+    println!("  testnet node: {}", cfg.testnet);
+    println!("  mainnet node: {}", cfg.mainnet);
+
+    let cfg = std::sync::Arc::new(cfg);
+    for stream in listener.incoming().flatten() {
+        let cfg = std::sync::Arc::clone(&cfg);
+        thread::spawn(move || { let _ = handle(stream, &cfg); });
+    }
+}
+
+fn handle(stream: TcpStream, cfg: &Config) -> std::io::Result<()> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let target = line.split_whitespace().nth(1).unwrap_or("/").to_string();
+
+    let (path, params) = parse_target(&target);
+    let net = match params.get("net").map(String::as_str) {
+        Some("mainnet") => "mainnet",
+        _ => "testnet",
+    };
+    let node = cfg.node(net);
+
+    let body = if path == "/search" {
+        // A search query is either a block height (a number) or an address.
+        let q = params.get("q").map(|q| q.trim().to_string()).unwrap_or_default();
+        if let Ok(h) = q.parse::<u64>() {
+            render_block(node, h, net)
+        } else if Address::parse(&q).is_ok() {
+            render_address(node, &q, net)
+        } else {
+            render_home(node, net)
+        }
+    } else if let Some(rest) = path.strip_prefix("/address/") {
+        render_address(node, rest.trim_end_matches('/'), net)
+    } else if let Some(rest) = path.strip_prefix("/block/") {
+        match rest.trim_end_matches('/').parse::<u64>() {
+            Ok(h) => render_block(node, h, net),
+            Err(_) => render_home(node, net),
+        }
+    } else if path == "/faucet" {
+        render_faucet(node, net, &params)
+    } else {
+        render_home(node, net)
+    };
+
+    let mut stream = stream;
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
+fn parse_target(target: &str) -> (String, HashMap<String, String>) {
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let mut params = HashMap::new();
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            params.insert(k.to_string(), v.to_string());
+        }
+    }
+    (path.to_string(), params)
+}
+
+fn fetch_block(node: &str, height: u64) -> Option<Block> {
+    let bytes = lat_p2p::get_block(node, height).ok()??;
+    Block::decode(&bytes)
+}
+
+// --- home page -------------------------------------------------------------
+
+fn render_home(node: &str, net: &str) -> String {
+    let height = match lat_p2p::get_height(node) {
+        Ok(h) => h,
+        Err(_) => return page("Latscan", &node_offline(node, net), net, "", true),
+    };
+
+    // Fetch the latest blocks once; reuse for stats, block rows and tx rows.
+    let start = height;
+    let end = start.saturating_sub(19);
+    let mut blocks: Vec<(u64, Block)> = Vec::new();
+    for h in (end..=start).rev() {
+        if let Some(b) = fetch_block(node, h) {
+            blocks.push((h, b));
+        }
+    }
+
+    let reward = emission(height);
+    let avg = avg_block_time(&blocks);
+    let net_label = if net == "mainnet" { "Mainnet" } else { "Testnet" };
+
+    let stats = format!(
+        "<div class='stats'>{}{}{}{}</div>",
+        scard(IC_BLOCK, "Latest block", &format!("#{}", commafy(height))),
+        scard(IC_COIN, "Block reward", &format!("{} LAT", fmt_lat(reward))),
+        scard(IC_CLOCK, "Avg block time", &avg.map(|s| format!("{s:.1}s")).unwrap_or_else(|| "—".into())),
+        scard(IC_NET, "Network", net_label),
+    );
+
+    // Latest blocks panel.
+    let mut brows = String::new();
+    for (h, b) in blocks.iter().take(8) {
+        let miner = if b.header.miner == [0u8; 32] { "—".to_string() } else { short(&b.header.miner) };
+        brows.push_str(&format!(
+            "<div class='row'>
+               <div class='ic'>{IC_BLOCK}</div>
+               <div class='mid'><div class='t1'><a href='/block/{h}?net={net}'>#{h}</a></div>
+                 <div class='t2'>{} ago</div></div>
+               <div class='rt'>{} txns<br><span class='muted hash'>{}</span></div>
+             </div>",
+            ago(b.header.timestamp), b.txs.len(), miner
+        ));
+    }
+    if brows.is_empty() { brows.push_str("<div class='row muted'>No blocks yet.</div>"); }
+
+    // Latest transactions panel (flatten recent blocks' txs).
+    let mut trows = String::new();
+    let mut count = 0;
+    'outer: for (h, b) in &blocks {
+        for tx in &b.txs {
+            if count >= 8 { break 'outer; }
+            trows.push_str(&tx_row(tx, *h, net, &b.header.timestamp));
+            count += 1;
+        }
+    }
+    if trows.is_empty() { trows.push_str("<div class='row muted'>No transactions yet.</div>"); }
+
+    let latest = format!("/block/{height}?net={net}");
+    let body = format!(
+        "<div class='hero'><div class='wrap'>
+           <h1>The Latebra {net_label} explorer</h1>
+           <form class='searchbar' action='/search' method='get'>
+             <input name='q' placeholder='Search a block height or address (latt1…)' autocomplete='off'>
+             <input type='hidden' name='net' value='{net}'>
+             <button type='submit'>Search</button>
+           </form>
+         </div></div>
+         <div class='wrap'>
+           {stats}
+           <div class='cols'>
+             <div class='panel'><div class='ph'>Latest blocks</div>{brows}
+               <a class='pf' href='{latest}'>View latest block</a></div>
+             <div class='panel'><div class='ph'>Latest transactions</div>{trows}
+               <a class='pf' href='{latest}'>View latest block</a></div>
+           </div>
+         </div>"
+    );
+    page("Latscan — Latebra explorer", &body, net, &format!("Height {}", commafy(height)), true)
+}
+
+// --- block page ------------------------------------------------------------
+
+fn render_block(node: &str, height: u64, net: &str) -> String {
+    let block = match fetch_block(node, height) {
+        Some(b) => b,
+        None => {
+            let body = format!(
+                "<div class='wrap' style='padding-top:24px'><div class='card'><div class='ph'>Block #{height}</div>
+                 <div class='kv'><div class='k'>Status</div><div class='muted'>Not found on this node.</div></div></div>
+                 <p><a href='/?net={net}'>← Back to explorer</a></p></div>"
+            );
+            return page("Block not found", &body, net, "", false);
+        }
+    };
+    let h = &block.header;
+    let miner = if h.miner == [0u8; 32] { "— (no reward)".to_string() } else { hex(&h.miner) };
+    let details = format!(
+        "<div class='card'>
+           <div class='ph'>Block <span class='muted'>#{height}</span></div>
+           <div class='kv'><div class='k'>Block height</div><div>{height}</div></div>
+           <div class='kv'><div class='k'>Timestamp</div><div>{} ago &nbsp;<span class='muted'>({})</span></div></div>
+           <div class='kv'><div class='k'>Transactions</div><div>{} in this block</div></div>
+           <div class='kv'><div class='k'>Block reward</div><div>{} LAT</div></div>
+           <div class='kv'><div class='k'>Mined by</div><div class='hash'>{}</div></div>
+           <div class='kv'><div class='k'>Hash</div><div class='hash'>{}</div></div>
+           <div class='kv'><div class='k'>Parent hash</div><div class='hash'>{}</div></div>
+           <div class='kv'><div class='k'>Tx root</div><div class='hash'>{}</div></div>
+           <div class='kv'><div class='k'>State root</div><div class='hash'>{}</div></div>
+           <div class='kv'><div class='k'>Nonce</div><div>{}</div></div>
+         </div>",
+        ago(h.timestamp), h.timestamp, block.txs.len(), fmt_lat(emission(height)),
+        miner, hex(&h.id()), hex(&h.prev_hash), hex(&h.tx_root), hex(&h.state_root), h.nonce,
+    );
+
+    let mut rows = String::new();
+    if block.txs.is_empty() {
+        rows.push_str("<tr><td colspan='3' class='muted'>No transactions in this block.</td></tr>");
+    }
+    for tx in &block.txs {
+        rows.push_str(&tx_table_row(tx));
+    }
+
+    let nav = format!(
+        "<div class='bnav'>{}<span>Block #{height}</span>{}</div>",
+        if height > 0 { format!("<a href='/block/{}?net={net}'>← Prev</a>", height - 1) } else { "<span class='muted'>← Prev</span>".into() },
+        format!("<a href='/block/{}?net={net}'>Next →</a>", height + 1),
+    );
+
+    let body = format!(
+        "<div class='wrap' style='padding-top:24px'>
+           <p><a href='/?net={net}'>← Explorer</a></p>
+           {nav}
+           {details}
+           <div class='card'><div class='ph'>Transactions</div>
+             <table><thead><tr><th>Type</th><th>Detail</th><th>Amount</th></tr></thead><tbody>{rows}</tbody></table>
+           </div>
+         </div>"
+    );
+    page(&format!("Block #{height} — Latscan"), &body, net, "", false)
+}
+
+// --- address page ------------------------------------------------------------
+
+/// How many recent blocks the address page scans for activity. The explorer is
+/// stateless (no index DB), so history is a bounded walk back from the tip —
+/// balances above the list are always current regardless of this depth.
+const ADDRESS_SCAN_BLOCKS: u64 = 600;
+
+fn render_address(node: &str, raw: &str, net: &str) -> String {
+    let addr = match Address::parse(raw.trim()) {
+        Ok(a) => a,
+        Err(_) => {
+            let body = format!(
+                "<div class='wrap' style='padding-top:24px'><div class='card'><div class='ph'>Address</div>
+                 <div class='kv'><div class='k'>Status</div><div class='muted'>Not a valid Latebra address.</div></div></div>
+                 <p><a href='/?net={net}'>← Back to explorer</a></p></div>"
+            );
+            return page("Address not found — Latscan", &body, net, "", false);
+        }
+    };
+    let id = addr.id();
+    let height = match lat_p2p::get_height(node) {
+        Ok(h) => h,
+        Err(_) => return page("Latscan", &node_offline(node, net), net, "", true),
+    };
+
+    let registered = matches!(lat_p2p::get_nonce(node, id), Ok(Some(_)));
+    let public = lat_p2p::get_public_balance(node, id, 0).ok().flatten();
+    let private_ct = lat_p2p::get_balance(node, id, 0).ok().flatten();
+    let pending_ct = lat_p2p::get_pending(node, id, 0).ok().flatten();
+
+    // The dual-state summary: the public balance is plaintext consensus data;
+    // the private balance EXISTS on-chain only as a ciphertext — showing its
+    // bytes (not its value) is the whole point of the privacy model.
+    let enc = |ct: &Option<[u8; 64]>| match ct {
+        Some(b) => format!(
+            "<span class='tag xfer'>encrypted</span> <span class='muted hash'>{}…</span> — only the key holder can read it",
+            b[..8].iter().map(|x| format!("{x:02x}")).collect::<String>()
+        ),
+        None => "—".to_string(),
+    };
+    let details = format!(
+        "<div class='card'>
+           <div class='ph'>Address</div>
+           <div class='kv'><div class='k'>Address</div><div class='hash'>{addr_str}</div></div>
+           <div class='kv'><div class='k'>Status</div><div>{status}</div></div>
+           <div class='kv'><div class='k'>Public balance</div><div>{pub_bal}</div></div>
+           <div class='kv'><div class='k'>Private balance</div><div>{priv_bal}</div></div>
+           <div class='kv'><div class='k'>Private pending</div><div>{pend_bal}</div></div>
+         </div>",
+        addr_str = esc(raw.trim()),
+        status = if registered { "Registered on-chain" } else { "Not registered (no on-chain account yet)" },
+        pub_bal = match public {
+            Some(v) => format!("<span class='pill-amt'>{} LAT</span> — visible to everyone", fmt_lat(v)),
+            None => "—".to_string(),
+        },
+        priv_bal = enc(&private_ct),
+        pend_bal = enc(&pending_ct),
+    );
+
+    // Recent activity: newest-first bounded scan, capped rows.
+    let mut rows = String::new();
+    let mut found = 0;
+    let stop = height.saturating_sub(ADDRESS_SCAN_BLOCKS);
+    for h in (stop..=height).rev() {
+        if found >= 25 {
+            break;
+        }
+        let Some(b) = fetch_block(node, h) else { continue };
+        if b.header.miner == id {
+            rows.push_str(&format!(
+                "<div class='row'><div class='ic'>{IC_COIN}</div>
+                 <div class='mid'><div class='t1'><span class='tag tok'>Coinbase</span></div>
+                   <div class='t2'>mined this block · reward {} LAT</div></div>
+                 <div class='rt'><a href='/block/{h}?net={net}'>#{h}</a><br><span class='muted'>{} ago</span></div></div>",
+                fmt_lat(emission(h)), ago(b.header.timestamp)
+            ));
+            found += 1;
+        }
+        for tx in &b.txs {
+            if found >= 25 {
+                break;
+            }
+            if tx_involves(tx, &id) {
+                rows.push_str(&tx_row(tx, h, net, &b.header.timestamp));
+                found += 1;
+            }
+        }
+    }
+    if rows.is_empty() {
+        rows.push_str(&format!(
+            "<div class='row muted'>No activity in the last {ADDRESS_SCAN_BLOCKS} blocks. \
+             (Balances above are current; the activity list scans recent history only. \
+             Fully private transfers received via stealth never appear here — that's the point.)</div>"
+        ));
+    }
+
+    let body = format!(
+        "<div class='wrap' style='padding-top:24px'>
+           <p><a href='/?net={net}'>← Explorer</a></p>
+           {details}
+           <div class='panel'><div class='ph'>Recent activity <span class='muted'>(last {ADDRESS_SCAN_BLOCKS} blocks)</span></div>{rows}</div>
+         </div>"
+    );
+    page("Address — Latscan", &body, net, "", false)
+}
+
+/// Whether `id` appears in one of the transaction's PUBLIC fields. This is
+/// exactly what an outside observer can link — confidential transfers still
+/// name their parties today (sender/receiver hiding is the Phase-3b milestone),
+/// while a stealth shield's one-time key is linkable only if you search the
+/// one-time key itself.
+fn tx_involves(tx: &Transaction, id: &[u8; 32]) -> bool {
+    match tx {
+        Transaction::Register { pubkey, .. } => pubkey == id,
+        Transaction::CreateToken { creator, .. } => creator == id,
+        Transaction::SolventTransfer { xfer, .. } => {
+            &xfer.sender.to_bytes() == id || &xfer.receiver.to_bytes() == id
+        }
+        Transaction::Rollover { account, .. } => account == id,
+        Transaction::DeployContract { deployer, .. } => deployer == id,
+        Transaction::CallContract { contract, caller, .. } => contract == id || caller == id,
+        Transaction::PublicTransfer { from, to, .. } => from == id || to == id,
+        Transaction::Shield { from, to, .. } => from == id || to == id,
+        Transaction::ShieldStealth { from, one_time, .. } => from == id || one_time == id,
+        Transaction::Unshield { to, xfer, .. } => to == id || &xfer.sender.to_bytes() == id,
+        // The whole point: no PUBLIC field names the sender or receiver. The
+        // ring members are visible (as the anonymity set), but membership is
+        // not involvement, so an anonymous transfer never links to an address.
+        Transaction::AnonTransfer { .. } => false,
+        Transaction::Transfer { .. } => false,
+    }
+}
+
+// --- faucet ------------------------------------------------------------------
+
+/// The public TESTNET faucet — the well-known genesis premine wallet that every
+/// `latebrad` testnet instance shares. Testnet coins are worthless by design;
+/// embedding this seed here is intentional and must never carry to a mainnet.
+const FAUCET_SEED: [u8; 32] = [42u8; 32];
+/// Paid per request: 100 LAT (5 decimals).
+const FAUCET_AMOUNT: u64 = 10_000_000;
+/// Per-address wait between payouts.
+const ADDRESS_COOLDOWN_SECS: u64 = 60;
+/// Faucet-wide spacing: the faucet can spend only once per block (its solvency
+/// proof binds its exact balance + nonce), so requests are spaced out.
+const GLOBAL_COOLDOWN_SECS: u64 = 10;
+
+/// (per-address last payout, faucet-wide last payout)
+fn cooldowns() -> &'static Mutex<(HashMap<String, Instant>, Option<Instant>)> {
+    static CD: OnceLock<Mutex<(HashMap<String, Instant>, Option<Instant>)>> = OnceLock::new();
+    CD.get_or_init(|| Mutex::new((HashMap::new(), None)))
+}
+
+fn render_faucet(node: &str, net: &str, params: &HashMap<String, String>) -> String {
+    if net == "mainnet" {
+        let body = format!(
+            "<div class='wrap' style='padding-top:24px'><div class='card'><div class='ph'>Faucet</div>
+             <div class='kv'><div class='k'>Status</div><div>The faucet is <b>testnet-only</b> — mainnet LAT is never given away.</div></div>
+             <div class='kv'><div class='k'>Get testnet LAT</div><div><a href='/faucet?net=testnet'>Switch to the testnet faucet →</a></div></div>
+             </div></div>"
+        );
+        return page("Faucet — Latscan", &body, net, "", false);
+    }
+
+    let result = match params.get("address").map(|a| a.trim()) {
+        Some(a) if !a.is_empty() => {
+            let (ok, msg) = faucet_send(node, a);
+            let cls = if ok { "ok" } else { "err" };
+            format!("<div class='fmsg {cls}'>{}</div>", esc(&msg))
+        }
+        _ => String::new(),
+    };
+
+    let body = format!(
+        "<div class='hero'><div class='wrap'>
+           <h1>Testnet faucet — free test LAT</h1>
+           <form class='searchbar' action='/faucet' method='get'>
+             <input name='address' placeholder='Your testnet address (latt1…)' autocomplete='off'>
+             <input type='hidden' name='net' value='{net}'>
+             <button type='submit'>Send me {amount} LAT</button>
+           </form>
+         </div></div>
+         <div class='wrap' style='padding-top:20px'>
+           {result}
+           <div class='card'><div class='ph'>How it works</div>
+             <div class='kv'><div class='k'>1 · Paste your address</div><div>Create one in the wallet app — it starts with <code>latt1</code>.</div></div>
+             <div class='kv'><div class='k'>2 · Auto-registration</div><div>If your account isn't on-chain yet, the faucet registers it first — request again a few seconds later to get paid.</div></div>
+             <div class='kv'><div class='k'>3 · Roll over</div><div>Funds arrive in your <b>pending</b> balance next block. Hit “Roll over” in your wallet to make them spendable.</div></div>
+             <div class='kv'><div class='k'>Limits</div><div>{amount} LAT per request · one request per address per minute.</div></div>
+           </div>
+         </div>",
+        amount = FAUCET_AMOUNT / 100_000,
+    );
+    page("Faucet — Latscan", &body, net, "", false)
+}
+
+/// Try to pay `raw` (a testnet address string) from the faucet. Returns
+/// `(success, user-facing message)` — never panics on bad input.
+fn faucet_send(node: &str, raw: &str) -> (bool, String) {
+    let addr = match Address::parse(raw) {
+        Ok(a) => a,
+        Err(_) => return (false, "That doesn't look like a valid address.".into()),
+    };
+    if addr.network != Network::Testnet {
+        return (false, "The faucet only pays testnet (latt1…) addresses.".into());
+    }
+    {
+        let cd = cooldowns().lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(t) = cd.1 {
+            if t.elapsed().as_secs() < GLOBAL_COOLDOWN_SECS {
+                return (false, "The faucet just paid someone (it can pay once per block) — try again in a few seconds.".into());
+            }
+        }
+        if let Some(t) = cd.0.get(raw) {
+            if t.elapsed().as_secs() < ADDRESS_COOLDOWN_SECS {
+                return (false, "This address was just funded — try again in a minute.".into());
+            }
+        }
+    }
+
+    let unreachable = || (false, format!("Testnet node unreachable at {node} — is latebrad running?"));
+    match lat_p2p::get_nonce(node, addr.id()) {
+        Err(_) => unreachable(),
+        Ok(None) => {
+            // Not on-chain yet: solve the anti-spam PoW and register it for them.
+            match lat_p2p::submit_tx(node, &mine_registration(addr.id()).encode()) {
+                Ok(true) => (true, "Your account wasn't registered yet, so the faucet submitted a registration. It mines in a few seconds — then request again to receive LAT.".into()),
+                Ok(false) => (false, "A registration for this address is already pending — wait a few seconds, then request again.".into()),
+                Err(_) => unreachable(),
+            }
+        }
+        Ok(Some(_)) => {
+            let faucet = Wallet::from_seed(Network::Testnet, FAUCET_SEED);
+            let bal = match lat_p2p::get_balance(node, faucet.id(), 0) {
+                Ok(Some(b)) => b,
+                Ok(None) => return (false, "The faucet account isn't on this chain (wrong genesis?).".into()),
+                Err(_) => return unreachable(),
+            };
+            let ct = match lat_crypto::Ciphertext::from_bytes(&bal) {
+                Some(c) => c,
+                None => return (false, "The faucet balance is unreadable.".into()),
+            };
+            let nonce = match lat_p2p::get_nonce(node, faucet.id()) {
+                Ok(Some(n)) => n,
+                _ => return unreachable(),
+            };
+            let tx = match faucet.build_transfer(&addr, 0, FAUCET_AMOUNT, MIN_TRANSFER_FEE, &ct, nonce, &mut OsRng) {
+                Some(t) => t,
+                None => return (false, "The faucet can't pay right now (balance in flux or empty) — try again shortly.".into()),
+            };
+            match lat_p2p::submit_tx(node, &tx.encode()) {
+                Ok(true) => {
+                    let mut cd = cooldowns().lock().unwrap_or_else(|p| p.into_inner());
+                    cd.0.insert(raw.to_string(), Instant::now());
+                    cd.1 = Some(Instant::now());
+                    (true, format!(
+                        "Sent {} LAT to {raw}. It lands in your PENDING balance when the next block mines — hit “Roll over” in your wallet to make it spendable.",
+                        FAUCET_AMOUNT / 100_000
+                    ))
+                }
+                Ok(false) => (false, "The node rejected the transfer (possibly a duplicate) — try again shortly.".into()),
+                Err(_) => unreachable(),
+            }
+        }
+    }
+}
+
+/// Minimal HTML escaping for user-echoed strings.
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+// --- transaction rendering -------------------------------------------------
+
+fn tag(tx: &Transaction) -> (&'static str, &'static str) {
+    match tx {
+        Transaction::Register { .. } => ("reg", "Register"),
+        Transaction::CreateToken { .. } => ("tok", "Create Token"),
+        Transaction::SolventTransfer { .. } => ("xfer", "Transfer"),
+        Transaction::Rollover { .. } => ("roll", "Rollover"),
+        Transaction::DeployContract { .. } => ("ct", "Deploy Contract"),
+        Transaction::CallContract { .. } => ("ct", "Call Contract"),
+        Transaction::PublicTransfer { .. } => ("xfer", "Public Transfer"),
+        Transaction::Shield { .. } => ("xfer", "Shield"),
+        Transaction::ShieldStealth { .. } => ("xfer", "Stealth Shield"),
+        Transaction::Unshield { .. } => ("xfer", "Unshield"),
+        Transaction::AnonTransfer { .. } => ("xfer", "Anonymous Transfer"),
+        Transaction::Transfer { .. } => ("", "Transfer (legacy)"),
+    }
+}
+
+fn tx_detail(tx: &Transaction) -> (String, String) {
+    match tx {
+        Transaction::Register { pubkey, .. } => (short(pubkey), "—".to_string()),
+        Transaction::CreateToken { ticker, supply, .. } => (format!("${ticker}"), format!("supply {}", commafy(*supply))),
+        Transaction::SolventTransfer { token, xfer } => (
+            format!("{} → {}", short(&xfer.sender.to_bytes()), short(&xfer.receiver.to_bytes())),
+            format!("<span class='pill-amt'>confidential</span> · token {token}"),
+        ),
+        Transaction::Rollover { account, .. } => (short(account), "—".to_string()),
+        Transaction::DeployContract { deployer, code, .. } => (format!("by {}", short(deployer)), format!("{} bytes", code.len())),
+        Transaction::CallContract { contract, input, .. } => (short(contract), format!("input {input}")),
+        // Public transfer: sender, receiver, and amount are all shown in the
+        // clear — the transparent half of the dual-state model.
+        Transaction::PublicTransfer { token, from, to, amount, .. } => (
+            format!("{} → {}", short(from), short(to)),
+            format!("<span class='pill-amt'>{}</span> · token {token}", commafy(*amount)),
+        ),
+        // Shield: public → private. Amount is public (it leaves the public ledger).
+        Transaction::Shield { token, from, to, amount, .. } => (
+            format!("{} → {} (private)", short(from), short(to)),
+            format!("<span class='pill-amt'>{}</span> shield · token {token}", commafy(*amount)),
+        ),
+        // Unshield: private → public. Origin is revealed; amount re-enters public.
+        Transaction::Unshield { token, to, amount, xfer, .. } => (
+            format!("{} (private) → {}", short(&xfer.sender.to_bytes()), short(to)),
+            format!("<span class='pill-amt'>{}</span> unshield · token {token}", commafy(*amount)),
+        ),
+        // Stealth shield: public → private, recipient hidden (a one-time address).
+        Transaction::ShieldStealth { token, from, amount, .. } => (
+            format!("{} → (stealth)", short(from)),
+            format!("<span class='pill-amt'>{}</span> shield · token {token}", commafy(*amount)),
+        ),
+        // Anonymous transfer: sender hidden in a ring, receiver behind a
+        // one-time stealth key. The amount is public (by design, this phase).
+        Transaction::AnonTransfer { token, xfer } => (
+            format!("(ring of {}) → (stealth)", xfer.ring.len()),
+            format!("<span class='pill-amt'>{}</span> anonymous · token {token}", commafy(xfer.amount)),
+        ),
+        Transaction::Transfer { .. } => ("—".to_string(), "—".to_string()),
+    }
+}
+
+fn tx_row(tx: &Transaction, height: u64, net: &str, ts: &u64) -> String {
+    let (cls, label) = tag(tx);
+    let (detail, _amount) = tx_detail(tx);
+    format!(
+        "<div class='row'>
+           <div class='ic'>{IC_TX}</div>
+           <div class='mid'><div class='t1'><span class='tag {cls}'>{label}</span></div>
+             <div class='t2 hash'>{detail}</div></div>
+           <div class='rt'><a href='/block/{height}?net={net}'>#{height}</a><br><span class='muted'>{} ago</span></div>
+         </div>",
+        ago(*ts)
+    )
+}
+
+fn tx_table_row(tx: &Transaction) -> String {
+    let (cls, label) = tag(tx);
+    let (detail, amount) = tx_detail(tx);
+    format!("<tr><td><span class='tag {cls}'>{label}</span></td><td class='hash'>{detail}</td><td>{amount}</td></tr>")
+}
+
+fn node_offline(node: &str, net: &str) -> String {
+    format!(
+        "<div class='wrap' style='padding-top:32px'><div class='card'><div class='ph'>{net} node unreachable</div>
+         <div class='kv'><div class='k'>Node</div><div class='hash'>{node}</div></div>
+         <div class='kv'><div class='k'>Fix</div><div>Start it with <code>latebrad --mine --listen {node}</code>, or switch network above.</div></div>
+         </div></div>"
+    )
+}
+
+// --- page scaffold ---------------------------------------------------------
+
+fn page(title: &str, body: &str, net: &str, status: &str, refresh: bool) -> String {
+    let meta_refresh = if refresh { "<meta http-equiv='refresh' content='8'>" } else { "" };
+    let pill = |n: &str, label: &str| {
+        let active = if n == net { " active" } else { "" };
+        format!("<a class='pill{active}' href='/?net={n}'>{label}</a>")
+    };
+    let net_label = if net == "mainnet" { "Mainnet" } else { "Testnet" };
+    format!(
+        "<!doctype html><html lang='en'><head><meta charset='utf-8'>
+         <meta name='viewport' content='width=device-width, initial-scale=1'>
+         <link rel='icon' href=\"{logo}\">
+         {meta_refresh}<title>{title}</title><style>{css}</style></head><body>
+         <div class='strip'><div class='wrap'>
+           <span>Latebra Blockchain Explorer</span>
+           <span>{status}{}<b class='netbadge'>{net_label}</b></span>
+         </div></div>
+         <div class='hdr'><div class='wrap'>
+           <a class='brand' href='/?net={net}'><img class='brandlogo' src=\"{logo}\" alt=''>Latscan</a>
+           <nav class='nav'>
+             <a href='/?net={net}'>Home</a>
+             <a href='/faucet?net={net}'>Faucet</a>
+             {}{}
+           </nav>
+         </div></div>
+         {body}
+         <footer><div class='wrap cols2'>
+           <div><b>Latscan</b> — the Latebra block explorer.<br>Balances and amounts are encrypted on-chain.</div>
+           <div class='muted'>Powered by latebrad · testnet-grade software</div>
+         </div></footer>
+         </body></html>",
+        if status.is_empty() { "" } else { " · " },
+        pill("mainnet", "Mainnet"),
+        pill("testnet", "Testnet"),
+        css = css(),
+        logo = LOGO,
+    )
+}
+
+fn scard(icon: &str, label: &str, value: &str) -> String {
+    format!("<div class='scard'><div class='ic'>{icon}</div><div><div class='lab'>{label}</div><div class='val'>{value}</div></div></div>")
+}
+
+fn css() -> String {
+    format!(
+        ":root{{--accent:{ACCENT};--accent-d:#ffbe6e;--bg:#131316;--surface:#1c1c22;--surface2:#26262e;--ink:#f3f3f6;--muted:#9a9aa6;--faint:#6c6c78;--line:rgba(255,255,255,.08);--soft:rgba(245,160,60,.13)}}
+        *{{box-sizing:border-box}}
+        body{{margin:0;background:radial-gradient(1100px 520px at 50% -8%,#2c2114 0%,rgba(44,33,20,0) 60%),var(--bg);color:var(--ink);font:14px/1.55 'Inter',system-ui,-apple-system,Segoe UI,sans-serif}}
+        a{{color:var(--accent);text-decoration:none}} a:hover{{color:var(--accent-d)}}
+        .wrap{{max-width:1200px;margin:0 auto;padding:0 16px}}
+        .strip{{background:rgba(255,255,255,.02);border-bottom:1px solid var(--line);font-size:12px;color:var(--muted)}}
+        .strip .wrap{{display:flex;justify-content:space-between;align-items:center;height:34px}}
+        .netbadge{{color:var(--accent);margin-left:6px}}
+        .hdr{{background:rgba(19,19,22,.7);backdrop-filter:blur(10px);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:10}}
+        .hdr .wrap{{display:flex;align-items:center;height:62px}}
+        .brand{{display:flex;align-items:center;gap:10px;font-weight:700;font-size:18px;color:var(--ink)}}
+        .brand:hover{{color:var(--ink)}}
+        .brandlogo{{width:26px;height:26px;display:block;filter:drop-shadow(0 2px 6px rgba(245,160,60,.35))}}
+        .nav{{display:flex;gap:14px;margin-left:auto;align-items:center;font-weight:500}}
+        .nav a{{color:var(--ink)}} .nav a:hover{{color:var(--accent)}}
+        .pill{{padding:5px 12px;border-radius:999px;border:1px solid var(--line);font-size:13px;font-weight:600;color:var(--muted)}}
+        .pill:hover{{color:var(--accent)}}
+        .pill.active{{background:var(--soft);color:var(--accent);border-color:rgba(245,160,60,.4)}}
+        .hero{{background:linear-gradient(180deg,rgba(245,160,60,.10),rgba(245,160,60,0));border-bottom:1px solid var(--line);padding:30px 0 78px}}
+        .hero h1{{font-size:22px;margin:0 0 16px;font-weight:700;letter-spacing:-.2px}}
+        .searchbar{{display:flex;max-width:720px;background:var(--surface);border:1px solid var(--line);border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,.35);overflow:hidden}}
+        .searchbar input{{flex:1;border:0;padding:13px 15px;font-size:14px;outline:none;background:transparent;color:var(--ink)}}
+        .searchbar input::placeholder{{color:var(--faint)}}
+        .searchbar button{{border:0;background:var(--accent);color:#2a1a05;padding:0 22px;font-weight:700;cursor:pointer}}
+        .searchbar button:hover{{background:var(--accent-d)}}
+        .stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-top:-50px;margin-bottom:24px}}
+        @media(max-width:820px){{.stats{{grid-template-columns:repeat(2,1fr)}}}}
+        .scard{{background:var(--surface);border:1px solid var(--line);border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.28);padding:16px 17px;display:flex;gap:12px;align-items:center}}
+        .scard .ic{{width:42px;height:42px;border-radius:12px;background:var(--soft);color:var(--accent);display:flex;align-items:center;justify-content:center;flex:none}}
+        .scard .ic svg{{width:21px;height:21px}}
+        .scard .lab{{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}}
+        .scard .val{{font-size:17px;font-weight:700;margin-top:2px}}
+        .cols{{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:28px}}
+        @media(max-width:820px){{.cols{{grid-template-columns:1fr}}}}
+        .panel,.card{{background:var(--surface);border:1px solid var(--line);border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.24);overflow:hidden}}
+        .card{{margin-bottom:20px}}
+        .panel .ph,.card .ph{{padding:15px 18px;border-bottom:1px solid var(--line);font-weight:700;font-size:15px}}
+        .row{{display:flex;align-items:center;gap:12px;padding:13px 18px;border-bottom:1px solid var(--line)}}
+        .row:last-of-type{{border-bottom:none}}
+        .row:hover{{background:rgba(255,255,255,.02)}}
+        .row .ic{{width:38px;height:38px;border-radius:11px;background:var(--soft);color:var(--accent);display:flex;align-items:center;justify-content:center;flex:none}}
+        .row .ic svg{{width:19px;height:19px}}
+        .row .mid{{flex:1;min-width:0;overflow:hidden}}
+        .row .t1{{font-weight:600}} .row .t2{{font-size:12.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+        .row .rt{{text-align:right;font-size:12.5px;color:var(--muted);white-space:nowrap}}
+        .pf{{display:block;padding:13px 18px;text-align:center;font-weight:600;border-top:1px solid var(--line);background:rgba(255,255,255,.02);color:var(--accent)}}
+        .kv{{display:grid;grid-template-columns:210px 1fr;gap:10px;padding:13px 18px;border-bottom:1px solid var(--line);font-size:13.5px}}
+        .kv:last-child{{border-bottom:none}} .kv .k{{color:var(--muted)}}
+        .bnav{{display:flex;justify-content:space-between;align-items:center;background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:11px 16px;margin-bottom:16px;font-weight:600}}
+        table{{width:100%;border-collapse:collapse}}
+        th,td{{text-align:left;padding:12px 18px;border-bottom:1px solid var(--line);font-size:13.5px}}
+        th{{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;background:rgba(255,255,255,.02)}}
+        tr:last-child td{{border-bottom:none}}
+        .hash{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#b7b7c4;word-break:break-all}}
+        .muted{{color:var(--muted)}}
+        .tag{{display:inline-block;padding:2px 9px;border-radius:7px;font-size:12px;font-weight:600;background:rgba(255,255,255,.05);border:1px solid var(--line);color:var(--muted)}}
+        .tag.xfer{{background:rgba(245,160,60,.14);color:#ffca8a;border-color:rgba(245,160,60,.3)}}
+        .tag.tok{{background:rgba(47,212,127,.12);color:#6fe3a8;border-color:rgba(47,212,127,.25)}}
+        .tag.reg{{background:rgba(120,150,255,.13);color:#a0b6ff;border-color:rgba(120,150,255,.28)}}
+        .tag.roll{{background:rgba(240,180,90,.12);color:#f0c58a;border-color:rgba(240,180,90,.25)}}
+        .tag.ct{{background:rgba(90,190,220,.14);color:#8fd4e8;border-color:rgba(90,190,220,.3)}}
+        .pill-amt{{background:var(--soft);color:var(--accent);border:1px solid rgba(245,160,60,.28);border-radius:7px;padding:1px 8px;font-size:12px;font-weight:600}}
+        code{{background:rgba(255,255,255,.06);padding:2px 6px;border-radius:6px;font-size:13px;color:#ffca8a}}
+        .fmsg{{border-radius:12px;padding:13px 16px;margin-bottom:18px;font-weight:600;border:1px solid}}
+        .fmsg.ok{{background:rgba(47,212,127,.1);color:#6fe3a8;border-color:rgba(47,212,127,.3)}}
+        .fmsg.err{{background:rgba(240,97,109,.1);color:#f4a3a9;border-color:rgba(240,97,109,.3)}}
+        footer{{background:rgba(255,255,255,.02);border-top:1px solid var(--line);margin-top:24px;padding:26px 0;color:var(--muted);font-size:13px}}
+        footer .cols2{{display:flex;justify-content:space-between;flex-wrap:wrap;gap:20px}} footer b{{color:var(--ink)}}"
+    )
+}
+
+// --- helpers ---------------------------------------------------------------
+
+fn avg_block_time(blocks: &[(u64, Block)]) -> Option<f64> {
+    // Exclude the genesis block: its timestamp is a fixed constant far in the past
+    // and would swamp the average. Use only mined blocks (height > 0), newest-first.
+    let mined: Vec<u64> = blocks.iter().filter(|(h, _)| *h > 0).map(|(_, b)| b.header.timestamp).collect();
+    if mined.len() < 2 {
+        return None;
+    }
+    let span = mined.first()?.checked_sub(*mined.last()?)? as f64;
+    if span == 0.0 {
+        return None;
+    }
+    Some(span / (mined.len() - 1) as f64)
+}
+
+fn fmt_lat(units: u64) -> String {
+    format!("{}.{:05}", commafy(units / 100_000), units % 100_000)
+}
+
+fn commafy(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::new();
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn short(bytes: &[u8]) -> String {
+    let h = hex(bytes);
+    if h.len() > 16 { format!("{}…{}", &h[..10], &h[h.len() - 8..]) } else { h }
+}
+
+fn ago(ts: u64) -> String {
+    if ts == 0 {
+        return "—".to_string();
+    }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(ts);
+    let secs = now.saturating_sub(ts);
+    if secs < 60 { format!("{secs} secs") } else if secs < 3600 { format!("{} mins", secs / 60) } else { format!("{} hrs", secs / 3600) }
+}

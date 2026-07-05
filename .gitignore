@@ -1,0 +1,18 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Node runtime data (regenerated on run — not source)
+/latebra-data/
+/node-b/
+
+# Embedded DB, chain logs, snapshots, process output
+*.redb
+*.redb.lock
+*.log
+*.out
+*.snap
+*.old-format.bak
+
+# Local editor / tool state
+.claude/settings.local.json

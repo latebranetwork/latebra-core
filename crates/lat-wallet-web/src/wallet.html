@@ -1,0 +1,544 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Latebra Wallet</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><defs><mask id='latm'><rect width='512' height='512' fill='%23000'/><rect x='108' y='104' width='230' height='304' rx='52' fill='%23fff'/><path fill='%23000' d='M192 180H362V292a24 24 0 0 1-24 24H216a24 24 0 0 1-24-24Z'/><rect x='192' y='104' width='34' height='80' fill='%23000'/></mask></defs><g mask='url(%23latm)'><rect width='512' height='512' fill='%23F5A03C'/></g><g fill='%23F5A03C'><rect x='410' y='150' width='30' height='30' rx='5'/><rect x='360' y='182' width='24' height='24' rx='4'/><rect x='404' y='216' width='22' height='22' rx='4'/><rect x='356' y='238' width='18' height='18' rx='3'/><rect x='392' y='262' width='30' height='30' rx='5'/><rect x='352' y='298' width='16' height='16' rx='3'/><rect x='404' y='300' width='14' height='14' rx='3'/><rect x='368' y='330' width='18' height='18' rx='3'/></g></svg>">
+<style>
+:root{
+  --bg:#131316; --surface:#1c1c22; --surface2:#26262e; --surface3:#2f2f38;
+  --purple:#F5A03C; --purple-d:#e07c25; --grad1:#ffb661; --grad2:#e07c25;
+  --ink:#ffffff; --muted:#9a9aa6; --faint:#6c6c78;
+  --green:#2fd47f; --red:#f0616d; --line:rgba(255,255,255,.07);
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%}
+body{margin:0;background:
+  radial-gradient(1200px 600px at 50% -10%, #2c2114 0%, rgba(44,33,20,0) 60%),
+  var(--bg);
+  color:var(--ink);font:15px/1.5 'Inter',system-ui,-apple-system,Segoe UI,sans-serif;
+  display:flex;justify-content:center;min-height:100%}
+.phone{width:100%;max-width:430px;min-height:100vh;background:var(--bg);
+  position:relative;display:flex;flex-direction:column;
+  box-shadow:0 0 0 1px var(--line), 0 30px 80px rgba(0,0,0,.5)}
+.scroll{flex:1;overflow-y:auto;padding-bottom:84px}
+
+/* header */
+.hdr{display:flex;align-items:center;gap:10px;padding:16px 18px 6px}
+.iconbtn{width:38px;height:38px;border-radius:50%;background:var(--surface2);border:0;
+  display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--ink);flex:0 0 auto}
+.iconbtn:hover{background:var(--surface3)}
+.iconbtn svg{width:18px;height:18px}
+.acct{flex:1;display:flex;align-items:center;justify-content:center;gap:9px;cursor:pointer;
+  background:var(--surface2);border-radius:999px;padding:7px 14px;border:0;color:var(--ink);font:inherit;font-weight:600}
+.acct:hover{background:var(--surface3)}
+.avatar{width:24px;height:24px;border-radius:50%;flex:0 0 auto;
+  background:linear-gradient(135deg,var(--grad1),var(--grad2))}
+.acct .chev{width:14px;height:14px;color:var(--muted)}
+
+/* hero */
+.hero{text-align:center;padding:26px 18px 10px}
+.hero .amt{font-size:44px;font-weight:700;letter-spacing:-1px;line-height:1.1}
+.hero .amt small{font-size:22px;font-weight:600;color:var(--muted);margin-left:6px}
+.hero .chg{display:inline-flex;align-items:center;gap:6px;margin-top:10px;font-size:14px;font-weight:600;
+  color:var(--green);background:rgba(47,212,127,.12);padding:4px 11px;border-radius:999px}
+.hero .chg.flat{color:var(--muted);background:var(--surface2)}
+
+/* action row */
+.actions{display:flex;justify-content:center;gap:22px;padding:20px 10px 22px}
+.act{display:flex;flex-direction:column;align-items:center;gap:8px;background:none;border:0;cursor:pointer;color:var(--ink);font:inherit}
+.act .circ{width:56px;height:56px;border-radius:50%;background:rgba(245,160,60,.13);
+  display:flex;align-items:center;justify-content:center;transition:.15s}
+.act:hover .circ{background:rgba(245,160,60,.22)}
+.act .circ svg{width:23px;height:23px;color:var(--purple)}
+.act span{font-size:12.5px;font-weight:600;color:var(--muted)}
+.act[disabled]{opacity:.4;cursor:default}
+.act[disabled]:hover .circ{background:rgba(245,160,60,.13)}
+
+/* cards / token list */
+.pad{padding:0 14px}
+.list{background:var(--surface);border-radius:18px;overflow:hidden;border:1px solid var(--line)}
+.tok{display:flex;align-items:center;gap:13px;padding:15px 16px;cursor:pointer;border-bottom:1px solid var(--line)}
+.tok:last-child{border-bottom:0}
+.tok:hover{background:var(--surface2)}
+.tok .logo{width:42px;height:42px;border-radius:50%;flex:0 0 auto;display:flex;align-items:center;justify-content:center;
+  background:linear-gradient(135deg,#2e2519,#1c160e);position:relative}
+.tok .logo b{font-size:16px;font-weight:800;background:linear-gradient(135deg,var(--grad1),var(--grad2));-webkit-background-clip:text;background-clip:text;color:transparent}
+.tok .logo.pub{background:linear-gradient(135deg,#20303a,#16212a)}
+.tok .logo.pub b{background:linear-gradient(135deg,#7fe0ff,#3aa0d6);-webkit-background-clip:text;background-clip:text}
+.tok .meta{flex:1;min-width:0}
+.tok .meta .n{font-weight:600}
+.tok .meta .s{font-size:12.5px;color:var(--muted);margin-top:1px}
+.tok .val{text-align:right}
+.tok .val .b{font-weight:600}
+.tok .val .f{font-size:12.5px;color:var(--muted);margin-top:1px}
+.tag{display:inline-block;font-size:10.5px;font-weight:700;letter-spacing:.03em;padding:2px 7px;border-radius:6px;vertical-align:middle}
+.tag.priv{color:var(--purple);background:rgba(245,160,60,.14)}
+.tag.pubt{color:#7fe0ff;background:rgba(127,224,255,.12)}
+
+.section-t{color:var(--faint);font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin:20px 6px 9px}
+
+/* pending / activate banners */
+.banner{display:flex;align-items:center;gap:12px;background:linear-gradient(135deg,rgba(245,160,60,.16),rgba(224,126,42,.10));
+  border:1px solid rgba(245,160,60,.28);border-radius:16px;padding:14px 15px;margin:14px}
+.banner .bi{width:40px;height:40px;border-radius:50%;background:rgba(245,160,60,.2);display:flex;align-items:center;justify-content:center;flex:0 0 auto}
+.banner .bi svg{width:19px;height:19px;color:var(--purple)}
+.banner .bt{flex:1}.banner .bt .t{font-weight:600;font-size:14px}.banner .bt .d{color:var(--muted);font-size:12.5px}
+.banner button{width:auto;padding:9px 16px;font-size:13.5px;flex:0 0 auto}
+
+/* bottom nav */
+.nav{position:fixed;bottom:0;left:50%;transform:translateX(-50%);width:100%;max-width:430px;
+  background:rgba(19,19,22,.9);backdrop-filter:blur(14px);border-top:1px solid var(--line);
+  display:flex;justify-content:space-around;padding:9px 8px calc(9px + env(safe-area-inset-bottom))}
+.nav a{background:none;border:0;cursor:pointer;color:var(--faint);display:flex;flex-direction:column;align-items:center;gap:3px;padding:5px 12px;font:inherit;font-size:10.5px;font-weight:600}
+.nav a svg{width:22px;height:22px}
+.nav a.on{color:var(--purple)}
+
+/* buttons + inputs (shared) */
+button{font:inherit;font-weight:600;border-radius:13px;border:0;background:var(--surface2);color:var(--ink);padding:14px 16px;cursor:pointer;width:100%}
+button:hover{background:var(--surface3)}
+button.primary{background:var(--purple);color:#2a1a05}button.primary:hover{background:var(--purple-d)}
+button.ghost{background:transparent;border:1px solid var(--line)}button.ghost:hover{background:var(--surface2)}
+button.danger{background:transparent;border:1px solid rgba(240,97,109,.4);color:var(--red)}button.danger:hover{background:rgba(240,97,109,.1)}
+.row{display:flex;gap:11px}.row button{width:auto;flex:1}
+label{display:block;font-size:12px;font-weight:600;letter-spacing:.03em;color:var(--muted);margin:0 0 7px}
+input{width:100%;border:1px solid var(--line);border-radius:13px;padding:14px;font:inherit;outline:none;margin-bottom:15px;
+  background:var(--surface2);color:var(--ink)}
+input::placeholder{color:var(--faint)}
+input:focus{border-color:var(--purple);background:var(--surface3)}
+
+/* onboarding */
+.onb{flex:1;display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;padding:34px 26px}
+.ghost-logo{width:96px;height:96px;border-radius:28px;background:linear-gradient(150deg,var(--grad1),var(--grad2));
+  display:flex;align-items:center;justify-content:center;margin-bottom:26px;box-shadow:0 18px 50px rgba(224,126,42,.45)}
+.ghost-logo svg{width:56px;height:56px;color:#fff}
+.onb h1{font-size:26px;margin:0 0 8px;font-weight:700}
+.onb p{color:var(--muted);margin:0 0 30px;max-width:300px}
+.onb .full{width:100%;max-width:320px}
+.onb .full button{margin-bottom:12px}
+.seedbox{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;color:#dcdce6;word-break:break-all;
+  background:var(--surface2);border:1px solid var(--line);border-radius:14px;padding:15px;text-align:left;line-height:1.7}
+.warn{display:flex;gap:11px;text-align:left;background:rgba(240,97,109,.08);border:1px solid rgba(240,97,109,.28);
+  color:#f4a3a9;border-radius:14px;padding:13px 14px;font-size:13px;margin-bottom:18px}
+.warn svg{width:20px;height:20px;flex:0 0 auto;color:var(--red);margin-top:1px}
+
+/* sheet */
+.backdrop{position:fixed;inset:0;background:rgba(0,0,0,.55);opacity:0;pointer-events:none;transition:.2s;z-index:40}
+.backdrop.show{opacity:1;pointer-events:auto}
+.sheet{position:fixed;left:50%;bottom:0;transform:translate(-50%,100%);width:100%;max-width:430px;
+  background:var(--surface);border-radius:24px 24px 0 0;padding:8px 20px calc(26px + env(safe-area-inset-bottom));
+  transition:transform .26s cubic-bezier(.2,.8,.2,1);z-index:50;border:1px solid var(--line)}
+.sheet.show{transform:translate(-50%,0)}
+.grip{width:38px;height:4px;border-radius:2px;background:var(--surface3);margin:8px auto 16px}
+.sheet h3{margin:0 0 4px;font-size:19px}
+.sheet .sub{color:var(--muted);font-size:13.5px;margin:0 0 18px}
+.qr{width:170px;height:170px;margin:6px auto 16px;border-radius:16px;background:#fff;display:flex;align-items:center;justify-content:center;padding:12px}
+.addrbox{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;color:#dcdce6;word-break:break-all;
+  background:var(--surface2);border:1px solid var(--line);border-radius:14px;padding:14px;text-align:center;margin-bottom:14px}
+.set-row{display:flex;align-items:center;gap:13px;padding:15px 4px;border-bottom:1px solid var(--line);cursor:pointer}
+.set-row:last-child{border-bottom:0}
+.set-row .si{width:36px;height:36px;border-radius:10px;background:var(--surface2);display:flex;align-items:center;justify-content:center;flex:0 0 auto}
+.set-row .si svg{width:18px;height:18px;color:var(--purple)}
+.set-row .st{flex:1}.set-row .st .t{font-weight:600}.set-row .st .d{color:var(--muted);font-size:12.5px}
+.set-row .chev{width:16px;height:16px;color:var(--faint)}
+.pillnode{display:flex;gap:9px;align-items:center;margin:2px 0 16px}
+.pillnode input{margin:0;flex:1;padding:11px 13px;font-size:13px}
+.pillnode button{width:auto;padding:11px 15px}
+
+/* segmented toggle (send source / move direction) */
+.seg{display:flex;background:var(--surface2);border-radius:13px;padding:4px;margin:0 0 14px;gap:4px}
+.seg button{flex:1;padding:10px 6px;border-radius:10px;background:transparent;font-size:13px;color:var(--muted)}
+.seg button:hover{background:var(--surface3)}
+.seg button.on,.seg button.on:hover{background:var(--purple);color:#2a1a05}
+.hint{font-size:12.5px;color:var(--muted);background:var(--surface2);border:1px solid var(--line);
+  border-radius:12px;padding:11px 13px;margin:0 0 15px;line-height:1.55}
+.hint b{color:var(--ink)}
+
+/* toast */
+.toast{position:fixed;left:50%;bottom:96px;transform:translateX(-50%);background:#2a2a33;color:#fff;
+  padding:12px 18px;border-radius:12px;font-size:14px;font-weight:500;opacity:0;transition:.25s;pointer-events:none;
+  max-width:90%;text-align:center;z-index:60;border:1px solid var(--line);box-shadow:0 12px 40px rgba(0,0,0,.5)}
+.toast.show{opacity:1}
+.toast.err{background:#3a2226;border-color:rgba(240,97,109,.4)}
+
+/* welcome + splash logo */
+.welcome-mark{width:104px;height:104px;margin-bottom:24px;filter:drop-shadow(0 14px 34px rgba(245,160,60,.4))}
+.splash{position:fixed;inset:0;z-index:200;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:24px;
+  background:radial-gradient(1200px 600px at 50% -10%, #2c2114 0%, rgba(44,33,20,0) 60%), var(--bg);
+  transition:opacity .55s ease}
+.splash.hide{opacity:0;pointer-events:none}
+.splash .mark{width:128px;height:128px;filter:drop-shadow(0 12px 34px rgba(245,160,60,.42));
+  animation:markin .8s cubic-bezier(.2,.9,.25,1) both}
+.splash .mark .px rect{transform-box:fill-box;transform-origin:center;opacity:0;transform:scale(0);
+  animation:pxin .5s cubic-bezier(.2,.9,.25,1) forwards}
+.splash .mark .px rect:nth-child(1){animation-delay:.5s}
+.splash .mark .px rect:nth-child(2){animation-delay:.58s}
+.splash .mark .px rect:nth-child(3){animation-delay:.66s}
+.splash .mark .px rect:nth-child(4){animation-delay:.74s}
+.splash .mark .px rect:nth-child(5){animation-delay:.82s}
+.splash .mark .px rect:nth-child(6){animation-delay:.9s}
+.splash .mark .px rect:nth-child(7){animation-delay:.98s}
+.splash .mark .px rect:nth-child(8){animation-delay:1.06s}
+.splash .name{font-size:14px;font-weight:700;letter-spacing:.5em;text-indent:.5em;color:var(--muted);
+  opacity:0;animation:namein .6s ease .55s forwards}
+@keyframes markin{from{opacity:0;transform:scale(.55)}to{opacity:1;transform:scale(1)}}
+@keyframes pxin{from{opacity:0;transform:scale(0) translateX(-10px)}to{opacity:1;transform:scale(1) translateX(0)}}
+@keyframes namein{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+@media(prefers-reduced-motion:reduce){.splash .mark,.splash .mark .px rect,.splash .name{animation:none;opacity:1;transform:none}}
+</style>
+</head>
+<body>
+<div class="splash" id="splash">
+  <div class="mark">
+    <svg viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg" width="128" height="128">
+      <defs><mask id="latm">
+        <rect width="512" height="512" fill="#000"/>
+        <rect x="108" y="104" width="230" height="304" rx="52" fill="#fff"/>
+        <path fill="#000" d="M192 180H362V292a24 24 0 0 1-24 24H216a24 24 0 0 1-24-24Z"/>
+        <rect x="192" y="104" width="34" height="80" fill="#000"/>
+      </mask></defs>
+      <g mask="url(#latm)"><rect width="512" height="512" fill="#F5A03C"/></g>
+      <g class="px" fill="#F5A03C">
+        <rect x="410" y="150" width="30" height="30" rx="5"/>
+        <rect x="360" y="182" width="24" height="24" rx="4"/>
+        <rect x="404" y="216" width="22" height="22" rx="4"/>
+        <rect x="356" y="238" width="18" height="18" rx="3"/>
+        <rect x="392" y="262" width="30" height="30" rx="5"/>
+        <rect x="352" y="298" width="16" height="16" rx="3"/>
+        <rect x="404" y="300" width="14" height="14" rx="3"/>
+        <rect x="368" y="330" width="18" height="18" rx="3"/>
+      </g>
+    </svg>
+  </div>
+  <div class="name">LATEBRA</div>
+</div>
+<div class="phone">
+  <div class="scroll" id="app"></div>
+</div>
+<div class="backdrop" id="backdrop" onclick="closeSheet()"></div>
+<div class="sheet" id="sheet"></div>
+<div class="toast" id="toast"></div>
+
+<script>
+const $=(id)=>document.getElementById(id);
+let NODE=localStorage.getItem('lat_node')||'127.0.0.1:4040';
+let SEED=localStorage.getItem('lat_seed')||'';
+let ADDR=localStorage.getItem('lat_addr')||'';
+let LAST={registered:false,spendable:'0.00000',pending:'0.00000',public:'0.00000',total:'0.00000'};
+let poll=null;
+const LOGO="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><defs><mask id='latm2'><rect width='512' height='512' fill='%23000'/><rect x='108' y='104' width='230' height='304' rx='52' fill='%23fff'/><path fill='%23000' d='M192 180H362V292a24 24 0 0 1-24 24H216a24 24 0 0 1-24-24Z'/><rect x='192' y='104' width='34' height='80' fill='%23000'/></mask></defs><g mask='url(%23latm2)'><rect width='512' height='512' fill='%23F5A03C'/></g><g fill='%23F5A03C'><rect x='410' y='150' width='30' height='30' rx='5'/><rect x='360' y='182' width='24' height='24' rx='4'/><rect x='404' y='216' width='22' height='22' rx='4'/><rect x='356' y='238' width='18' height='18' rx='3'/><rect x='392' y='262' width='30' height='30' rx='5'/><rect x='352' y='298' width='16' height='16' rx='3'/><rect x='404' y='300' width='14' height='14' rx='3'/><rect x='368' y='330' width='18' height='18' rx='3'/></g></svg>";
+
+/* ---- icons ---- */
+const I={
+  ghost:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C7.6 2 4 5.6 4 10v10.2c0 .8.9 1.2 1.5.7l1.6-1.3 1.7 1.4c.3.3.8.3 1.1 0l1.7-1.4 1.7 1.4c.3.3.8.3 1.1 0l1.7-1.4 1.6 1.3c.6.5 1.5.1 1.5-.7V10c0-4.4-3.6-8-8-8zm-3 9a1.4 1.4 0 110-2.8A1.4 1.4 0 019 11zm6 0a1.4 1.4 0 110-2.8A1.4 1.4 0 0115 11z"/></svg>',
+  recv:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M6 13l6 6 6-6"/></svg>',
+  send:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M6 11l6-6 6 6"/></svg>',
+  roll:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 11-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>',
+  gear:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.6 1.6 0 00-2.7.7 1.6 1.6 0 01-3.2 0 1.6 1.6 0 00-2.7-.7l-.1.1a2 2 0 11-2.8-2.8l.1-.1A1.6 1.6 0 004.6 15a1.6 1.6 0 00-1.5-1H3a2 2 0 010-4h.1A1.6 1.6 0 004.6 9a1.6 1.6 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.6 1.6 0 001.8.3H9a1.6 1.6 0 001-1.5V3a2 2 0 014 0v.1a1.6 1.6 0 001 1.5 1.6 1.6 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.6 1.6 0 00-.3 1.8V9a1.6 1.6 0 001.5 1H21a2 2 0 010 4h-.1a1.6 1.6 0 00-1.5 1z"/></svg>',
+  copy:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M5 15V5a2 2 0 012-2h10"/></svg>',
+  chev:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>',
+  chevr:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>',
+  home:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5L12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/></svg>',
+  swap:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3l4 4-4 4"/><path d="M21 7H7"/><path d="M7 21l-4-4 4-4"/><path d="M3 17h14"/></svg>',
+  disc:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M15.5 8.5l-2 5-5 2 2-5 5-2z"/></svg>',
+  act:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
+  key:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="4"/><path d="M10.8 12.2L21 2m-4 4l3 3m-6 0l3 3"/></svg>',
+  net:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.7 2.5 15.3 0 18M12 3c-2.5 2.7-2.5 15.3 0 18"/></svg>',
+  out:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 4h3a2 2 0 012 2v12a2 2 0 01-2 2h-3"/><path d="M10 17l5-5-5-5M15 12H3"/></svg>',
+  warn:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9L2 18a2 2 0 001.7 3h16.6a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z"/></svg>',
+  spark:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l2.4 6.4L21 11l-6.6 2.6L12 20l-2.4-6.4L3 11l6.6-2.6z"/></svg>',
+  drop:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3s6 6.5 6 10.5a6 6 0 11-12 0C6 9.5 12 3 12 3z"/></svg>',
+};
+
+function toast(m,e){const t=$('toast');t.textContent=m;t.className='toast show'+(e?' err':'');clearTimeout(t._t);t._t=setTimeout(()=>t.className='toast',2600);}
+async function api(path,params){params.node=NODE;const q=Object.entries(params).map(([k,v])=>k+'='+encodeURIComponent(v)).join('&');const r=await fetch('/api/'+path+'?'+q);return r.json();}
+function save(){localStorage.setItem('lat_seed',SEED);localStorage.setItem('lat_addr',ADDR);}
+function copyText(t,m){navigator.clipboard.writeText(t);toast(m||'copied');}
+function shortAddr(a){return a?a.slice(0,8)+'…'+a.slice(-6):'';}
+
+/* ================= onboarding ================= */
+function showWelcome(){
+  if(poll){clearInterval(poll);poll=null;}
+  $('app').innerHTML=`
+    <div class="onb">
+      <img class="welcome-mark" src="${LOGO}" alt="Latebra">
+      <h1>Latebra Wallet</h1>
+      <p>A private wallet for the Latebra chain. Your keys stay in this browser.</p>
+      <div class="full">
+        <button class="primary" onclick="createWallet()">Create a new wallet</button>
+        <button class="ghost" onclick="showImport()">I already have a seed</button>
+      </div>
+    </div>`;
+}
+function showImport(){
+  $('app').innerHTML=`
+    <div class="hdr"><button class="iconbtn" onclick="showWelcome()">${I.chev}</button><div style="flex:1"></div></div>
+    <div class="onb" style="justify-content:flex-start;padding-top:20px">
+      <div class="ghost-logo" style="width:70px;height:70px;border-radius:20px;margin-bottom:18px">${I.key}</div>
+      <h1 style="font-size:22px">Import wallet</h1>
+      <p>Paste your 64-character secret seed.</p>
+      <div class="full">
+        <input id="imp" placeholder="2a2a2a…" autocomplete="off" spellcheck="false">
+        <button class="primary" onclick="doImport()">Import</button>
+      </div>
+    </div>`;
+}
+async function doImport(){
+  const s=$('imp').value.trim();
+  const r=await api('address',{seed:s,net:'testnet'});
+  if(r.address){SEED=s;ADDR=r.address;save();showWallet();toast('wallet imported');}
+  else toast('invalid seed',true);
+}
+async function createWallet(){
+  const r=await api('new',{net:'testnet'});
+  SEED=r.seed;ADDR=r.address;save();
+  $('app').innerHTML=`
+    <div class="onb" style="justify-content:flex-start;padding-top:34px">
+      <div class="ghost-logo" style="width:70px;height:70px;border-radius:20px;margin-bottom:20px">${I.key}</div>
+      <h1 style="font-size:22px">Your secret seed</h1>
+      <p>Write it down and keep it safe. It's the only way to recover this wallet.</p>
+      <div class="full">
+        <div class="warn">${I.warn}<div>Anyone with this seed controls your funds. Never share it.</div></div>
+        <div class="seedbox" id="seedbox">${SEED}</div>
+        <button class="ghost" style="margin:12px 0" onclick="copyText(SEED,'seed copied')">Copy seed</button>
+        <button class="primary" onclick="showWallet()">I saved it — open wallet</button>
+      </div>
+    </div>`;
+}
+
+/* ================= main wallet ================= */
+function showWallet(){
+  closeSheet();
+  $('app').innerHTML=`
+    <div class="hdr">
+      <button class="iconbtn" onclick="openReceive()" title="Receive">${I.recv}</button>
+      <button class="acct" onclick="openSettings()">
+        <span class="avatar"></span><span>Account 1</span><span class="chev">${I.chev}</span>
+      </button>
+      <button class="iconbtn" onclick="openSettings()" title="Settings">${I.gear}</button>
+    </div>
+
+    <div class="hero">
+      <div class="amt" id="hero">0.00<small>LAT</small></div>
+      <div class="chg flat" id="chg">Testnet · Latebra</div>
+    </div>
+
+    <div class="actions">
+      <button class="act" onclick="openReceive()"><span class="circ">${I.recv}</span><span>Receive</span></button>
+      <button class="act" onclick="openSend()"><span class="circ">${I.send}</span><span>Send</span></button>
+      <button class="act" onclick="openMove()"><span class="circ">${I.swap}</span><span>Shield</span></button>
+      <button class="act" onclick="faucet()"><span class="circ">${I.drop}</span><span>Faucet</span></button>
+    </div>
+
+    <div id="regbar"></div>
+    <div id="pendbar"></div>
+
+    <div class="pad">
+      <div class="section-t">Tokens</div>
+      <div class="list">
+        <div class="tok" onclick="openMove('unshield')">
+          <div class="logo"><b>L</b></div>
+          <div class="meta"><div class="n">Latebra <span class="tag priv">PRIVATE</span></div><div class="s">Encrypted — only you can read it</div></div>
+          <div class="val"><div class="b" id="spend">0.00000</div><div class="f">LAT</div></div>
+        </div>
+        <div class="tok" onclick="openMove('shield')">
+          <div class="logo pub"><b>L</b></div>
+          <div class="meta"><div class="n">Latebra <span class="tag pubt">PUBLIC</span></div><div class="s">Visible on the explorer</div></div>
+          <div class="val"><div class="b" id="pub">0.00000</div><div class="f">LAT</div></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="nav">
+      <a class="on" onclick="showWallet()">${I.home}<span>Home</span></a>
+      <a onclick="toast('Swap is coming soon')">${I.swap}<span>Swap</span></a>
+      <a onclick="toast('Discover is coming soon')">${I.disc}<span>Discover</span></a>
+      <a onclick="toast('Activity view is coming soon')">${I.act}<span>Activity</span></a>
+      <a onclick="openSettings()">${I.gear}<span>Settings</span></a>
+    </div>`;
+  refresh();
+  if(poll)clearInterval(poll);poll=setInterval(refresh,8000);
+}
+
+async function refresh(){
+  if(!SEED||!$('hero'))return;
+  const r=await api('balance',{seed:SEED,net:'testnet'});
+  if(r.error){toast(r.error,true);return;}
+  if(r.address){ADDR=r.address;save();}
+  LAST=r;
+  const reg=$('regbar'),pend=$('pendbar');
+  if(r.registered===false){
+    $('hero').innerHTML='0.00<small>LAT</small>';
+    if($('spend'))$('spend').textContent='0.00000';
+    if($('pub'))$('pub').textContent='0.00000';
+    if(reg)reg.innerHTML=`
+      <div class="banner">
+        <div class="bi">${I.spark}</div>
+        <div class="bt"><div class="t">Activate your account</div><div class="d">A one-time on-chain registration.</div></div>
+        <button class="primary" onclick="register()">Activate</button>
+      </div>`;
+    if(pend)pend.innerHTML='';
+    const ra=$('rollact');if(ra)ra.setAttribute('disabled','');
+    return;
+  }
+  if(reg)reg.innerHTML='';
+  if($('hero'))$('hero').innerHTML=fmtHero(r.total);
+  if($('spend'))$('spend').textContent=r.spendable;
+  if($('pub'))$('pub').textContent=r.public;
+  const p=parseFloat(r.pending||'0');
+  const ra=$('rollact');if(ra){if(p>0)ra.removeAttribute('disabled');else ra.setAttribute('disabled','');}
+  if(pend)pend.innerHTML = p>0 ? `
+    <div class="banner">
+      <div class="bi">${I.roll}</div>
+      <div class="bt"><div class="t">${r.pending} LAT pending</div><div class="d">Received funds — roll over to make them spendable.</div></div>
+      <button class="primary" onclick="rollover()">Roll over</button>
+    </div>` : '';
+}
+function fmtHero(total){
+  const [i,f]=String(total||'0.00000').split('.');
+  return `${Number(i).toLocaleString()}.${(f||'00').slice(0,2)}<small>LAT</small>`;
+}
+
+/* ================= actions ================= */
+async function register(){const r=await api('register',{seed:SEED,net:'testnet'});toast(r.ok?r.msg:(r.error||'failed'),!r.ok);}
+async function rollover(){
+  if(parseFloat(LAST.pending||'0')<=0){toast('nothing pending to roll over');return;}
+  const r=await api('rollover',{seed:SEED,net:'testnet'});toast(r.ok?r.msg:(r.error||'failed'),!r.ok);
+}
+async function send(){
+  const to=$('to').value.trim(),amt=$('amt').value.trim();
+  if(!to||!amt){toast('enter recipient and amount',true);return;}
+  toast('building transaction…');
+  const r=await api(SENDMODE==='private'?'send':'public-send',{seed:SEED,to:to,amount:amt,net:'testnet'});
+  if(r.ok){toast(r.msg);closeSheet();setTimeout(refresh,1000);}
+  else toast(r.error||'failed',true);
+}
+async function doMove(){
+  const amt=$('mvamt').value.trim();
+  if(!amt){toast('enter an amount',true);return;}
+  toast(MOVEDIR==='shield'?'shielding…':'building the privacy proof…');
+  const r=await api(MOVEDIR,{seed:SEED,amount:amt,net:'testnet'});
+  if(r.ok){toast(r.msg);closeSheet();setTimeout(refresh,1000);}
+  else toast(r.error||'failed',true);
+}
+async function faucet(){
+  if(LAST.registered===false){toast('activate your account first',true);return;}
+  toast('requesting from the faucet…');
+  const r=await api('faucet',{to:ADDR,net:'testnet'});
+  toast(r.ok?r.msg:(r.error||'failed'),!r.ok);
+  if(r.ok)setTimeout(refresh,4000);
+}
+
+/* ================= sheets ================= */
+function openSheet(html){$('sheet').innerHTML='<div class="grip"></div>'+html;$('sheet').classList.add('show');$('backdrop').classList.add('show');}
+function closeSheet(){$('sheet').classList.remove('show');$('backdrop').classList.remove('show');}
+
+function openReceive(){
+  openSheet(`
+    <h3>Receive LAT</h3>
+    <p class="sub">Share your address to receive funds. Incoming funds arrive as pending.</p>
+    <div class="qr">${qrSvg(ADDR)}</div>
+    <div class="addrbox">${ADDR}</div>
+    <div class="row">
+      <button class="ghost" onclick="closeSheet()">Close</button>
+      <button class="primary" onclick="copyText(ADDR,'address copied')">Copy address</button>
+    </div>`);
+}
+let SENDMODE='private';
+function openSend(mode){
+  openSheet(`
+    <h3>Send LAT</h3>
+    <p class="sub">Choose which balance to pay from · a small network fee applies.</p>
+    <div class="seg">
+      <button id="segP" onclick="setSendMode('private')">🔒 Private</button>
+      <button id="segU" onclick="setSendMode('public')">👁 Public</button>
+    </div>
+    <div class="hint" id="sendhint"></div>
+    <label>Recipient address</label>
+    <input id="to" placeholder="latt1…" autocomplete="off" spellcheck="false">
+    <label>Amount (LAT)</label>
+    <input id="amt" placeholder="0.0" inputmode="decimal">
+    <div class="row">
+      <button class="ghost" onclick="closeSheet()">Cancel</button>
+      <button class="primary" onclick="send()">Send</button>
+    </div>`);
+  setSendMode(mode||'private');
+}
+function setSendMode(m){
+  SENDMODE=m;
+  $('segP').className=m==='private'?'on':'';
+  $('segU').className=m==='public'?'on':'';
+  $('sendhint').innerHTML= m==='private'
+    ? `Pays from your <b>private balance (${LAST.spendable||'0.00000'} LAT)</b>. On the explorer this shows only "proof verified" — <b>no sender, receiver or amount</b>. The recipient rolls it over to spend.`
+    : `Pays from your <b>public balance (${LAST.public||'0.00000'} LAT)</b>. Sender, receiver and amount are <b>fully visible</b> on the explorer — like Ethereum.`;
+}
+
+let MOVEDIR='shield';
+function openMove(dir){
+  openSheet(`
+    <h3>Shield / Unshield</h3>
+    <p class="sub">Move LAT between your own public and private balances.</p>
+    <div class="seg">
+      <button id="segS" onclick="setMoveDir('shield')">Public → Private</button>
+      <button id="segX" onclick="setMoveDir('unshield')">Private → Public</button>
+    </div>
+    <div class="hint" id="movehint"></div>
+    <label>Amount (LAT)</label>
+    <input id="mvamt" placeholder="0.0" inputmode="decimal">
+    <div class="row">
+      <button class="ghost" onclick="closeSheet()">Cancel</button>
+      <button class="primary" id="mvbtn" onclick="doMove()">Shield</button>
+    </div>`);
+  setMoveDir(dir||'shield');
+}
+function setMoveDir(d){
+  MOVEDIR=d;
+  $('segS').className=d==='shield'?'on':'';
+  $('segX').className=d==='unshield'?'on':'';
+  $('mvbtn').textContent=d==='shield'?'Shield':'Unshield';
+  $('movehint').innerHTML= d==='shield'
+    ? `Makes coins <b>private</b>. Public balance: <b>${LAST.public||'0.00000'} LAT</b>. The amount crossing the boundary is visible once; after that, private transfers hide everything. Shielded funds arrive as <b>pending</b> — roll over to spend them.`
+    : `Makes coins <b>public</b> again. Private balance: <b>${LAST.spendable||'0.00000'} LAT</b>. A zero-knowledge proof spends them; the amount appears in your public balance.`;
+}
+function openSettings(){
+  openSheet(`
+    <h3>Settings</h3>
+    <p class="sub">${shortAddr(ADDR)} · Testnet</p>
+    <label>Node RPC endpoint</label>
+    <div class="pillnode"><input id="node" value="${NODE}"><button class="primary" onclick="saveNode()">Save</button></div>
+    <div class="set-row" onclick="copyText(ADDR,'address copied')">
+      <div class="si">${I.copy}</div><div class="st"><div class="t">Copy address</div><div class="d">${shortAddr(ADDR)}</div></div><div class="chev">${I.chevr}</div>
+    </div>
+    <div class="set-row" onclick="revealSeed()">
+      <div class="si">${I.key}</div><div class="st"><div class="t">Reveal secret seed</div><div class="d">Show your recovery phrase</div></div><div class="chev">${I.chevr}</div>
+    </div>
+    <div class="set-row" onclick="logout()">
+      <div class="si">${I.out}</div><div class="st"><div class="t" style="color:var(--red)">Log out</div><div class="d">Remove this wallet from the browser</div></div><div class="chev">${I.chevr}</div>
+    </div>`);
+}
+function saveNode(){NODE=$('node').value.trim();localStorage.setItem('lat_node',NODE);toast('node saved');refresh();}
+function revealSeed(){if(confirm('Show your secret seed on screen?'))alert('Your seed:\n\n'+SEED+'\n\nKeep it secret. Anyone with it controls this wallet.');}
+function logout(){if(confirm('Log out? Make sure your seed is saved — it will be removed from this browser.')){localStorage.removeItem('lat_seed');localStorage.removeItem('lat_addr');SEED='';ADDR='';closeSheet();showWelcome();}}
+
+/* A lightweight deterministic address glyph (NOT a scannable QR — a visual
+   fingerprint so a receive address is recognizable at a glance). */
+function qrSvg(addr){
+  let h=2166136261;for(let i=0;i<(addr||'').length;i++){h^=addr.charCodeAt(i);h=Math.imul(h,16777619);}
+  const n=9,cell=15,pad=6;let rects='';
+  for(let y=0;y<n;y++)for(let x=0;x<Math.ceil(n/2);x++){
+    h^=h<<13;h^=h>>>17;h^=h<<5;
+    if((h&7)>3){const rx=pad+x*cell,ry=pad+y*cell;
+      rects+=`<rect x="${rx}" y="${ry}" width="${cell}" height="${cell}" rx="3"/>`;
+      if(x<Math.floor(n/2))rects+=`<rect x="${pad+(n-1-x)*cell}" y="${ry}" width="${cell}" height="${cell}" rx="3"/>`;}
+  }
+  return `<svg viewBox="0 0 ${n*cell+pad*2} ${n*cell+pad*2}" width="146" height="146" fill="#e07c25">${rects}</svg>`;
+}
+
+if(SEED)showWallet();else showWelcome();
+
+/* Play the splash, then fade it out to reveal the wallet / welcome screen. */
+setTimeout(()=>{const s=$('splash');if(!s)return;s.classList.add('hide');setTimeout(()=>s.remove(),600);},1900);
+</script>
+</body>
+</html>

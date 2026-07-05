@@ -1,0 +1,11 @@
+# Normalize line endings: LF in the repo, regardless of OS checkout.
+* text=auto eol=lf
+
+# Rust + config are always text.
+*.rs   text eol=lf
+*.toml text eol=lf
+*.md   text eol=lf
+*.lock text eol=lf
+
+# Windows scripts keep CRLF.
+*.ps1  text eol=crlf

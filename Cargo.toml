@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lat-store",
+    "crates/lat-crypto",
+    "crates/lat-vm",
+    "crates/lat-contracts",
+    "crates/lat-types",
+    "crates/lat-state",
+    "crates/lat-chain",
+    "crates/lat-wallet",
+    "crates/lat-net",
+    "crates/lat-p2p",
+    "crates/lat-node",
+    "crates/lat-attack",
+    "crates/latebrad",
+    "crates/lat-explorer",
+    "crates/lat-wallet-cli",
+    "crates/lat-wallet-web",
+    "crates/latfun",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Latebra"]
+
+[workspace.dependencies]
+curve25519-dalek = { version = "4", features = ["rand_core"] }
+rand = "0.8"
+sha2 = "0.10"
+bulletproofs = "5"
+merlin = "3"
+bech32 = "0.11"
+blake3 = "1"
+hex = "0.4"
+redb = "4"
+lat-crypto = { path = "crates/lat-crypto" }
+lat-types = { path = "crates/lat-types" }
+lat-state = { path = "crates/lat-state" }
+lat-chain = { path = "crates/lat-chain" }
+lat-wallet = { path = "crates/lat-wallet" }
+lat-p2p = { path = "crates/lat-p2p" }
+lat-vm = { path = "crates/lat-vm" }
+lat-contracts = { path = "crates/lat-contracts" }
+lat-store = { path = "crates/lat-store" }
