@@ -5,12 +5,12 @@
 //! form a testnet.
 //!
 //! ```text
-//! latebrad --mine --data ./node-a/chain.log --listen 127.0.0.1:4040
-//! latebrad         --data ./node-b/chain.log --listen 127.0.0.1:4041 --peer 127.0.0.1:4040
+//! latebrad --mine --data ./node-a/chain.db --listen 127.0.0.1:4040
+//! latebrad         --data ./node-b/chain.db --listen 127.0.0.1:4041 --peer 127.0.0.1:4040
 //! ```
 //!
 //! Flags:
-//!   --data <path>        block-log file (default: latebra-data/chain.log)
+//!   --data <path>        chain database file (redb; default: latebra-data/chain.db)
 //!   --listen <addr>      address to serve peers + RPC on (default: 127.0.0.1:4040)
 //!   --peer <addr>        a seed peer to sync from / gossip to (repeatable)
 //!   --public-addr <addr> the address OTHER nodes can reach us on — advertised
@@ -70,7 +70,7 @@ struct Config {
 
 fn parse_config() -> Config {
     let mut cfg = Config {
-        data: PathBuf::from("latebra-data/chain.log"),
+        data: PathBuf::from("latebra-data/chain.db"),
         listen: "127.0.0.1:4040".to_string(),
         public_addr: None,
         peers: Vec::new(),
@@ -117,7 +117,7 @@ fn parse_config() -> Config {
 
 fn print_usage() {
     println!("latebrad — Latebra node daemon");
-    println!("  --data <path>         block-log file (default latebra-data/chain.log)");
+    println!("  --data <path>         chain database file (redb; default latebra-data/chain.db)");
     println!("  --listen <addr>       serve peers + RPC (default 127.0.0.1:4040)");
     println!("  --peer <addr>         seed peer to sync from / gossip to (repeatable)");
     println!("  --public-addr <addr>  address other nodes can reach us on (default: --listen);");
@@ -137,8 +137,23 @@ fn main() {
     if let Some(parent) = cfg.data.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let chain = Blockchain::open_with_public(&cfg.data, &premine, &public_premine, DEFAULT_DIFFICULTY)
-        .expect("open persistent chain");
+    let chain = match Blockchain::open_with_public(&cfg.data, &premine, &public_premine, DEFAULT_DIFFICULTY) {
+        Ok(chain) => chain,
+        Err(e) => {
+            // The common cause is pointing --data at a file that isn't a Latebra
+            // chain database — most often data from an older build whose block
+            // store was a flat append-only log (pre-redb). Rather than a raw
+            // panic, tell the operator exactly what to do.
+            eprintln!("error: could not open the chain database at {}", cfg.data.display());
+            eprintln!("  cause: {e}");
+            eprintln!();
+            eprintln!("If this path holds data from an older Latebra build, it is no longer");
+            eprintln!("compatible (the block store is now a redb database, not a flat log).");
+            eprintln!("Move the old file aside or point --data at a fresh path, e.g.:");
+            eprintln!("  latebrad --data ./latebra-data/chain.db --listen {}", cfg.listen);
+            std::process::exit(1);
+        }
+    };
 
     println!("Latebra node (latebrad)");
     println!("  data        : {}", cfg.data.display());

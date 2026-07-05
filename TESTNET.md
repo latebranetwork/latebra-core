@@ -36,13 +36,13 @@ Binaries are produced in `target/release/`:
 **A public node others can connect to** (bind to all interfaces):
 
 ```sh
-latebrad --data ./latebra-data/chain.log --listen 0.0.0.0:4040 --peer <seed-ip>:4040
+latebrad --data ./latebra-data/chain.db --listen 0.0.0.0:4040 --peer <seed-ip>:4040
 ```
 
 **A mining node** (also secures the network and earns block rewards):
 
 ```sh
-latebrad --mine --data ./latebra-data/chain.log --listen 0.0.0.0:4040 --peer <seed-ip>:4040
+latebrad --mine --data ./latebra-data/chain.db --listen 0.0.0.0:4040 --peer <seed-ip>:4040
 ```
 
 - `--peer` can be repeated to connect to several seed nodes.
@@ -63,7 +63,7 @@ latebrad --mine --data ./latebra-data/chain.log --listen 0.0.0.0:4040 --peer <se
 1. Get one or more **seed node addresses** (`ip:port`) from whoever runs them.
 2. Start your node pointing at them:
    ```sh
-   latebrad --data ./my-node/chain.log --listen 0.0.0.0:4040 --peer <seed-ip>:4040
+   latebrad --data ./my-node/chain.db --listen 0.0.0.0:4040 --peer <seed-ip>:4040
    ```
 3. Watch it sync — it will pull and re-validate every block, then follow the tip.
 

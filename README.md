@@ -50,10 +50,10 @@ math is ~15× slower unoptimized.
 cargo run --release -p lat-node
 
 # Run a mining node:
-cargo run --release -p latebrad -- --mine --data ./node-a/chain.log --listen 127.0.0.1:4040
+cargo run --release -p latebrad -- --mine --data ./node-a/chain.db --listen 127.0.0.1:4040
 
 # Run a second node that syncs from the first:
-cargo run --release -p latebrad -- --data ./node-b/chain.log --listen 127.0.0.1:4041 --peer 127.0.0.1:4040
+cargo run --release -p latebrad -- --data ./node-b/chain.db --listen 127.0.0.1:4041 --peer 127.0.0.1:4040
 
 # Run the test suite:
 cargo test

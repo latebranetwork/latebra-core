@@ -30,14 +30,14 @@ New-Item -ItemType Directory -Force -Path $data | Out-Null
 
 Write-Host "Starting mining node on 127.0.0.1:4040..." -ForegroundColor Cyan
 $miner = Start-Process "$rel/latebrad.exe" `
-    -ArgumentList "--mine", "--data", "$data/a/chain.log", "--listen", "127.0.0.1:4040" `
+    -ArgumentList "--mine", "--data", "$data/a/chain.db", "--listen", "127.0.0.1:4040" `
     -PassThru -WindowStyle Hidden
 
 Start-Sleep -Seconds 2
 
 Write-Host "Starting syncing node on 127.0.0.1:4041 (peer of the miner)..." -ForegroundColor Cyan
 $peer = Start-Process "$rel/latebrad.exe" `
-    -ArgumentList "--data", "$data/b/chain.log", "--listen", "127.0.0.1:4041", "--peer", "127.0.0.1:4040" `
+    -ArgumentList "--data", "$data/b/chain.db", "--listen", "127.0.0.1:4041", "--peer", "127.0.0.1:4040" `
     -PassThru -WindowStyle Hidden
 
 Write-Host "Starting explorer on http://127.0.0.1:8080..." -ForegroundColor Cyan
