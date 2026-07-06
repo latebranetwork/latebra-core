@@ -410,6 +410,9 @@ fn tx_involves(tx: &Transaction, id: &[u8; 32]) -> bool {
         // ring members are visible (as the anonymity set), but membership is
         // not involvement, so an anonymous transfer never links to an address.
         Transaction::AnonTransfer { .. } => false,
+        Transaction::Stake { validator, .. } | Transaction::Unstake { validator, .. } => {
+            validator == id
+        }
     }
 }
 
@@ -567,6 +570,8 @@ fn tag(tx: &Transaction) -> (&'static str, &'static str) {
         Transaction::ShieldStealth { .. } => ("xfer", "Stealth Shield"),
         Transaction::Unshield { .. } => ("xfer", "Unshield"),
         Transaction::AnonTransfer { .. } => ("xfer", "Anonymous Transfer"),
+        Transaction::Stake { .. } => ("stake", "Stake"),
+        Transaction::Unstake { .. } => ("stake", "Unstake"),
     }
 }
 
@@ -607,6 +612,15 @@ fn tx_detail(tx: &Transaction) -> (String, String) {
         Transaction::AnonTransfer { token, xfer } => (
             format!("(ring of {}) → (stealth)", xfer.ring.len()),
             format!("<span class='pill-amt'>{}</span> anonymous · token {token}", commafy(xfer.amount)),
+        ),
+        // Staking (T13): bond / begin unbonding validator stake, in the clear.
+        Transaction::Stake { validator, amount, .. } => (
+            format!("{} bonds", short(validator)),
+            format!("<span class='pill-amt'>{}</span> stake", commafy(*amount)),
+        ),
+        Transaction::Unstake { validator, amount, .. } => (
+            format!("{} unbonds", short(validator)),
+            format!("<span class='pill-amt'>{}</span> unstake", commafy(*amount)),
         ),
     }
 }
@@ -759,6 +773,8 @@ fn feed_badge(tx: &Transaction) -> (&'static str, &'static str) {
         Transaction::Unshield { .. } => ("b-pub", "Unshield"),
         Transaction::DeployContract { .. } => ("b-ct", "Deploy"),
         Transaction::CallContract { .. } => ("b-ct", "Call"),
+        Transaction::Stake { .. } => ("b-pub", "Stake"),
+        Transaction::Unstake { .. } => ("b-pub", "Unstake"),
     }
 }
 
@@ -778,6 +794,9 @@ fn feed_amount(tx: &Transaction) -> String {
         Transaction::DeployContract { code, .. } => format!("<span class='tamt muted'>{} B</span>", code.len()),
         Transaction::CallContract { .. } => "<span class='tamt muted'>call</span>".to_string(),
         Transaction::Register { .. } | Transaction::Rollover { .. } => "<span class='tamt muted'>—</span>".to_string(),
+        Transaction::Stake { amount, .. } | Transaction::Unstake { amount, .. } => {
+            format!("<span class='tamt'>{} LAT</span>", fmt_lat(*amount))
+        }
     }
 }
 

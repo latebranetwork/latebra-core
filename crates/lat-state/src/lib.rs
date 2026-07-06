@@ -46,6 +46,48 @@ pub fn epoch_of(height: u64) -> u64 {
     height / EPOCH_BLOCKS
 }
 
+// -- staking parameters (T13, consensus) -------------------------------------
+// TESTNET values — LAUNCH.md's mainnet-must-change table covers all three.
+
+/// Minimum bonded stake to be eligible for the validator set: 1,000 LAT
+/// (units are 5-decimal, so 1 LAT = 100_000).
+pub const MIN_VALIDATOR_STAKE: u64 = 1_000 * 100_000;
+
+/// Blocks between an `Unstake` and the funds releasing back to the public
+/// balance. The delay is what makes misbehavior slashable after the fact
+/// (T16) — stake can't vanish the moment it equivocates.
+pub const UNBONDING_BLOCKS: u64 = 240;
+
+/// Upper bound on the validator set (top-N by stake).
+pub const MAX_VALIDATORS: usize = 64;
+
+/// A validator's staking state (T13): the bonded weight the BFT-PoS validator
+/// set is derived from, plus any unbonding entries still in their delay window.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Validator {
+    /// Currently bonded stake in public LAT — the validator-set weight.
+    pub staked: u64,
+    /// Unbonding entries as `(amount, release_height)`, oldest first. Matured
+    /// entries sweep back into the public balance on the account's next
+    /// `Stake`/`Unstake` (deterministic: driven by that tx's block height).
+    pub unbonding: Vec<(u64, u64)>,
+}
+
+/// Drain every unbonding entry whose release height has passed, returning the
+/// total released back to the public balance.
+fn release_matured(v: &mut Validator, height: u64) -> u64 {
+    let mut released = 0u64;
+    v.unbonding.retain(|(amount, release)| {
+        if *release <= height {
+            released += *amount;
+            false
+        } else {
+            true
+        }
+    });
+    released
+}
+
 /// Metadata recorded for each created token.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TokenMeta {
@@ -112,6 +154,8 @@ enum DirtyKey {
     Token(u32),
     Contract([u8; 32]),
     Nullifier([u8; 32]),
+    /// A validator's staking record (T13).
+    Validator([u8; 32]),
     /// The `next_token_id` meta record.
     Meta,
 }
@@ -256,6 +300,8 @@ pub enum LedgerError {
     /// A ring member's claimed balance ciphertext does not match its current
     /// on-chain balance (the proof binds to stale or fabricated state).
     StaleRingBalance,
+    /// An `Unstake` asked for more than the validator's bonded stake.
+    InsufficientStake,
 }
 
 impl Ledger {
@@ -372,6 +418,11 @@ impl Ledger {
         for (key, _) in ledger.store.scan_prefix(Column::Objects, &[REC_NULLIFIER]) {
             let nf: [u8; 32] = key.get(1..)?.try_into().ok()?;
             dirty.push(DirtyKey::Nullifier(nf));
+        }
+        for (key, body) in ledger.store.scan_prefix(Column::Objects, &[REC_VALIDATOR]) {
+            let id: [u8; 32] = key.get(1..)?.try_into().ok()?;
+            decode_validator(&body)?;
+            dirty.push(DirtyKey::Validator(id));
         }
         // Rebuild the ticker index from committed tokens (self-heals tampering).
         for (ticker, id) in tickers {
@@ -548,6 +599,54 @@ impl Ledger {
         self.store.put(Column::Objects, rec_key(REC_NULLIFIER, nf), vec![1u8]);
     }
 
+    /// Read one validator staking record.
+    fn validator(&self, id: &[u8; 32]) -> Option<Validator> {
+        let bytes = self.store.get(Column::Objects, &rec_key(REC_VALIDATOR, id))?;
+        Some(decode_validator(&bytes).expect("corrupt validator record"))
+    }
+
+    /// Write one validator record. A fully-drained record (no stake, no
+    /// unbonding) is DELETED rather than stored empty, so the committed state
+    /// is canonical: it matches a chain where the account never staked.
+    fn put_validator(&mut self, id: &[u8; 32], v: &Validator) {
+        if v.staked == 0 && v.unbonding.is_empty() {
+            self.store.delete(Column::Objects, rec_key(REC_VALIDATOR, id));
+        } else {
+            self.store.put(Column::Objects, rec_key(REC_VALIDATOR, id), encode_validator(v));
+        }
+    }
+
+    /// The validator's currently bonded stake (0 if it never staked).
+    pub fn staked(&self, id: &[u8; 32]) -> u64 {
+        self.validator(id).map(|v| v.staked).unwrap_or(0)
+    }
+
+    /// The validator's unbonding entries as `(amount, release_height)`.
+    pub fn unbonding(&self, id: &[u8; 32]) -> Vec<(u64, u64)> {
+        self.validator(id).map(|v| v.unbonding).unwrap_or_default()
+    }
+
+    /// The deterministic validator set at the current state (T13): every
+    /// account with at least [`MIN_VALIDATOR_STAKE`] bonded, ordered by stake
+    /// descending then id ascending, capped at [`MAX_VALIDATORS`]. Derived
+    /// purely from committed records, so every node computes the identical
+    /// set — the input BFT-PoS finality (T14) selects proposers/voters from.
+    pub fn validator_set(&self) -> Vec<([u8; 32], u64)> {
+        let mut set: Vec<([u8; 32], u64)> = self
+            .store
+            .scan_prefix(Column::Objects, &[REC_VALIDATOR])
+            .into_iter()
+            .filter_map(|(key, body)| {
+                let id: [u8; 32] = key.get(1..)?.try_into().ok()?;
+                let v = decode_validator(&body)?;
+                (v.staked >= MIN_VALIDATOR_STAKE).then_some((id, v.staked))
+            })
+            .collect();
+        set.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        set.truncate(MAX_VALIDATORS);
+        set
+    }
+
     /// Flag one state entry for re-commitment on the next `state_root`. Cheap:
     /// no hashing happens here, only at the next root computation.
     fn mark(&mut self, key: DirtyKey) {
@@ -599,6 +698,9 @@ impl Ledger {
                 keys.push(DirtyKey::Account(xfer.output.one_time.to_bytes()));
                 keys.push(DirtyKey::Nullifier(xfer.nullifier()));
                 keys
+            }
+            Transaction::Stake { validator, .. } | Transaction::Unstake { validator, .. } => {
+                vec![DirtyKey::Account(*validator), DirtyKey::Validator(*validator)]
             }
         }
     }
@@ -1140,6 +1242,55 @@ impl Ledger {
                 self.insert_nullifier(&nullifier);
                 Ok(())
             }
+
+            Transaction::Stake { validator, amount, nonce, sig } => {
+                // Bond public LAT into validator stake. Transparent auth, and
+                // any matured unbonding entries sweep back first — so `Stake`
+                // with amount 0 is the explicit "claim released funds" tx.
+                check_sig(validator, tx, sig)?;
+                let mut acct =
+                    self.account(validator).ok_or(LedgerError::SenderNotRegistered)?;
+                if *nonce != acct.nonce {
+                    return Err(LedgerError::BadNonce);
+                }
+                let mut val = self.validator(validator).unwrap_or_default();
+                let released = release_matured(&mut val, height);
+                let available = acct.public(LAT_TOKEN).saturating_add(released);
+                if available < *amount {
+                    return Err(LedgerError::InsufficientPublicBalance);
+                }
+                acct.set_public(LAT_TOKEN, available - amount);
+                acct.nonce += 1;
+                val.staked = val.staked.saturating_add(*amount);
+                self.put_account(validator, acct);
+                self.put_validator(validator, &val);
+                Ok(())
+            }
+
+            Transaction::Unstake { validator, amount, nonce, sig } => {
+                // Move bonded stake into an unbonding entry that releases after
+                // the delay window (sweeping already-matured entries first).
+                check_sig(validator, tx, sig)?;
+                let mut acct =
+                    self.account(validator).ok_or(LedgerError::SenderNotRegistered)?;
+                if *nonce != acct.nonce {
+                    return Err(LedgerError::BadNonce);
+                }
+                let mut val = self.validator(validator).unwrap_or_default();
+                let released = release_matured(&mut val, height);
+                if val.staked < *amount {
+                    return Err(LedgerError::InsufficientStake);
+                }
+                val.staked -= amount;
+                if *amount > 0 {
+                    val.unbonding.push((*amount, height + UNBONDING_BLOCKS));
+                }
+                acct.set_public(LAT_TOKEN, acct.public(LAT_TOKEN).saturating_add(released));
+                acct.nonce += 1;
+                self.put_account(validator, acct);
+                self.put_validator(validator, &val);
+                Ok(())
+            }
         }
     }
 
@@ -1194,6 +1345,10 @@ impl Ledger {
             DirtyKey::Nullifier(nf) => {
                 (trie_key_nullifier(nf), self.nullifier_seen(nf).then(|| vec![1u8]))
             }
+            DirtyKey::Validator(id) => (
+                trie_key_validator(id),
+                self.validator(id).map(|v| validator_leaf_preimage(id, &v)),
+            ),
             DirtyKey::Meta => (trie_key_meta(), Some(self.next_token_id.to_le_bytes().to_vec())),
         }
     }
@@ -1240,6 +1395,19 @@ fn trie_key_nullifier(nf: &[u8; 32]) -> [u8; 32] {
 }
 fn trie_key_meta() -> [u8; 32] {
     trie_key(b"meta", b"")
+}
+fn trie_key_validator(id: &[u8; 32]) -> [u8; 32] {
+    trie_key(b"val", id)
+}
+
+/// Canonical byte preimage of a validator leaf (tag + id + record body), so
+/// headers commit the staking state and T14 can bind validator sets to roots.
+fn validator_leaf_preimage(id: &[u8; 32], v: &Validator) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(b"LAT-state-val");
+    b.extend_from_slice(id);
+    b.extend_from_slice(&encode_validator(v));
+    b
 }
 
 /// Canonical byte preimage of an account leaf (the trie hashes it). Begins with
@@ -1319,6 +1487,8 @@ const REC_TOKEN: u8 = b't';
 const REC_TICKER: u8 = b'u';
 const REC_CONTRACT: u8 = b'c';
 const REC_NULLIFIER: u8 = b'n';
+/// Validator staking records (T13).
+const REC_VALIDATOR: u8 = b'v';
 /// The single `next_token_id` meta record.
 const REC_META: u8 = b'm';
 
@@ -1387,6 +1557,32 @@ fn encode_contract(c: &Contract) -> Vec<u8> {
     v
 }
 
+/// Validator record body: staked + unbonding entries (the snapshot validator
+/// entry minus the leading id).
+fn encode_validator(v: &Validator) -> Vec<u8> {
+    let mut b = Vec::with_capacity(8 + 4 + v.unbonding.len() * 16);
+    b.extend_from_slice(&v.staked.to_le_bytes());
+    b.extend_from_slice(&(v.unbonding.len() as u32).to_le_bytes());
+    for (amount, release) in &v.unbonding {
+        b.extend_from_slice(&amount.to_le_bytes());
+        b.extend_from_slice(&release.to_le_bytes());
+    }
+    b
+}
+
+fn decode_validator(b: &[u8]) -> Option<Validator> {
+    let mut r = Reader { b, off: 0 };
+    let staked = r.u64()?;
+    let n = r.u32()?;
+    let mut unbonding = Vec::new();
+    for _ in 0..n {
+        let amount = r.u64()?;
+        let release = r.u64()?;
+        unbonding.push((amount, release));
+    }
+    (r.off == b.len()).then_some(Validator { staked, unbonding })
+}
+
 fn decode_contract(b: &[u8]) -> Option<Contract> {
     let mut r = Reader { b, off: 0 };
     let code_len = r.u32()? as usize;
@@ -1440,9 +1636,10 @@ pub fn verify_account_proof(root: &[u8; 32], proof: &AccountProof) -> bool {
 // chain layer enforces this (see lat-chain).
 
 /// Version tag heading every ledger snapshot encoding. Bumped to 2 when the
-/// anonymous-spend nullifier set joined the encoding; a v1 snapshot no longer
-/// decodes, which simply costs one full replay on the next boot.
-const LEDGER_MAGIC: &[u8; 8] = b"LATLEDG2";
+/// anonymous-spend nullifier set joined the encoding, and to 3 when validator
+/// staking records (T13) did; an old snapshot no longer decodes, which simply
+/// costs one full replay on the next boot.
+const LEDGER_MAGIC: &[u8; 8] = b"LATLEDG3";
 
 impl Ledger {
     /// Canonical snapshot encoding of the full ledger (see the section note).
@@ -1478,6 +1675,13 @@ impl Ledger {
         v.extend_from_slice(&(nfs.len() as u32).to_le_bytes());
         for (key, _) in nfs {
             v.extend_from_slice(&key[1..]);
+        }
+
+        let validators = self.store.scan_prefix(Column::Objects, &[REC_VALIDATOR]);
+        v.extend_from_slice(&(validators.len() as u32).to_le_bytes());
+        for (key, body) in validators {
+            v.extend_from_slice(&key[1..]); // validator id
+            v.extend_from_slice(&body); // staked + unbonding entries
         }
         v
     }
@@ -1538,6 +1742,19 @@ impl Ledger {
             let nf = r.arr32()?;
             ledger.insert_nullifier(&nf);
             ledger.mark(DirtyKey::Nullifier(nf));
+        }
+
+        for _ in 0..r.u32()? {
+            let id = r.arr32()?;
+            let staked = r.u64()?;
+            let mut unbonding = Vec::new();
+            for _ in 0..r.u32()? {
+                let amount = r.u64()?;
+                let release = r.u64()?;
+                unbonding.push((amount, release));
+            }
+            ledger.put_validator(&id, &Validator { staked, unbonding });
+            ledger.mark(DirtyKey::Validator(id));
         }
 
         // Reject trailing garbage — an encoding is exactly its contents.
@@ -1607,7 +1824,9 @@ mod tests {
             | Transaction::PublicTransfer { sig, .. }
             | Transaction::Shield { sig, .. }
             | Transaction::Unshield { sig, .. }
-            | Transaction::ShieldStealth { sig, .. } => *sig = sig_bytes,
+            | Transaction::ShieldStealth { sig, .. }
+            | Transaction::Stake { sig, .. }
+            | Transaction::Unstake { sig, .. } => *sig = sig_bytes,
             _ => {}
         }
         tx
@@ -2604,6 +2823,108 @@ mod tests {
         let booted = Ledger::from_records(base).expect("records boot after rehome");
         assert_eq!(booted.state_root(), root);
         assert!(!booted.is_registered(&old_id));
+    }
+
+    fn stake_tx(sk: &SecretKey, amount: u64, nonce: u64) -> Transaction {
+        signed(
+            Transaction::Stake { validator: sk.public_key().to_bytes(), amount, nonce, sig: [0u8; 64] },
+            sk,
+        )
+    }
+    fn unstake_tx(sk: &SecretKey, amount: u64, nonce: u64) -> Transaction {
+        signed(
+            Transaction::Unstake { validator: sk.public_key().to_bytes(), amount, nonce, sig: [0u8; 64] },
+            sk,
+        )
+    }
+
+    #[test]
+    fn stake_unstake_lifecycle_with_unbonding_window() {
+        let mut rng = OsRng;
+        let sk = SecretKey::random(&mut rng);
+        let id = sk.public_key().to_bytes();
+        let mut l = Ledger::new();
+        l.register(id).unwrap();
+        l.credit_public(&id, LAT_TOKEN, 3 * MIN_VALIDATOR_STAKE);
+
+        // Bond twice the minimum: balance moves into stake, root changes.
+        let r0 = l.state_root();
+        l.apply_at(&stake_tx(&sk, 2 * MIN_VALIDATOR_STAKE, 0), 10).unwrap();
+        assert_eq!(l.staked(&id), 2 * MIN_VALIDATOR_STAKE);
+        assert_eq!(l.public_balance(&id, LAT_TOKEN), Some(MIN_VALIDATOR_STAKE));
+        assert_eq!(l.validator_set(), vec![(id, 2 * MIN_VALIDATOR_STAKE)]);
+        assert_ne!(l.state_root(), r0, "staking is committed state");
+
+        // Unbond half: stake drops immediately, funds wait out the window.
+        l.apply_at(&unstake_tx(&sk, MIN_VALIDATOR_STAKE, 1), 20).unwrap();
+        assert_eq!(l.staked(&id), MIN_VALIDATOR_STAKE);
+        assert_eq!(l.unbonding(&id), vec![(MIN_VALIDATOR_STAKE, 20 + UNBONDING_BLOCKS)]);
+        assert_eq!(
+            l.public_balance(&id, LAT_TOKEN),
+            Some(MIN_VALIDATOR_STAKE),
+            "nothing released before the window"
+        );
+
+        // A zero-amount Stake BEFORE maturity sweeps nothing…
+        l.apply_at(&stake_tx(&sk, 0, 2), 20 + UNBONDING_BLOCKS - 1).unwrap();
+        assert_eq!(l.public_balance(&id, LAT_TOKEN), Some(MIN_VALIDATOR_STAKE));
+        // …and AT maturity releases the entry back to the public balance.
+        l.apply_at(&stake_tx(&sk, 0, 3), 20 + UNBONDING_BLOCKS).unwrap();
+        assert_eq!(l.public_balance(&id, LAT_TOKEN), Some(2 * MIN_VALIDATOR_STAKE));
+        assert!(l.unbonding(&id).is_empty());
+
+        // Guardrails: can't unstake more than bonded; can't stake more than held.
+        assert_eq!(
+            l.apply_at(&unstake_tx(&sk, 2 * MIN_VALIDATOR_STAKE, 4), 300),
+            Err(LedgerError::InsufficientStake)
+        );
+        assert_eq!(
+            l.apply_at(&stake_tx(&sk, u64::MAX, 4), 300),
+            Err(LedgerError::InsufficientPublicBalance)
+        );
+        // Draining everything deletes the record — canonical empty state.
+        l.apply_at(&unstake_tx(&sk, MIN_VALIDATOR_STAKE, 4), 300).unwrap();
+        l.apply_at(&stake_tx(&sk, 0, 5), 300 + UNBONDING_BLOCKS).unwrap();
+        assert_eq!(l.staked(&id), 0);
+        assert!(l.validator_set().is_empty());
+        assert_eq!(l.public_balance(&id, LAT_TOKEN), Some(3 * MIN_VALIDATOR_STAKE));
+    }
+
+    #[test]
+    fn validator_set_is_deterministic_ordered_and_thresholded() {
+        let mut rng = OsRng;
+        let sks: Vec<SecretKey> = (0..4).map(|_| SecretKey::random(&mut rng)).collect();
+        let ids: Vec<[u8; 32]> = sks.iter().map(|s| s.public_key().to_bytes()).collect();
+        let mut l = Ledger::new();
+        for id in &ids {
+            l.register(*id).unwrap();
+            l.credit_public(id, LAT_TOKEN, 10 * MIN_VALIDATOR_STAKE);
+        }
+        // Stakes: [3×min, 5×min, 5×min, below-min].
+        l.apply_at(&stake_tx(&sks[0], 3 * MIN_VALIDATOR_STAKE, 0), 1).unwrap();
+        l.apply_at(&stake_tx(&sks[1], 5 * MIN_VALIDATOR_STAKE, 0), 1).unwrap();
+        l.apply_at(&stake_tx(&sks[2], 5 * MIN_VALIDATOR_STAKE, 0), 1).unwrap();
+        l.apply_at(&stake_tx(&sks[3], MIN_VALIDATOR_STAKE - 1, 0), 1).unwrap();
+
+        let set = l.validator_set();
+        assert_eq!(set.len(), 3, "below-threshold stake is not a validator");
+        // Stake descending; the two 5×min entries tie-break by ascending id.
+        assert_eq!(set[0].1, 5 * MIN_VALIDATOR_STAKE);
+        assert_eq!(set[1].1, 5 * MIN_VALIDATOR_STAKE);
+        assert!(set[0].0 < set[1].0, "ties order by id");
+        assert_eq!(set[2], (ids[0], 3 * MIN_VALIDATOR_STAKE));
+
+        // Deterministic from committed state alone: a snapshot roundtrip and a
+        // records boot both reproduce the identical set and root.
+        let decoded = Ledger::decode(&l.encode()).expect("snapshot decodes");
+        assert_eq!(decoded.validator_set(), set);
+        assert_eq!(decoded.state_root(), l.state_root());
+
+        l.state_root();
+        l.flush();
+        let booted = Ledger::from_records(l.store.base()).expect("records boot");
+        assert_eq!(booted.validator_set(), set);
+        assert_eq!(booted.state_root(), l.state_root());
     }
 
     #[test]

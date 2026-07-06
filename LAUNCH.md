@@ -29,6 +29,15 @@ automatically. These are the consensus/economic constants as shipped:
 | Anonymity epoch | 20 blocks (`EPOCH_BLOCKS`) | lat-state |
 | Snapshot interval | 500 blocks (`SNAPSHOT_INTERVAL`) | lat-chain |
 | PoW hash | BLAKE3 (default) · RandomX with `--features randomx` | lat-chain |
+| Min validator stake | 1,000 LAT (`MIN_VALIDATOR_STAKE`) | lat-state |
+| Unbonding window | 240 blocks (`UNBONDING_BLOCKS`) | lat-state |
+| Max validators | 64 (`MAX_VALIDATORS`) | lat-state |
+
+**Mainnet must additionally decide a validator genesis** (T13/T14): with the
+testnet premine, the genesis wallet can trivially hold every validator seat.
+A real launch needs a deliberate initial stake distribution (or a PoW→PoS
+transition height) before BFT-PoS finality (T14) activates — revisit all three
+staking parameters at the same time.
 
 Testnet genesis (in `latebrad`) — **well-known, testnet-only secrets**:
 

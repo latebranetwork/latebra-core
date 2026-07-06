@@ -221,6 +221,30 @@ pub enum Transaction {
         token: u32,
         xfer: AnonTransfer,
     },
+    /// **Stake** (T13): bond `amount` LAT from `validator`'s transparent public
+    /// balance into its validator stake — the weight the BFT-PoS validator set
+    /// is derived from. `amount = 0` is a valid no-op bond used to sweep any
+    /// matured unbonding entries back into the public balance. Transparent
+    /// auth: Schnorr-signed by `validator`, nonce-bound.
+    Stake {
+        validator: [u8; 32],
+        amount: u64,
+        nonce: u64,
+        /// Schnorr signature by `validator` over the signing bytes.
+        sig: [u8; 64],
+    },
+    /// **Unstake** (T13): move `amount` from `validator`'s bonded stake into an
+    /// unbonding entry that releases back to the public balance after the
+    /// unbonding window (`lat_state::UNBONDING_BLOCKS`) — the delay is what
+    /// makes long-range-attack slashing possible later (T16). Same auth as
+    /// `Stake`.
+    Unstake {
+        validator: [u8; 32],
+        amount: u64,
+        nonce: u64,
+        /// Schnorr signature by `validator` over the signing bytes.
+        sig: [u8; 64],
+    },
 }
 
 impl Transaction {
@@ -343,6 +367,24 @@ impl Transaction {
                 v.extend_from_slice(sig);
                 v
             }
+            Transaction::Stake { validator, amount, nonce, sig } => {
+                let mut v = Vec::with_capacity(1 + 32 + 8 + 8 + 64);
+                v.push(0x0C);
+                v.extend_from_slice(validator);
+                v.extend_from_slice(&amount.to_le_bytes());
+                v.extend_from_slice(&nonce.to_le_bytes());
+                v.extend_from_slice(sig);
+                v
+            }
+            Transaction::Unstake { validator, amount, nonce, sig } => {
+                let mut v = Vec::with_capacity(1 + 32 + 8 + 8 + 64);
+                v.push(0x0D);
+                v.extend_from_slice(validator);
+                v.extend_from_slice(&amount.to_le_bytes());
+                v.extend_from_slice(&nonce.to_le_bytes());
+                v.extend_from_slice(sig);
+                v
+            }
         }
     }
 
@@ -361,6 +403,8 @@ impl Transaction {
                 | Transaction::Shield { .. }
                 | Transaction::Unshield { .. }
                 | Transaction::ShieldStealth { .. }
+                | Transaction::Stake { .. }
+                | Transaction::Unstake { .. }
         ) {
             v.truncate(v.len() - 64);
         }
@@ -490,6 +534,20 @@ impl Transaction {
                 }
                 Some(Transaction::AnonTransfer { token, xfer })
             }
+            0x0C | 0x0D => {
+                if rest.len() != 32 + 8 + 8 + 64 {
+                    return None;
+                }
+                let validator: [u8; 32] = rest.get(0..32)?.try_into().ok()?;
+                let amount = u64::from_le_bytes(rest.get(32..40)?.try_into().ok()?);
+                let nonce = u64::from_le_bytes(rest.get(40..48)?.try_into().ok()?);
+                let sig: [u8; 64] = rest.get(48..112)?.try_into().ok()?;
+                Some(if tag == 0x0C {
+                    Transaction::Stake { validator, amount, nonce, sig }
+                } else {
+                    Transaction::Unstake { validator, amount, nonce, sig }
+                })
+            }
             _ => None,
         }
     }
@@ -559,6 +617,25 @@ mod tests {
         extra.push(0);
         assert!(Transaction::decode(&extra).is_none(), "trailing garbage rejected");
         assert!(Transaction::decode(&bytes[..bytes.len() - 1]).is_none(), "truncation rejected");
+    }
+
+    #[test]
+    fn stake_and_unstake_encoding_roundtrip() {
+        for (tag, tx) in [
+            (0x0Cu8, Transaction::Stake { validator: [5u8; 32], amount: 777, nonce: 3, sig: [9u8; 64] }),
+            (0x0D, Transaction::Unstake { validator: [5u8; 32], amount: 777, nonce: 3, sig: [9u8; 64] }),
+        ] {
+            let bytes = tx.encode();
+            assert_eq!(bytes[0], tag, "tag byte");
+            assert_eq!(bytes.len(), 1 + 32 + 8 + 8 + 64);
+            let decoded = Transaction::decode(&bytes).expect("decodes");
+            assert_eq!(decoded.encode(), bytes, "roundtrip");
+            assert_eq!(tx.signing_bytes(), bytes[..bytes.len() - 64].to_vec());
+            let mut extra = bytes.clone();
+            extra.push(0);
+            assert!(Transaction::decode(&extra).is_none(), "trailing garbage rejected");
+            assert!(Transaction::decode(&bytes[..bytes.len() - 1]).is_none(), "truncation rejected");
+        }
     }
 
     #[test]

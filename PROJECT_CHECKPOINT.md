@@ -2,7 +2,7 @@
 
 > Living document. Paste "continue from the latest checkpoint" in a new
 > conversation and work resumes from the **Current Task** below.
-> Last updated: 2026-07-06 (Checkpoint 11 — T12 parallel confidential verification).
+> Last updated: 2026-07-06 (Checkpoint 12 — T13 validator set + staking; M3 begun).
 
 ## 0. Mission
 
@@ -256,7 +256,25 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
   scheduled earlier).  ← T8
 
 ### M3 — Consensus & finality (BFT-PoS)
-- [ ] T13 Validator set + staking module.  ← T3
+- [x] **T13 Validator set + staking module.** New transparent transactions
+  `Stake`/`Unstake` (wire tags 0x0C/0x0D; Schnorr-signed, nonce-bound, LAT
+  only). Stake bonds from the public balance into a validator record
+  (`Column::Objects` kind `v`); Unstake moves bonded stake into an unbonding
+  entry that releases after `UNBONDING_BLOCKS` (240) — matured entries sweep
+  back on the account's next Stake/Unstake, so `Stake { amount: 0 }` is the
+  explicit claim tx (deterministic: driven by block height, never wall
+  clock). A fully-drained record is DELETED, keeping roots canonical.
+  Staking is committed state: `DirtyKey::Validator` + `LAT-state-val` leaf, so
+  headers bind it and T14 can trust `validator_set()` = every account with
+  ≥ `MIN_VALIDATOR_STAKE` (1,000 LAT), stake desc / id asc, capped at
+  `MAX_VALIDATORS` (64) — derived purely from committed records (identical on
+  every node; proven by snapshot-roundtrip + records-boot tests). Snapshot
+  magic bumped LATLEDG2→3 (old snapshots fall back to replay). Errors:
+  `InsufficientStake`. Stake txs are serial barriers in the parallel engine
+  (rare; they'd need validator-record merge support otherwise). Explorer
+  renders both kinds. LAUNCH.md: 3 new params + a validator-genesis
+  mainnet-must-decide note. PoW still produces blocks — T14 swaps finality
+  and only *reads* this module.  ← T3
 - [ ] T14 BFT-PoS deterministic finality engine.  ← T13
 - [ ] T15 Fork choice integrated with finality.  ← T14
 - [ ] T16 Slashing, epochs, governance parameters.  ← T14
@@ -356,6 +374,14 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
     `apply_txs_and_reward` uses it; the mempool's `select_valid` deliberately
     stays sequential (per-tx admission, different problem).
 
+- T13 staking:
+  - `lat-types`: `Transaction::Stake`/`Unstake { validator, amount, nonce, sig }`
+    (tags 0x0C/0x0D, fixed 113 bytes).
+  - `lat-state`: `MIN_VALIDATOR_STAKE`, `UNBONDING_BLOCKS`, `MAX_VALIDATORS`,
+    `struct Validator { staked, unbonding: Vec<(amount, release_height)> }`,
+    `Ledger::{staked, unbonding, validator_set}`,
+    `LedgerError::InsufficientStake`. Snapshot magic `LATLEDG3`.
+
 ## 8. Known limitations / follow-ups
 
 - **RESOLVED by T7** (was: chain ledger base is still in-memory). Persistent
@@ -382,25 +408,28 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
 
 ## 9. Current Task
 
-**T13 — Validator set + staking module** (M3 begins; T12 done. Remaining M2
-tasks are deliberately deferred: T9 access lists are unnecessary for the
-transparent lane after T8's static-set design and only matter once contracts
-need parallelism (fold into T11); T10 batched signature verification and T11
-VM optimization are incremental wins, while consensus is the last big
-STRUCTURAL change — do structure before polish). Goal (D2): the on-chain
-machinery BFT-PoS finality needs before any engine work — a staking module in
-state: validator registration (bond LAT from the public balance), stake
-amounts, unbonding with a delay window, and a deterministic
-`validator_set(epoch)` (top-N by stake, ties by id) derived from committed
-state so every node computes the identical set. New tx kinds (Stake/Unstake)
-ride the existing transparent lane; the set is committed into the state trie
-(new DirtyKey/record kind) so headers can bind it. PoW stays the block
-producer for now — T14 swaps finality; design the module so T14 only *reads*
-it. Watch: premine/testnet params in latebrad give the genesis wallet all
-stake — LAUNCH.md's mainnet-must-change table needs a validator-genesis row.
+**T14 — BFT-PoS deterministic finality engine** (T13's staking module is in;
+this is the heart of M3 and the program's biggest structural change, D2).
+Goal: blocks become FINAL — no more heaviest-work reorgs beyond the finalized
+prefix. Sketch (Tendermint-flavored, adapted to the existing tree): (1) an
+epoch's validator set = `Ledger::validator_set()` at the last block of the
+previous epoch (so the set is bound by an already-final root); (2)
+deterministic round-robin proposer weighted by stake; (3) prevote/precommit
+vote messages (new P2P kinds) signed with validator keys; ≥2/3 stake
+precommits = a **finality certificate** carried with (or after) the block;
+(4) fork choice (T15) becomes "longest finalized chain, then heaviest work
+for the unfinalized tail" — `Blockchain` gains a finalized-height watermark
+that `apply_block` refuses to reorg across; (5) PoW can remain as the
+proposer's block-production spam bound during transition (hybrid), with the
+certificate what actually finalizes. Big open decisions for the session:
+vote transport (lat-p2p message kinds + rebroadcast), certificate encoding in
+the block wire format (header extension vs side-channel), and how latebrad
+runs a validator (key from wallet seed; `--validator` flag). Keep single-node
+dev UX working: a chain with an EMPTY validator set runs exactly as today
+(pure PoW) — finality activates only when a set exists.
 
-Alternative order: T10/T11 (execution polish) if consensus design needs more
-soak time.
+Alternative order: T15 fork-choice integration is inseparable and will likely
+land WITH T14; T16 (slashing/epochs/governance) after.
 
 ### Build/verify commands
 - Tests: `cargo test -p lat-store` (+ per-crate as tasks land).
