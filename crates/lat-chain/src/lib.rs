@@ -1200,13 +1200,16 @@ fn apply_txs_and_reward(
     miner: [u8; 32],
     height: u64,
 ) -> Result<(), ChainError> {
-    // Apply each transaction, collecting the fees they pay (per token). Fees are
-    // split by state: confidential-transfer fees are paid into the miner's
-    // *encrypted* balance, public-transfer fees into the miner's *public* balance.
+    // Apply the block's transactions — the transparent lane runs across all
+    // cores (T8), with a result bit-identical to the sequential order.
+    lat_state::apply_block_parallel(state, txs, height).map_err(ChainError::Ledger)?;
+    // Collect the fees each transaction pays (per token) from the transaction
+    // data alone. Fees are split by state: confidential-transfer fees are paid
+    // into the miner's *encrypted* balance, public-transfer fees into the
+    // miner's *public* balance.
     let mut fees: Vec<(u32, u64)> = Vec::new();
     let mut public_fees: Vec<(u32, u64)> = Vec::new();
     for tx in txs {
-        state.apply_at(tx, height).map_err(ChainError::Ledger)?;
         match tx {
             // Confidential-side fees (paid from an encrypted balance) → miner's
             // encrypted balance. Unshield's fee is debited from the private side,

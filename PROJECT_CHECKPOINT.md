@@ -2,7 +2,7 @@
 
 > Living document. Paste "continue from the latest checkpoint" in a new
 > conversation and work resumes from the **Current Task** below.
-> Last updated: 2026-07-06 (Checkpoint 9 — T7 durable state + records boot; M1 complete).
+> Last updated: 2026-07-06 (Checkpoint 10 — T8 parallel transparent execution; M2 begun).
 
 ## 0. Mission
 
@@ -213,8 +213,26 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
   anchor + records format is the manifest groundwork.  ← T3, T5
 
 ### M2 — Execution performance (current milestone)
-- [ ] T8 Deterministic parallel scheduler (Block-STM style) over transparent
-  state; conflict detection + deterministic replay.  ← T3
+- [x] **T8 Deterministic parallel execution over the transparent lane.**
+  `lat_state::apply_block_parallel` — semantics identical to the sequential
+  apply loop, wired into lat-chain's `apply_txs_and_reward` (tip-extend, reorg
+  rebuild, snapshot tail replay all benefit). Design: transparent transactions
+  (`PublicTransfer`/`Shield` = {from,to}, `Register` = {pubkey}) have **exact
+  static access sets** (fees are already deferred to the coinbase), so instead
+  of optimistic Block-STM re-execution we do **conflict-free wave scheduling**:
+  runs of parallel-lane txs are split into waves by earliest-wave list
+  scheduling (conflicting txs execute in block order across waves; same-wave
+  txs are pairwise account-disjoint by construction), each wave fans out over
+  `thread::scope` workers on cheap Ledger clones (T5b) and merges written
+  account records back. Result is provably bit-identical to sequential — each
+  tx observes exactly its sequential pre-state; block accept/reject identical.
+  Everything else (confidential proofs, contracts, CreateToken) is a serial
+  barrier — proof batching is T12, dynamic access lists are T9/T11. INVARIANT
+  (documented at `access_set`): a parallel-lane apply arm must never touch
+  state outside its static set — a randomized parallel-vs-sequential root
+  oracle test guards it. **Measured (parallel_bench, 8 logical cores): 2000
+  disjoint public transfers 244→86 ms (~2.9–3.1×, ~23–30k tx/s); hot-receiver
+  worst case exactly 1.00× (zero overhead).**  ← T3
 - [ ] T9 Per-tx access lists / state-dependency hints.  ← T8
 - [ ] T10 Parallel + batched signature verification.  ← T8
 - [ ] T11 VM optimization (dispatch, gas metering, memory model).  ← T8
@@ -314,6 +332,13 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
     (`height u64 LE ‖ block id [32]`), written atomically with every adopted
     flush/rehome. `booted_from_snapshot()` = `boot_mode() != FullReplay`.
   - `lat-store::Smt` is `S: KVStore + ?Sized`.
+- T8 parallel execution:
+  - `lat_state::apply_block_parallel(&mut Ledger, &[Transaction], height)
+    -> Result<(), LedgerError>` — drop-in equivalent of the sequential
+    `apply_at` loop (same state, same block-level accept/reject); transparent
+    lane runs across cores, everything else is a serial barrier. lat-chain's
+    `apply_txs_and_reward` uses it; the mempool's `select_valid` deliberately
+    stays sequential (per-tx admission, different problem).
 
 ## 8. Known limitations / follow-ups
 
@@ -341,23 +366,26 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
 
 ## 9. Current Task
 
-**T8 — Deterministic parallel scheduler over transparent state** (M1 storage
-milestone COMPLETE: T1–T7 all done; the P2P half of state sync is deferred to
-T19 where it belongs, after T14 gives it peers). T8 is the biggest throughput
-lever: execute a block's transparent transactions optimistically in parallel
-(Block-STM style), detect read/write conflicts, and re-execute conflicting
-transactions so the result is **bit-identical to sequential order** — consensus
-must never see a difference. Sketch: (1) a versioned read/write-set recorder
-over the ledger's account reads; (2) worker pool executing txs speculatively
-against a snapshot + write buffer; (3) validation pass in tx order, aborting
-and re-running any tx whose reads were clobbered; (4) the confidential lane
-(~23 ms proofs) stays OFF this path — proofs batch-verify in parallel
-trivially (T12). Bench target: multi-core scaling on the transparent-transfer
-workload in `lat-attack`'s bench. Depends on: T3 (done).
+**T12 — Parallel + batched confidential verification** (pulled ahead of T9/T10:
+T8's static-access design makes per-tx access hints (T9) unnecessary for the
+transparent lane, and transparent signature verification already parallelizes
+inside T8's waves (much of T10). The 23 ms confidential proof is now the
+dominant serial cost per block). Goal: verify a block's confidential
+transactions' zero-knowledge proofs (SolventTransfer / Unshield / AnonTransfer)
+**in parallel across cores before/alongside state application**, so a block of
+mixed traffic no longer serializes on proofs. Sketch: (1) split `apply_at`'s
+confidential arms into a pure *verify* half (no state writes; needs the
+sender/ring balance ciphertexts it binds to) and an *apply* half; (2) in
+`apply_block_parallel`, pre-read each confidential tx's bound balances at its
+sequential position — they're only stable if no earlier tx touches those
+accounts, so start with the common fast case: verify in parallel when the
+bound accounts are untouched by earlier txs in the block, else fall back to
+in-place serial verify; (3) keep the barrier semantics for state application.
+Bench: mixed transparent+confidential block in `bench.rs`/`parallel_bench`.
+Alternative next: T13 validator set + staking (start the consensus milestone).
 
-Watch out for: `RefCell` interior mutability in `Ledger` (commitment, cache)
-is not `Sync` — the parallel engine needs its own state view, not `&Ledger`
-sharing across threads.
+Note: `lat-attack` red-team must stay green — the privacy lane's verification
+must be byte-for-byte the same checks, just scheduled differently.
 
 ### Build/verify commands
 - Tests: `cargo test -p lat-store` (+ per-crate as tasks land).
@@ -365,5 +393,6 @@ sharing across threads.
 - Store bench: `cargo run --release --example store_bench -p lat-store`.
 - Clone bench: `cargo run --release --example clone_bench -p lat-state`.
 - Prune bench: `cargo run --release --example prune_bench -p lat-state`.
+- Parallel-exec bench: `cargo run --release --example parallel_bench -p lat-state`.
 - Note: `latfun.exe` may hold a file lock during `--workspace` builds if running;
   build with `--exclude latfun` or stop that process.

@@ -29,6 +29,9 @@ use lat_crypto::{Ciphertext, PublicKey, Signature};
 use lat_store::{Column, KVStore, OverlayStore, Smt, WriteBatch};
 use lat_types::{normalize_ticker, Transaction};
 
+mod parallel;
+pub use parallel::apply_block_parallel;
+
 /// The native coin LAT is token id 0.
 pub const LAT_TOKEN: u32 = 0;
 
@@ -469,6 +472,22 @@ impl Ledger {
             cache.clear();
         }
         cache.insert(*id, a);
+    }
+
+    /// Raw account record bytes (T8 crate-internal: a parallel worker's view
+    /// exports its writes as records for the merge back into the main ledger).
+    fn account_record(&self, id: &[u8; 32]) -> Option<Vec<u8>> {
+        self.store.get(Column::Objects, &rec_key(REC_ACCOUNT, id))
+    }
+
+    /// Adopt an account record produced by a parallel worker's view (T8
+    /// crate-internal). Bypasses the typed write path, so the cache entry must
+    /// be dropped (it would otherwise serve the stale pre-wave account) and the
+    /// commitment leaf re-marked.
+    fn adopt_account_record(&mut self, id: &[u8; 32], bytes: Vec<u8>) {
+        self.store.put(Column::Objects, rec_key(REC_ACCOUNT, id), bytes);
+        self.cache.get_mut().remove(id);
+        self.mark(DirtyKey::Account(*id));
     }
 
     /// Read one token record by id.
