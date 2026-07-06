@@ -466,6 +466,10 @@ pub struct Blockchain {
     /// Whether this instance booted from a snapshot instead of a full replay
     /// (observability: tests assert on it, the daemon prints it).
     booted_from_snapshot: bool,
+    /// T6 pruning: `Some(w)` sweeps unreachable trie nodes every `w` blocks,
+    /// keeping the last `w` block state-roots queryable. `None` = archive mode
+    /// (every historical root stays readable forever) — the default.
+    prune_window: Option<u64>,
 }
 
 impl Blockchain {
@@ -519,7 +523,17 @@ impl Blockchain {
             store: None,
             snapshot_path: None,
             booted_from_snapshot: false,
+            prune_window: None,
         }
+    }
+
+    /// Enable state-trie pruning (T6): every `window` blocks, trie nodes not
+    /// reachable from the last `window` block state-roots (or the current root)
+    /// are swept from the committed base. Bounds state-storage growth under
+    /// churn; historical roots older than the window can no longer serve
+    /// proofs. Leave unset for an archive node. `window` is clamped to ≥ 1.
+    pub fn set_prune_window(&mut self, window: u64) {
+        self.prune_window = Some(window.max(1));
     }
 
     fn genesis_state(
@@ -938,6 +952,7 @@ impl Blockchain {
             // Commit this block's trie writes into the overlay base, so the next
             // block's clone starts from an empty overlay (keeps clones cheap).
             self.active_state.flush();
+            self.maybe_prune();
             self.maybe_snapshot();
             Ok(())
         } else if cum_work > active_cum {
@@ -954,6 +969,7 @@ impl Blockchain {
                     self.active_tip = id;
                     self.active_height = block.header.height;
                     self.active_chain = path;
+                    self.maybe_prune();
                     self.maybe_snapshot();
                     Ok(())
                 }
@@ -988,6 +1004,25 @@ impl Blockchain {
     /// block, active chain or side branch).
     pub fn block_by_id(&self, id: &[u8; 32]) -> Option<Vec<u8>> {
         self.tree.get(id).map(|n| n.encoded.clone())
+    }
+
+    /// Sweep unreachable trie nodes every `prune_window` blocks (no-op in
+    /// archive mode). Retains the state roots of the last `window` active
+    /// blocks plus the current root, so proofs within the window keep working
+    /// and any speculative clone forked from the adopted tip stays valid.
+    fn maybe_prune(&self) {
+        let Some(window) = self.prune_window else { return };
+        if self.active_height == 0 || !self.active_height.is_multiple_of(window) {
+            return;
+        }
+        let retain: Vec<[u8; 32]> = self
+            .active_chain
+            .iter()
+            .rev()
+            .take(window as usize + 1)
+            .filter_map(|id| self.tree.get(id).map(|n| n.header.state_root))
+            .collect();
+        self.active_state.prune_history(&retain);
     }
 
     /// Snapshot the active state every [`SNAPSHOT_INTERVAL`] blocks (persistent
@@ -1359,6 +1394,45 @@ mod tests {
         assert_eq!(a.height(), 3, "reorged to the heavier branch");
         assert_eq!(a.tip(), b.tip());
         assert!(a.is_registered(&x), "state was rebuilt along the new branch");
+    }
+
+    #[test]
+    fn prune_window_bounds_state_growth_and_chains_agree() {
+        let prem = [([1u8; 32], 100u64)];
+        let mut archive = Blockchain::genesis(&prem, DEFAULT_DIFFICULTY);
+        let mut pruned = Blockchain::genesis(&prem, DEFAULT_DIFFICULTY);
+        pruned.set_prune_window(4);
+
+        // Identical blocks into both chains; registrations churn the trie.
+        for i in 0..16u8 {
+            let block = archive.mine(vec![mine_registration([i + 10; 32])]);
+            archive.apply_block(&block).unwrap();
+            pruned.apply_block(&block).unwrap();
+        }
+        assert_eq!(pruned.tip(), archive.tip());
+        assert_eq!(pruned.state_root(), archive.state_root(), "pruning never changes state");
+        assert!(
+            pruned.active_state.state_node_count() < archive.active_state.state_node_count(),
+            "the pruned chain must hold fewer trie nodes than the archive chain"
+        );
+
+        // The pruned chain keeps operating: extend the tip…
+        let block = pruned.mine(vec![mine_registration([99u8; 32])]);
+        pruned.apply_block(&block).unwrap();
+        assert!(pruned.is_registered(&[99u8; 32]));
+
+        // …and reorg (state is rebuilt from blocks, never from pruned nodes).
+        let mut rival = Blockchain::genesis(&prem, DEFAULT_DIFFICULTY);
+        for _ in 0..19 {
+            let b = rival.mine(vec![]);
+            rival.apply_block(&b).unwrap();
+        }
+        for h in 1..=19u64 {
+            let b = Block::decode(rival.block_bytes(h).unwrap()).unwrap();
+            pruned.apply_block(&b).unwrap();
+        }
+        assert_eq!(pruned.tip(), rival.tip(), "pruned chain reorged to the heavier branch");
+        assert_eq!(pruned.state_root(), rival.state_root());
     }
 
     #[test]

@@ -29,7 +29,10 @@ use std::collections::BTreeMap;
 use std::sync::RwLock;
 
 pub mod smt;
-pub use smt::{empty_root, verify as verify_proof, Proof, Smt, Terminal, KEY_BITS};
+pub use smt::{
+    empty_root, prune as prune_state, verify as verify_proof, Proof, PruneStats, Smt, Terminal,
+    KEY_BITS,
+};
 
 pub mod redb_store;
 pub use redb_store::RedbStore;

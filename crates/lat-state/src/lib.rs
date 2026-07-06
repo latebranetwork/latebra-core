@@ -294,6 +294,34 @@ impl Ledger {
         self.store.flush();
     }
 
+    /// Garbage-collect the commitment trie (T6): drop from the committed base
+    /// every trie node unreachable from the current `state_root` or from one of
+    /// `retain_roots` (a window of recent historical roots kept queryable for
+    /// proofs). Content-addressed nodes accumulate forever otherwise — every
+    /// account update strands its old path.
+    ///
+    /// Reconciles and flushes first, so the sweep sees the complete current
+    /// state in the base. Semantically a no-op for the current state and every
+    /// retained root; roots *not* retained become unreadable. **Same invariant
+    /// as [`flush`](Self::flush): only call on the adopted ledger**, and retain
+    /// every root a live speculative clone may have been forked from. Archive
+    /// nodes simply never call this.
+    pub fn prune_history(&self, retain_roots: &[[u8; 32]]) -> lat_store::PruneStats {
+        let mut roots = Vec::with_capacity(retain_roots.len() + 1);
+        roots.push(self.state_root()); // reconciles pending dirty entries
+        roots.extend_from_slice(retain_roots);
+        self.flush(); // the base must hold every node before the sweep
+        lat_store::prune_state(self.store.base().as_ref(), &roots)
+    }
+
+    /// Commitment-trie nodes currently in the committed base (diagnostics /
+    /// benchmarks — e.g. asserting [`prune_history`](Self::prune_history)
+    /// actually shrank the store). Meaningful after a [`flush`](Self::flush);
+    /// uncommitted nodes still in the overlay's write top are not counted.
+    pub fn state_node_count(&self) -> usize {
+        self.store.base().scan_prefix(Column::State, b"").len()
+    }
+
     // -- object records ---------------------------------------------------------
     // Accounts, tokens, contracts and nullifiers are encoded records in
     // `Column::Objects`, read through a bounded write-through cache (accounts
@@ -2295,6 +2323,62 @@ mod tests {
         assert!(matches!(proof.terminal, lat_store::Terminal::Leaf { .. }), "account leaf persisted");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn prune_history_shrinks_trie_and_keeps_state_intact() {
+        let mut rng = OsRng;
+        let mut ledger = Ledger::new();
+        let ids: Vec<[u8; 32]> =
+            (0..12).map(|_| SecretKey::random(&mut rng).public_key().to_bytes()).collect();
+        for id in &ids {
+            ledger.register(*id).unwrap();
+            ledger.credit_public(id, LAT_TOKEN, 1_000);
+        }
+        ledger.state_root();
+        ledger.flush();
+
+        // Churn across simulated committed blocks: every balance change strands
+        // the old trie path. Keep the recent roots like a chain would.
+        let mut roots = Vec::new();
+        for round in 1..=20u64 {
+            for id in &ids {
+                ledger.credit_public(id, LAT_TOKEN, round);
+            }
+            roots.push(ledger.state_root());
+            ledger.flush();
+        }
+        let before = ledger.state_node_count();
+        let root_before = ledger.state_root();
+
+        // Retain a 4-root window; everything older is garbage-collected.
+        let window = &roots[roots.len() - 4..];
+        let stats = ledger.prune_history(window);
+        assert!(stats.dropped > 0, "churn must leave prunable garbage");
+        let after = ledger.state_node_count();
+        assert_eq!(after, before - stats.dropped);
+        assert_eq!(after, stats.kept);
+
+        // Current state is untouched: same root, proofs verify, balances read.
+        assert_eq!(ledger.state_root(), root_before);
+        let proof = ledger.account_proof(&ids[0]).unwrap();
+        assert!(verify_account_proof(&root_before, &proof));
+        assert_eq!(ledger.public_balance(&ids[0], LAT_TOKEN), Some(1_000 + (1..=20).sum::<u64>()));
+
+        // A retained historical root still serves trie reads (archive window)…
+        let old_root = window[0];
+        let base = ledger.store.base();
+        let old_trie = Smt::from_root(base.as_ref(), old_root);
+        assert!(matches!(
+            old_trie.prove(&trie_key_account(&ids[0])).terminal,
+            lat_store::Terminal::Leaf { .. }
+        ));
+
+        // …and the ledger keeps working normally after the sweep.
+        ledger.credit_public(&ids[1], LAT_TOKEN, 5);
+        assert_ne!(ledger.state_root(), root_before);
+        let rebuilt = Ledger::decode(&ledger.encode()).expect("snapshot decodes");
+        assert_eq!(rebuilt.state_root(), ledger.state_root(), "roundtrip after prune");
     }
 
     #[test]

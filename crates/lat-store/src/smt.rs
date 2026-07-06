@@ -228,12 +228,12 @@ pub fn verify(root: &Hash, key: &[u8; 32], expected: Option<&[u8]>, proof: &Proo
 /// the current [`root`](Smt::root) is held in memory (callers persist it under
 /// their own meta key). Reads and proofs are `&self`; mutations are `&mut self`
 /// and commit atomically.
-pub struct Smt<'a, S: KVStore> {
+pub struct Smt<'a, S: KVStore + ?Sized> {
     store: &'a S,
     root: Hash,
 }
 
-impl<'a, S: KVStore> Smt<'a, S> {
+impl<'a, S: KVStore + ?Sized> Smt<'a, S> {
     /// An empty tree over `store`.
     pub fn new(store: &'a S) -> Self {
         Smt { store, root: defaults()[0] }
@@ -446,6 +446,73 @@ impl<'a, S: KVStore> Smt<'a, S> {
     }
 }
 
+// --- pruning (T6) ----------------------------------------------------------
+
+/// Result of a [`prune`] sweep over [`Column::State`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PruneStats {
+    /// Nodes reachable from a retained root (left in place).
+    pub kept: usize,
+    /// Unreachable nodes deleted by the sweep.
+    pub dropped: usize,
+}
+
+/// Every node hash reachable from any of `roots` (the mark phase). Default
+/// (empty-subtree) hashes are never stored, so a child that doesn't resolve is
+/// simply skipped; content-addressing means subtrees shared between roots are
+/// visited once.
+pub fn reachable_nodes<S: KVStore + ?Sized>(
+    store: &S,
+    roots: &[Hash],
+) -> std::collections::HashSet<Hash> {
+    let mut live = std::collections::HashSet::new();
+    let mut stack: Vec<Hash> = roots.to_vec();
+    while let Some(hash) = stack.pop() {
+        if live.contains(&hash) {
+            continue;
+        }
+        let Some(bytes) = store.get(Column::State, &hash) else {
+            continue; // default (empty) subtree, or a root not in this store
+        };
+        live.insert(hash);
+        if let Some(Node::Internal { left, right }) = Node::decode(&bytes) {
+            stack.push(left);
+            stack.push(right);
+        }
+    }
+    live
+}
+
+/// Mark-and-sweep prune of the state trie: delete every node in
+/// [`Column::State`] not reachable from one of the `retain` roots. Nodes are
+/// content-addressed and immutable, so anything unreachable from a retained
+/// root can never be referenced again — dropping it is safe by construction,
+/// and every retained root remains fully readable and provable afterwards
+/// (leaves carry their values).
+///
+/// Call this on the **committed base** store (after a flush): pruning through
+/// an overlay would only accumulate tombstones in its write layer. The caller
+/// must retain every root a live reader or speculative clone may still be
+/// forked from — the same adopted-state invariant as `flush`. Archive nodes
+/// simply never call this.
+pub fn prune<S: KVStore + ?Sized>(store: &S, retain: &[Hash]) -> PruneStats {
+    let live = reachable_nodes(store, retain);
+    let mut batch = WriteBatch::new();
+    let mut dropped = 0usize;
+    for (key, _) in store.scan_prefix(Column::State, b"") {
+        let is_live = key.len() == 32
+            && live.contains::<Hash>(&key.as_slice().try_into().expect("checked 32-byte key"));
+        if !is_live {
+            batch.delete(Column::State, key);
+            dropped += 1;
+        }
+    }
+    if dropped > 0 {
+        store.write(batch);
+    }
+    PruneStats { kept: live.len(), dropped }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,6 +683,116 @@ mod tests {
         assert_eq!(t.get(&k(b"a")), Some(b"1".to_vec()));
         assert_eq!(t.get(&k(b"b")), Some(b"2".to_vec()));
         assert!(verify(&t.root(), &k(b"a"), Some(b"1"), &t.prove(&k(b"a"))));
+    }
+
+    /// Number of nodes physically present in Column::State.
+    fn node_count(s: &MemStore) -> usize {
+        s.scan_prefix(Column::State, b"").len()
+    }
+
+    #[test]
+    fn prune_drops_garbage_keeps_current_root_fully_readable() {
+        let s = MemStore::new();
+        let mut t = Smt::new(&s);
+        let mut rng = Rng(42);
+        let mut keys = Vec::new();
+        // Churn: every overwrite strands the old path's nodes as garbage.
+        for i in 0..64u32 {
+            let key = rng.key();
+            t.update(&key, &i.to_le_bytes());
+            keys.push((key, i));
+        }
+        for round in 1..=5u32 {
+            for (key, i) in &keys {
+                t.update(key, &(i + round * 1000).to_le_bytes());
+            }
+        }
+        let before = node_count(&s);
+        let stats = prune(&s, &[t.root()]);
+        let after = node_count(&s);
+        assert!(stats.dropped > 0, "churn must have created garbage");
+        assert_eq!(after, stats.kept, "sweep leaves exactly the marked set");
+        assert_eq!(before, stats.kept + stats.dropped);
+
+        // The retained root is fully intact: reads and proofs for every key.
+        for (key, i) in &keys {
+            let val = (i + 5000).to_le_bytes();
+            assert_eq!(t.get(key), Some(val.to_vec()));
+            assert!(verify(&t.root(), key, Some(&val), &t.prove(key)));
+        }
+        // Pruning an already-pruned store is a no-op.
+        let again = prune(&s, &[t.root()]);
+        assert_eq!(again.dropped, 0);
+        assert_eq!(again.kept, stats.kept);
+    }
+
+    #[test]
+    fn prune_retains_historical_roots_on_request() {
+        let s = MemStore::new();
+        let mut t = Smt::new(&s);
+        t.update(&k(b"alice"), b"10");
+        t.update(&k(b"bob"), b"20");
+        let old_root = t.root();
+        t.update(&k(b"alice"), b"99");
+        t.update(&k(b"carol"), b"5");
+        let new_root = t.root();
+
+        // Retaining both roots keeps the old state queryable (archive window).
+        prune(&s, &[new_root, old_root]);
+        let old = Smt::from_root(&s, old_root);
+        assert_eq!(old.get(&k(b"alice")), Some(b"10".to_vec()));
+        assert!(verify(&old_root, &k(b"alice"), Some(b"10"), &old.prove(&k(b"alice"))));
+        let new = Smt::from_root(&s, new_root);
+        assert_eq!(new.get(&k(b"alice")), Some(b"99".to_vec()));
+
+        // Dropping the old root from the retain set garbage-collects what only
+        // it referenced, while the current root stays whole.
+        let stats = prune(&s, &[new_root]);
+        assert!(stats.dropped > 0, "old-root-only nodes must go");
+        assert_eq!(new.get(&k(b"alice")), Some(b"99".to_vec()));
+        assert_eq!(new.get(&k(b"bob")), Some(b"20".to_vec()));
+        assert_eq!(new.get(&k(b"carol")), Some(b"5".to_vec()));
+        assert!(verify(&new_root, &k(b"bob"), Some(b"20"), &new.prove(&k(b"bob"))));
+    }
+
+    #[test]
+    fn pruned_store_reproduces_a_fresh_rebuild() {
+        // Oracle: after churn + prune, the surviving node set is exactly what a
+        // from-scratch build of the final key/value set produces.
+        let mut rng = Rng(7);
+        let s = MemStore::new();
+        let mut t = Smt::new(&s);
+        let mut model = std::collections::BTreeMap::new();
+        let mut keys: Vec<[u8; 32]> = Vec::new();
+        for i in 0..300u32 {
+            if rng.next() % 10 < 7 || keys.is_empty() {
+                let key = rng.key();
+                t.update(&key, &i.to_le_bytes());
+                model.insert(key, i.to_le_bytes().to_vec());
+                keys.push(key);
+            } else {
+                let key = keys.swap_remove((rng.next() as usize) % keys.len());
+                t.remove(&key);
+                model.remove(&key);
+            }
+        }
+        prune(&s, &[t.root()]);
+
+        let s2 = MemStore::new();
+        let mut fresh = Smt::new(&s2);
+        for (key, val) in &model {
+            fresh.update(key, val);
+        }
+        assert_eq!(t.root(), fresh.root());
+        // Exactly the reachable set survives. (Counts are NOT comparable across
+        // stores: a leaf at depth d shares its content-address with the internal
+        // node (leaf@d+1, empty), so a churned store may hold a deeper — equally
+        // valid — materialization than a fresh build.)
+        assert_eq!(node_count(&s), reachable_nodes(&s, &[t.root()]).len());
+        for (key, val) in &model {
+            assert_eq!(t.get(key).as_ref(), Some(val));
+            assert!(verify(&t.root(), key, Some(val), &t.prove(key)));
+        }
     }
 
     #[test]

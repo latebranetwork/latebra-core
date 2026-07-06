@@ -2,7 +2,7 @@
 
 > Living document. Paste "continue from the latest checkpoint" in a new
 > conversation and work resumes from the **Current Task** below.
-> Last updated: 2026-07-05 (Checkpoint 7 — T5b disk-resident objects).
+> Last updated: 2026-07-06 (Checkpoint 8 — T6 pruning + archive mode).
 
 ## 0. Mission
 
@@ -171,7 +171,25 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
   (shares the store base, drops the cache). NB: the running chain's ledger still
   uses an in-memory base (`Ledger::new`) — booting a node's *state* from the
   on-disk records without replay is T7 (snapshot sync).  ← T3, T4
-- [ ] T6 Pruning + archive mode.  ← T3, T5
+- [x] **T6 Pruning + archive mode.** Mark-and-sweep GC for the commitment trie:
+  `lat_store::smt::{reachable_nodes, prune}` (re-exported as `prune_state`)
+  marks every node reachable from a set of retained roots and deletes the rest
+  from `Column::State` — safe by construction (nodes are content-addressed and
+  immutable, so unreachable ⇒ unreferenceable; retained roots stay fully
+  readable and provable since leaves carry their values).
+  `Ledger::prune_history(retain_roots)` reconciles + flushes, then sweeps the
+  committed base (never through the overlay). `Blockchain::set_prune_window(w)`
+  sweeps every `w` blocks retaining the last `w` block state-roots + current;
+  unset = **archive mode** (default — behavior unchanged). `latebrad` prunes
+  with window 64 by default; `--archive` opts out. Reorg safety: rebuild
+  replays blocks into a fresh base, never reads pruned nodes. **Measured
+  (prune_bench): churn grows the trie with history, not state — 10k accounts ×
+  50 touch-all rounds = 7.95M nodes, 97k live (81.6× shrink)**; sweep is
+  O(history) (~1.6 s/10k×10, ~17 s/50k×10 in-memory) — fine at a 64-block
+  cadence, revisit (incremental refcounts) if it ever bites. Subtlety found: a
+  leaf at depth d shares its content-address with internal(leaf@d+1, empty), so
+  two stores can hold different — equally valid — physical materializations of
+  the same root; cross-store node counts are not comparable.  ← T3, T5
 - [ ] T7 Snapshot format + fast snapshot sync.  ← T3, T5
 
 ### M2 — Execution performance
@@ -253,6 +271,17 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
   - `struct Proof { siblings, terminal }`, `enum Terminal { Empty, Leaf }`.
   - `fn verify(root, key, expected: Option<&[u8]>, proof) -> bool` (re-exported
     as `verify_proof`) — membership when `Some`, exclusion when `None`.
+- T6 pruning:
+  - `lat-store::smt`: `fn reachable_nodes(store, roots) -> HashSet<Hash>` (mark),
+    `fn prune(store, retain: &[Hash]) -> PruneStats { kept, dropped }` (sweep;
+    re-exported as `prune_state`). `Smt` is now `S: KVStore + ?Sized` (works
+    over `&dyn KVStore`). Call `prune` on the committed **base**, not an overlay.
+  - `lat-state::Ledger`: `prune_history(retain_roots) -> PruneStats` (reconciles,
+    flushes, sweeps the base; same adopted-ledger invariant as `flush`),
+    `state_node_count()` (diagnostics; meaningful after a flush).
+  - `lat-chain::Blockchain`: `set_prune_window(w)` — sweep every `w` blocks
+    retaining the last `w` block state-roots; unset = archive (default).
+  - `latebrad`: `--archive` flag (default prunes with window 64).
 
 ## 8. Known limitations / follow-ups
 
@@ -263,10 +292,13 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
   wiring the live chain onto a durable ledger base needs care (reorg builds a
   fresh ledger; speculative clones share the base; `with_base` wipes on open) and
   is coupled to booting-state-without-replay — that's **T7 (snapshot sync)**.
-- **Object-record accumulation on the trie side.** SMT nodes remain content-
-  addressed and never deleted (old versions linger); object records ARE keyed by
-  id and overwritten in place, so they don't accumulate — but trie-node growth is
-  still there. Addressed by pruning (**T6**).
+- **Prune sweep is O(history), not incremental.** T6's mark-and-sweep scans the
+  whole `Column::State` and marks from the retained roots on every sweep (~17 s
+  at 10M stranded nodes, in-memory). Amortized over a 64-block window this is
+  acceptable; if it ever dominates, move to incremental reference counting or
+  generational sweeps. Also: the mark set holds every live node hash in RAM
+  (32 B each), and `scan_prefix` materializes the column — fine now, revisit
+  with a streaming iterator API if state reaches hundreds of millions of nodes.
 - **Account cache is clear-on-cap, not LRU.** `ACCOUNT_CACHE_CAP` (65 536) bounds
   memory by wiping the whole cache at the cap rather than evicting LRU. Bounded
   and allocation-free on the hit path; a hot set larger than the cap thrashes.
@@ -276,28 +308,29 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
 
 ## 9. Current Task
 
-**T6 — Pruning + archive mode** (the state model is now settled by T5b, so the
-storage foundation is ready for pruning). Trie nodes are content-addressed and
-never deleted, so the store grows unbounded with state churn. Add: (1) a
-reachability sweep from the current `state_root` (and a configurable window of
-recent roots) that drops unreferenced SMT nodes from `Column::State`; (2) an
-**archive mode** flag that keeps everything for full-history nodes. Keep the
-incremental-commitment semantics intact — pruning must never drop a node the
-active root (or a retained historical root) still needs. Benchmark store size
-before/after a churny workload. Depends on: T3, T5.
+**T7 — Snapshot format + fast snapshot sync** (M1's last open task; T6 done).
+Goal: boot a node's *state* from the on-disk object records + trie without a
+from-genesis replay, and serve/verify state snapshots to syncing peers. This is
+also the gate for wiring the live chain ledger onto a durable `RedbStore` base
+(§8: reorg builds a fresh ledger, speculative clones share the base, `with_base`
+wipes Objects on open — all three interactions must be redesigned together).
+Sketch: (1) a versioned snapshot manifest = block id + state_root + object-record
+range digests; (2) `Ledger::from_records(base)` that trusts records only after
+recomputing the trie root against the header's `state_root`; (3) chunked
+transfer over P2P with per-chunk verification against the root (SMT proofs);
+(4) reorg = open a fresh base (directory/generation per adopted branch) instead
+of wipe-in-place. Depends on: T3, T5. T6's pruning keeps what a snapshot must
+carry small.
 
-Natural companion / alternative order:
-- **Wire the chain ledger onto a durable base** (finish the disk-resident story):
-  give `Blockchain` a real `RedbStore`-backed ledger base instead of `Ledger::new()`.
-  Blocked on booting state from records without replay — do it WITH **T7 snapshot
-  sync**, not before (reorg/clone/wipe interactions, see §8).
-- Or jump to **M2 parallel execution** (biggest throughput lever) — the state
-  model is settled enough now that this is unblocked.
+Alternative order:
+- Jump to **M2 parallel execution** (T8, biggest throughput lever) — the state
+  model is settled; T7 is about boot/sync ergonomics, not correctness.
 
 ### Build/verify commands
 - Tests: `cargo test -p lat-store` (+ per-crate as tasks land).
 - Chain bench: `cargo run --release --example bench -p lat-attack`.
 - Store bench: `cargo run --release --example store_bench -p lat-store`.
 - Clone bench: `cargo run --release --example clone_bench -p lat-state`.
+- Prune bench: `cargo run --release --example prune_bench -p lat-state`.
 - Note: `latfun.exe` may hold a file lock during `--workspace` builds if running;
   build with `--exclude latfun` or stop that process.

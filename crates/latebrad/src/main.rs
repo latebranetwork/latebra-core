@@ -66,7 +66,14 @@ struct Config {
     peers: Vec<String>,
     mine: bool,
     mine_blocks: Option<u64>,
+    /// Keep every historical state root (no trie pruning).
+    archive: bool,
 }
+
+/// Default T6 prune window: sweep unreachable trie nodes every 64 blocks,
+/// keeping the last 64 block state-roots provable. Matches the snapshot
+/// cadence's order of magnitude; archive nodes opt out with --archive.
+const PRUNE_WINDOW: u64 = 64;
 
 fn parse_config() -> Config {
     let mut cfg = Config {
@@ -76,6 +83,7 @@ fn parse_config() -> Config {
         peers: Vec::new(),
         mine: false,
         mine_blocks: None,
+        archive: false,
     };
     let args: Vec<String> = env::args().skip(1).collect();
     let mut i = 0;
@@ -100,6 +108,7 @@ fn parse_config() -> Config {
                 cfg.public_addr = args.get(i).cloned();
             }
             "--mine" => cfg.mine = true,
+            "--archive" => cfg.archive = true,
             "--mine-blocks" => {
                 i += 1;
                 cfg.mine_blocks = args.get(i).and_then(|s| s.parse().ok());
@@ -124,6 +133,8 @@ fn print_usage() {
     println!("                        for internet nodes: --listen 0.0.0.0:4040 --public-addr host:4040");
     println!("  --mine                mine blocks on an interval");
     println!("  --mine-blocks <n>     mine n blocks then exit");
+    println!("  --archive             keep all historical state roots (default: prune,");
+    println!("                        retaining the last {PRUNE_WINDOW} block state-roots)");
 }
 
 fn main() {
@@ -137,7 +148,7 @@ fn main() {
     if let Some(parent) = cfg.data.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let chain = match Blockchain::open_with_public(&cfg.data, &premine, &public_premine, DEFAULT_DIFFICULTY) {
+    let mut chain = match Blockchain::open_with_public(&cfg.data, &premine, &public_premine, DEFAULT_DIFFICULTY) {
         Ok(chain) => chain,
         Err(e) => {
             // The common cause is pointing --data at a file that isn't a Latebra
@@ -155,8 +166,13 @@ fn main() {
         }
     };
 
+    if !cfg.archive {
+        chain.set_prune_window(PRUNE_WINDOW);
+    }
+
     println!("Latebra node (latebrad)");
     println!("  data        : {}", cfg.data.display());
+    println!("  state       : {}", if cfg.archive { "archive (all roots kept)".to_string() } else { format!("pruned (last {PRUNE_WINDOW} roots kept)") });
     println!(
         "  boot        : {}",
         if chain.booted_from_snapshot() { "snapshot + tail replay" } else { "full replay" }

@@ -170,7 +170,7 @@ mod tests {
         let ov = OverlayStore::new(base);
         ov.put(Column::State, b"x".to_vec(), b"1".to_vec());
 
-        let mut clone = ov.clone();
+        let clone = ov.clone();
         clone.put(Column::State, b"x".to_vec(), b"2".to_vec());
         clone.put(Column::State, b"y".to_vec(), b"clone-only".to_vec());
 
