@@ -42,7 +42,7 @@ use std::thread;
 
 use lat_types::Transaction;
 
-use crate::{Ledger, LedgerError};
+use crate::{Ledger, LedgerError, ProofPass};
 
 /// The complete set of accounts `tx` may read or write, or `None` if the
 /// transaction's access is dynamic/global (barrier: applied serially).
@@ -77,10 +77,17 @@ pub fn apply_block_parallel(
     txs: &[Transaction],
     height: u64,
 ) -> Result<(), LedgerError> {
+    // T12: verify eligible confidential proofs across all cores up front, so
+    // the serial barrier below skips the ~ms zero-knowledge math per proof.
+    let preverified = preverify_confidential(ledger, txs);
     let mut i = 0;
     while i < txs.len() {
         if access_set(&txs[i]).is_none() {
-            ledger.apply_at(&txs[i], height)?; // barrier: serial, in place
+            // Barrier: serial, in place (with the pre-pass evidence, if any).
+            match preverified.get(&i) {
+                Some(p) => ledger.apply_at_with(&txs[i], height, Some(p))?,
+                None => ledger.apply_at(&txs[i], height)?,
+            }
             i += 1;
             continue;
         }
@@ -92,6 +99,104 @@ pub fn apply_block_parallel(
         i = j;
     }
     Ok(())
+}
+
+/// T12 pre-pass: verify confidential proofs across all cores **before**
+/// application, producing [`ProofPass`] evidence the apply arms can reuse.
+///
+/// Eligibility:
+/// * `AnonTransfer` — the ring proof is a pure function of the transfer, so
+///   every one is eligible regardless of position.
+/// * `SolventTransfer` / `Unshield` — the proof binds to the sender's balance
+///   ciphertext *at its block position*. It is pre-verified against the
+///   block-START balance, which equals the positional one iff no earlier
+///   transaction writes the sender — predicted here with the same superset
+///   write-sets the commitment uses. The prediction is a pure heuristic: the
+///   apply arm re-verifies unless the live ciphertext is bit-identical to the
+///   one recorded here, so a wrong guess costs time, never soundness.
+///
+/// A proof that FAILS pre-verification simply yields no evidence — the apply
+/// arm re-verifies at the true position and reports the exact sequential
+/// error, keeping the block verdict bit-identical.
+fn preverify_confidential(
+    ledger: &Ledger,
+    txs: &[Transaction],
+) -> HashMap<usize, ProofPass> {
+    // Collect the verification jobs and each one's bound balance.
+    #[allow(clippy::large_enum_variant)] // a 64-byte ciphertext; one per job
+    enum Job<'a> {
+        Anon(&'a Transaction),
+        Solvent(&'a Transaction, crate::Ciphertext),
+    }
+    let mut written: HashSet<[u8; 32]> = HashSet::new();
+    let mut jobs: Vec<(usize, Job)> = Vec::new();
+    for (i, tx) in txs.iter().enumerate() {
+        match tx {
+            Transaction::AnonTransfer { .. } => jobs.push((i, Job::Anon(tx))),
+            Transaction::SolventTransfer { token, xfer } => {
+                let sender = xfer.sender.to_bytes();
+                if !written.contains(&sender) {
+                    if let Some(bal) = ledger.balance(&sender, *token) {
+                        jobs.push((i, Job::Solvent(tx, bal)));
+                    }
+                }
+            }
+            Transaction::Unshield { token, xfer, .. } => {
+                let sender = xfer.sender.to_bytes();
+                if !written.contains(&sender) {
+                    if let Some(bal) = ledger.balance(&sender, *token) {
+                        jobs.push((i, Job::Solvent(tx, bal)));
+                    }
+                }
+            }
+            _ => {}
+        }
+        for key in ledger.dirty_keys_for(tx) {
+            if let crate::DirtyKey::Account(id) = key {
+                written.insert(id);
+            }
+        }
+    }
+    if jobs.len() < 2 {
+        return HashMap::new(); // one proof gains nothing from a pre-pass
+    }
+
+    let workers = thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(jobs.len());
+    let chunk_len = jobs.len().div_ceil(workers);
+    let verified: Vec<Vec<(usize, ProofPass)>> = thread::scope(|s| {
+        let handles: Vec<_> = jobs
+            .chunks(chunk_len)
+            .map(|chunk| {
+                s.spawn(move || {
+                    let mut out = Vec::new();
+                    for (i, job) in chunk {
+                        match job {
+                            Job::Anon(tx) => {
+                                if let Transaction::AnonTransfer { xfer, .. } = tx {
+                                    if xfer.verify() {
+                                        out.push((*i, ProofPass::Anon));
+                                    }
+                                }
+                            }
+                            Job::Solvent(tx, bal) => {
+                                let ok = match tx {
+                                    Transaction::SolventTransfer { xfer, .. } => xfer.verify(bal),
+                                    Transaction::Unshield { xfer, .. } => xfer.verify(bal),
+                                    _ => false,
+                                };
+                                if ok {
+                                    out.push((*i, ProofPass::AgainstBalance(*bal)));
+                                }
+                            }
+                        }
+                    }
+                    out
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("preverify worker panicked")).collect()
+    });
+    verified.into_iter().flatten().collect()
 }
 
 /// Schedule a run of parallel-lane transactions into conflict-free waves and
@@ -368,6 +473,117 @@ mod tests {
         }
         apply_block_parallel(&mut par2, &txs, 1).unwrap();
         assert_eq!(par2.state_root(), seq2.state_root());
+    }
+
+    #[test]
+    fn confidential_preverify_matches_sequential_on_a_mixed_block() {
+        let mut rng = OsRng;
+        // Confidentially-funded ring accounts + public funds for the same ids.
+        let (mut l, csks, cids) = crate::tests::ledger_with_ring(8, 100_000, &mut rng);
+        for id in &cids {
+            l.credit_public(id, LAT_TOKEN, 10_000);
+        }
+        l.state_root();
+        l.flush();
+        let height = 45; // fixes the anon epoch
+
+        // Solvent transfers from three DIFFERENT senders (all eligible for the
+        // pre-pass), one anon transfer (always eligible), and a second solvent
+        // from a sender whose balance an earlier tx changed (ineligible →
+        // serial re-verify fallback), plus transparent noise around them.
+        let bal0 = l.balance(&cids[0], LAT_TOKEN).unwrap();
+        let s0 = Transaction::SolventTransfer {
+            token: LAT_TOKEN,
+            xfer: lat_crypto::SolventTransfer::create(
+                &csks[0], &csks[1].public_key(), 5_000, 100, 100_000, &bal0, 0, &mut rng,
+            )
+            .unwrap(),
+        };
+        let bal2 = l.balance(&cids[2], LAT_TOKEN).unwrap();
+        let s2 = Transaction::SolventTransfer {
+            token: LAT_TOKEN,
+            xfer: lat_crypto::SolventTransfer::create(
+                &csks[2], &csks[3].public_key(), 700, 100, 100_000, &bal2, 0, &mut rng,
+            )
+            .unwrap(),
+        };
+        // The anon transfer's ring covers ALL the accounts, so it must bind to
+        // the balances AFTER s0/s2 (its block position). Same for s6 below —
+        // the anon debit touches cids[6] too. Build both against a scratch
+        // clone that replays the block prefix.
+        let mut scratch = l.clone();
+        scratch.apply_at(&s0, height).unwrap();
+        scratch.apply_at(&s2, height).unwrap();
+        let anon = crate::tests::anon_tx(
+            &scratch, &csks, &cids, 4, 100_000, &csks[5].public_key(), 2_000, 1_000, height,
+            &mut rng,
+        );
+        scratch.apply_at(&anon, height).unwrap();
+        let bal6 = scratch.balance(&cids[6], LAT_TOKEN).unwrap();
+        let s6 = Transaction::SolventTransfer {
+            token: LAT_TOKEN,
+            xfer: lat_crypto::SolventTransfer::create(
+                &csks[6], &csks[7].public_key(), 300, 100, 100_000, &bal6, 0, &mut rng,
+            )
+            .unwrap(),
+        };
+
+        // Transparent noise after the confidential txs. The spend nonce is
+        // shared across tx kinds: s0/s2/s6 bumped cids[0]/[2]/[6] to 1; the
+        // anon transfer bumps nobody (naming the spender would defeat it).
+        let mut txs = vec![s0, s2, anon, s6];
+        for (i, nonce) in [(0usize, 1u64), (1, 0), (2, 1), (3, 0)] {
+            txs.push(transfer(&csks, &cids, i, 7 - i, 50, nonce));
+        }
+
+        let mut seq = l.clone();
+        let mut par = l;
+        for tx in &txs {
+            seq.apply_at(tx, height).unwrap();
+        }
+        apply_block_parallel(&mut par, &txs, height).unwrap();
+        assert_eq!(par.state_root(), seq.state_root(), "mixed confidential block diverged");
+    }
+
+    #[test]
+    fn tampered_confidential_proof_rejected_with_and_without_prepass() {
+        let mut rng = OsRng;
+        let (l, csks, cids) = crate::tests::ledger_with_ring(4, 50_000, &mut rng);
+        let mut seq = l.clone();
+        let mut par = l.clone();
+
+        // A proof built against a FABRICATED balance: pre-verification fails
+        // (no evidence), apply re-verifies serially and rejects — both modes.
+        let fake = lat_crypto::Ciphertext::mint(999_999);
+        let bad = Transaction::SolventTransfer {
+            token: LAT_TOKEN,
+            xfer: lat_crypto::SolventTransfer::create(
+                &csks[0], &csks[1].public_key(), 60_000, 0, 999_999, &fake, 0, &mut rng,
+            )
+            .unwrap(),
+        };
+        let bal2 = l.balance(&cids[2], LAT_TOKEN).unwrap();
+        let good = Transaction::SolventTransfer {
+            token: LAT_TOKEN,
+            xfer: lat_crypto::SolventTransfer::create(
+                &csks[2], &csks[3].public_key(), 100, 0, 50_000, &bal2, 0, &mut rng,
+            )
+            .unwrap(),
+        };
+        let txs = vec![good, bad];
+
+        let seq_err = (|| -> Result<(), LedgerError> {
+            for tx in &txs {
+                seq.apply_at(tx, 1)?;
+            }
+            Ok(())
+        })();
+        assert_eq!(seq_err, Err(LedgerError::InvalidProof));
+        assert_eq!(
+            apply_block_parallel(&mut par, &txs, 1),
+            Err(LedgerError::InvalidProof),
+            "pre-pass must not launder a bad proof"
+        );
     }
 
     #[test]

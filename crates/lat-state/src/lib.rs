@@ -182,6 +182,26 @@ impl Default for Ledger {
     }
 }
 
+/// T12: evidence from the parallel pre-pass that a confidential transaction's
+/// **expensive** zero-knowledge verification already ran and passed. The apply
+/// path treats it as a *hint*, never an authority:
+///
+/// * [`ProofPass::Anon`] — `AnonTransfer::verify()` is a pure function of the
+///   transfer bytes (the proof binds to the transfer's *claimed* ring
+///   balances; the apply arm separately compares claimed vs. live balances),
+///   so a passing pre-verification is unconditionally reusable.
+/// * [`ProofPass::AgainstBalance`] — a `SolventTransfer`/`Unshield` proof was
+///   verified against exactly this sender balance ciphertext. The apply arm
+///   skips re-verification **only if the live balance it reads is
+///   bit-identical** to this one, so soundness never depends on the pre-pass
+///   having predicted write sets correctly — a wrong guess just costs the
+///   serial re-verify it would have cost anyway.
+#[allow(clippy::large_enum_variant)] // a 64-byte ciphertext; short-lived, few per block
+pub(crate) enum ProofPass {
+    Anon,
+    AgainstBalance(Ciphertext),
+}
+
 /// Verify a transparent transaction's Schnorr signature by the account key `id`
 /// over the transaction's signing bytes.
 fn check_sig(id: &[u8; 32], tx: &Transaction, sig: &[u8; 64]) -> Result<(), LedgerError> {
@@ -719,7 +739,20 @@ impl Ledger {
     /// entries it touched are flagged for re-commitment (the trie root updates
     /// lazily on the next [`state_root`](Self::state_root)).
     pub fn apply_at(&mut self, tx: &Transaction, height: u64) -> Result<(), LedgerError> {
-        let result = self.apply_inner(tx, height);
+        self.apply_at_with(tx, height, None)
+    }
+
+    /// Like [`apply_at`](Self::apply_at), with optional evidence from the T12
+    /// parallel pre-pass that this transaction's expensive zero-knowledge
+    /// verification already ran (see [`ProofPass`]). Every other check still
+    /// runs; the verdict is identical either way.
+    pub(crate) fn apply_at_with(
+        &mut self,
+        tx: &Transaction,
+        height: u64,
+        pre: Option<&ProofPass>,
+    ) -> Result<(), LedgerError> {
+        let result = self.apply_inner(tx, height, pre);
         if result.is_ok() {
             let keys = self.dirty_keys_for(tx);
             self.mark_all(keys);
@@ -727,7 +760,12 @@ impl Ledger {
         result
     }
 
-    fn apply_inner(&mut self, tx: &Transaction, height: u64) -> Result<(), LedgerError> {
+    fn apply_inner(
+        &mut self,
+        tx: &Transaction,
+        height: u64,
+        pre: Option<&ProofPass>,
+    ) -> Result<(), LedgerError> {
         match tx {
             Transaction::Register { pubkey, .. } => self.register(*pubkey),
 
@@ -771,8 +809,12 @@ impl Ledger {
                 if xfer.nonce != sender_nonce {
                     return Err(LedgerError::BadNonce);
                 }
-                // Solvency against the sender's current SPENDABLE balance.
-                if !xfer.verify(&sender_bal) {
+                // Solvency against the sender's current SPENDABLE balance. The
+                // T12 pre-pass may have verified this proof already — reusable
+                // only if it verified against this exact ciphertext.
+                let preverified =
+                    matches!(pre, Some(ProofPass::AgainstBalance(b)) if *b == sender_bal);
+                if !preverified && !xfer.verify(&sender_bal) {
                     return Err(LedgerError::InvalidProof);
                 }
                 if !self.is_registered(&receiver_id) {
@@ -962,8 +1004,11 @@ impl Ledger {
                     return Err(LedgerError::BadNonce);
                 }
                 // Solvency + conservation against the sender's real confidential
-                // balance (proves balance − amount − fee ≥ 0).
-                if !xfer.verify(&sender_bal) {
+                // balance (proves balance − amount − fee ≥ 0). Same T12 reuse
+                // rule as SolventTransfer: identical ciphertext or re-verify.
+                let preverified =
+                    matches!(pre, Some(ProofPass::AgainstBalance(b)) if *b == sender_bal);
+                if !preverified && !xfer.verify(&sender_bal) {
                     return Err(LedgerError::InvalidProof);
                 }
                 // Reveal: the hidden amount must equal the declared public amount.
@@ -1060,7 +1105,10 @@ impl Ledger {
                         return Err(LedgerError::StaleRingBalance);
                     }
                 }
-                if !xfer.verify() {
+                // The ring proof is a pure function of the transfer (it binds
+                // the CLAIMED balances checked just above), so a passing T12
+                // pre-verification is unconditionally reusable.
+                if !matches!(pre, Some(ProofPass::Anon)) && !xfer.verify() {
                     return Err(LedgerError::InvalidProof);
                 }
 
@@ -1566,7 +1614,8 @@ mod tests {
     }
 
     /// Ledger with `n` registered accounts each holding `amount` confidential LAT.
-    fn ledger_with_ring(
+    /// (`pub(crate)`: the parallel module's tests reuse it.)
+    pub(crate) fn ledger_with_ring(
         n: usize,
         amount: u64,
         rng: &mut OsRng,
@@ -1582,8 +1631,9 @@ mod tests {
     }
 
     /// Build an `AnonTransfer` tx from `sks[sender]` against the ledger's CURRENT
-    /// balances, for the epoch of `height`.
-    fn anon_tx(
+    /// balances, for the epoch of `height`. (`pub(crate)`: parallel tests reuse it.)
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn anon_tx(
         ledger: &Ledger,
         sks: &[SecretKey],
         ids: &[[u8; 32]],

@@ -2,7 +2,7 @@
 
 > Living document. Paste "continue from the latest checkpoint" in a new
 > conversation and work resumes from the **Current Task** below.
-> Last updated: 2026-07-06 (Checkpoint 10 — T8 parallel transparent execution; M2 begun).
+> Last updated: 2026-07-06 (Checkpoint 11 — T12 parallel confidential verification).
 
 ## 0. Mission
 
@@ -236,8 +236,24 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
 - [ ] T9 Per-tx access lists / state-dependency hints.  ← T8
 - [ ] T10 Parallel + batched signature verification.  ← T8
 - [ ] T11 VM optimization (dispatch, gas metering, memory model).  ← T8
-- [ ] T12 Privacy lane: parallelizable confidential/anon verification + proof
-  batching (keeps the 23ms path off the hot transparent path).  ← T8
+- [x] **T12 Parallel confidential-proof verification.** A pre-pass in
+  `apply_block_parallel` verifies confidential zero-knowledge proofs across
+  all cores *before* application, and the apply arms reuse the evidence
+  (`ProofPass`, crate-internal) instead of re-running the expensive math.
+  Soundness is structural, never scheduling-dependent: an `AnonTransfer` ring
+  proof is a **pure function of the transfer** (it binds the *claimed* ring
+  balances; apply still compares claimed vs live), so its evidence is
+  unconditionally reusable; a `SolventTransfer`/`Unshield` proof is
+  pre-verified against the block-START sender balance and the apply arm skips
+  re-verification **only if the live ciphertext is bit-identical** — write-set
+  prediction is a pure perf heuristic, a wrong guess costs a serial re-verify,
+  never correctness. Failed pre-verifications yield no evidence (apply
+  re-verifies and reports the exact sequential error). Every other check
+  (nonce, epoch, nullifier, ring binding, registration) still runs in the
+  serial barrier. **Measured: 32 solvent transfers 161→49 ms (3.3× on 8
+  logical cores)**; mixed transparent+confidential oracle test incl. the
+  ineligible-fallback path; `lat-attack` red-team green (same checks, just
+  scheduled earlier).  ← T8
 
 ### M3 — Consensus & finality (BFT-PoS)
 - [ ] T13 Validator set + staking module.  ← T3
@@ -366,26 +382,25 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
 
 ## 9. Current Task
 
-**T12 — Parallel + batched confidential verification** (pulled ahead of T9/T10:
-T8's static-access design makes per-tx access hints (T9) unnecessary for the
-transparent lane, and transparent signature verification already parallelizes
-inside T8's waves (much of T10). The 23 ms confidential proof is now the
-dominant serial cost per block). Goal: verify a block's confidential
-transactions' zero-knowledge proofs (SolventTransfer / Unshield / AnonTransfer)
-**in parallel across cores before/alongside state application**, so a block of
-mixed traffic no longer serializes on proofs. Sketch: (1) split `apply_at`'s
-confidential arms into a pure *verify* half (no state writes; needs the
-sender/ring balance ciphertexts it binds to) and an *apply* half; (2) in
-`apply_block_parallel`, pre-read each confidential tx's bound balances at its
-sequential position — they're only stable if no earlier tx touches those
-accounts, so start with the common fast case: verify in parallel when the
-bound accounts are untouched by earlier txs in the block, else fall back to
-in-place serial verify; (3) keep the barrier semantics for state application.
-Bench: mixed transparent+confidential block in `bench.rs`/`parallel_bench`.
-Alternative next: T13 validator set + staking (start the consensus milestone).
+**T13 — Validator set + staking module** (M3 begins; T12 done. Remaining M2
+tasks are deliberately deferred: T9 access lists are unnecessary for the
+transparent lane after T8's static-set design and only matter once contracts
+need parallelism (fold into T11); T10 batched signature verification and T11
+VM optimization are incremental wins, while consensus is the last big
+STRUCTURAL change — do structure before polish). Goal (D2): the on-chain
+machinery BFT-PoS finality needs before any engine work — a staking module in
+state: validator registration (bond LAT from the public balance), stake
+amounts, unbonding with a delay window, and a deterministic
+`validator_set(epoch)` (top-N by stake, ties by id) derived from committed
+state so every node computes the identical set. New tx kinds (Stake/Unstake)
+ride the existing transparent lane; the set is committed into the state trie
+(new DirtyKey/record kind) so headers can bind it. PoW stays the block
+producer for now — T14 swaps finality; design the module so T14 only *reads*
+it. Watch: premine/testnet params in latebrad give the genesis wallet all
+stake — LAUNCH.md's mainnet-must-change table needs a validator-genesis row.
 
-Note: `lat-attack` red-team must stay green — the privacy lane's verification
-must be byte-for-byte the same checks, just scheduled differently.
+Alternative order: T10/T11 (execution polish) if consensus design needs more
+soak time.
 
 ### Build/verify commands
 - Tests: `cargo test -p lat-store` (+ per-crate as tasks land).
