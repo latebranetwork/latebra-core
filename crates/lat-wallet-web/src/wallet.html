@@ -4,21 +4,28 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Latebra Wallet</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><defs><mask id='latm'><rect width='512' height='512' fill='%23000'/><rect x='108' y='104' width='230' height='304' rx='52' fill='%23fff'/><path fill='%23000' d='M192 180H362V292a24 24 0 0 1-24 24H216a24 24 0 0 1-24-24Z'/><rect x='192' y='104' width='34' height='80' fill='%23000'/></mask></defs><g mask='url(%23latm)'><rect width='512' height='512' fill='%23F5A03C'/></g><g fill='%23F5A03C'><rect x='410' y='150' width='30' height='30' rx='5'/><rect x='360' y='182' width='24' height='24' rx='4'/><rect x='404' y='216' width='22' height='22' rx='4'/><rect x='356' y='238' width='18' height='18' rx='3'/><rect x='392' y='262' width='30' height='30' rx='5'/><rect x='352' y='298' width='16' height='16' rx='3'/><rect x='404' y='300' width='14' height='14' rx='3'/><rect x='368' y='330' width='18' height='18' rx='3'/></g></svg>">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><defs><mask id='latm'><rect width='512' height='512' fill='%23000'/><rect x='108' y='104' width='230' height='304' rx='52' fill='%23fff'/><path fill='%23000' d='M192 180H362V292a24 24 0 0 1-24 24H216a24 24 0 0 1-24-24Z'/><rect x='192' y='104' width='34' height='80' fill='%23000'/></mask></defs><g mask='url(%23latm)'><rect width='512' height='512' fill='%23FFB43C'/></g><g fill='%23FFB43C'><rect x='410' y='150' width='30' height='30' rx='5'/><rect x='360' y='182' width='24' height='24' rx='4'/><rect x='404' y='216' width='22' height='22' rx='4'/><rect x='356' y='238' width='18' height='18' rx='3'/><rect x='392' y='262' width='30' height='30' rx='5'/><rect x='352' y='298' width='16' height='16' rx='3'/><rect x='404' y='300' width='14' height='14' rx='3'/><rect x='368' y='330' width='18' height='18' rx='3'/></g></svg>">
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+/* Latscan design language: near-black canvas, Space Grotesk display +
+   JetBrains Mono for all numbers/addresses, one amber accent,
+   violet = private, blue = public. Matches lat-explorer + launchpad. */
 :root{
-  --bg:#131316; --surface:#1c1c22; --surface2:#26262e; --surface3:#2f2f38;
-  --purple:#F5A03C; --purple-d:#e07c25; --grad1:#ffb661; --grad2:#e07c25;
-  --ink:#ffffff; --muted:#9a9aa6; --faint:#6c6c78;
-  --green:#2fd47f; --red:#f0616d; --line:rgba(255,255,255,.07);
+  --bg:#08080a; --surface:#0f0f12; --surface2:#151519; --surface3:#1c1c22;
+  --purple:#FFB43C; --purple-d:#e69a28; --grad1:#ffc25e; --grad2:#e69a28;
+  --ink:#fafafc; --muted:#6f6f7b; --faint:#4c4c56;
+  --green:#35d07f; --red:#ff5d6c; --line:rgba(255,255,255,.08); --line2:rgba(255,255,255,.15);
+  --bl:#4c9bf5; --vi:#b98cf6;
 }
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{height:100%}
 body{margin:0;background:
-  radial-gradient(1200px 600px at 50% -10%, #2c2114 0%, rgba(44,33,20,0) 60%),
+  radial-gradient(900px 420px at 50% -12%, #171019 0%, rgba(5,5,6,0) 62%),
   var(--bg);
-  color:var(--ink);font:15px/1.5 'Inter',system-ui,-apple-system,Segoe UI,sans-serif;
+  color:var(--ink);font:15px/1.5 'Space Grotesk',system-ui,-apple-system,Segoe UI,sans-serif;
+  -webkit-font-smoothing:antialiased;
   display:flex;justify-content:center;min-height:100%}
+.mono{font-family:'JetBrains Mono',ui-monospace,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
 .phone{width:100%;max-width:430px;min-height:100vh;background:var(--bg);
   position:relative;display:flex;flex-direction:column;
   box-shadow:0 0 0 1px var(--line), 0 30px 80px rgba(0,0,0,.5)}
@@ -39,8 +46,9 @@ body{margin:0;background:
 
 /* hero */
 .hero{text-align:center;padding:26px 18px 10px}
-.hero .amt{font-size:44px;font-weight:700;letter-spacing:-1px;line-height:1.1}
-.hero .amt small{font-size:22px;font-weight:600;color:var(--muted);margin-left:6px}
+.hero .amt{font-size:42px;font-weight:600;letter-spacing:-1px;line-height:1.1;
+  font-family:'JetBrains Mono',ui-monospace,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
+.hero .amt small{font-size:20px;font-weight:500;color:var(--muted);margin-left:6px;font-family:'Space Grotesk',system-ui,sans-serif}
 .hero .chg{display:inline-flex;align-items:center;gap:6px;margin-top:10px;font-size:14px;font-weight:600;
   color:var(--green);background:rgba(47,212,127,.12);padding:4px 11px;border-radius:999px}
 .hero .chg.flat{color:var(--muted);background:var(--surface2)}
@@ -48,13 +56,13 @@ body{margin:0;background:
 /* action row */
 .actions{display:flex;justify-content:center;gap:22px;padding:20px 10px 22px}
 .act{display:flex;flex-direction:column;align-items:center;gap:8px;background:none;border:0;cursor:pointer;color:var(--ink);font:inherit}
-.act .circ{width:56px;height:56px;border-radius:50%;background:rgba(245,160,60,.13);
+.act .circ{width:56px;height:56px;border-radius:50%;background:rgba(255,180,60,.13);
   display:flex;align-items:center;justify-content:center;transition:.15s}
-.act:hover .circ{background:rgba(245,160,60,.22)}
+.act:hover .circ{background:rgba(255,180,60,.22)}
 .act .circ svg{width:23px;height:23px;color:var(--purple)}
 .act span{font-size:12.5px;font-weight:600;color:var(--muted)}
 .act[disabled]{opacity:.4;cursor:default}
-.act[disabled]:hover .circ{background:rgba(245,160,60,.13)}
+.act[disabled]:hover .circ{background:rgba(255,180,60,.13)}
 
 /* cards / token list */
 .pad{padding:0 14px}
@@ -63,26 +71,27 @@ body{margin:0;background:
 .tok:last-child{border-bottom:0}
 .tok:hover{background:var(--surface2)}
 .tok .logo{width:42px;height:42px;border-radius:50%;flex:0 0 auto;display:flex;align-items:center;justify-content:center;
-  background:linear-gradient(135deg,#2e2519,#1c160e);position:relative}
-.tok .logo b{font-size:16px;font-weight:800;background:linear-gradient(135deg,var(--grad1),var(--grad2));-webkit-background-clip:text;background-clip:text;color:transparent}
-.tok .logo.pub{background:linear-gradient(135deg,#20303a,#16212a)}
-.tok .logo.pub b{background:linear-gradient(135deg,#7fe0ff,#3aa0d6);-webkit-background-clip:text;background-clip:text}
+  background:rgba(185,140,246,.10);border:1px solid rgba(185,140,246,.25);position:relative}
+.tok .logo b{font-size:16px;font-weight:700;color:var(--vi)}
+.tok .logo.pub{background:rgba(76,155,245,.10);border-color:rgba(76,155,245,.25)}
+.tok .logo.pub b{color:var(--bl)}
 .tok .meta{flex:1;min-width:0}
 .tok .meta .n{font-weight:600}
 .tok .meta .s{font-size:12.5px;color:var(--muted);margin-top:1px}
 .tok .val{text-align:right}
-.tok .val .b{font-weight:600}
+.tok .val .b{font-weight:600;font-family:'JetBrains Mono',ui-monospace,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
 .tok .val .f{font-size:12.5px;color:var(--muted);margin-top:1px}
-.tag{display:inline-block;font-size:10.5px;font-weight:700;letter-spacing:.03em;padding:2px 7px;border-radius:6px;vertical-align:middle}
-.tag.priv{color:var(--purple);background:rgba(245,160,60,.14)}
-.tag.pubt{color:#7fe0ff;background:rgba(127,224,255,.12)}
+.tag{display:inline-block;font-size:10.5px;font-weight:600;letter-spacing:.06em;padding:2px 7px;border-radius:5px;vertical-align:middle;
+  font-family:'JetBrains Mono',ui-monospace,monospace}
+.tag.priv{color:var(--vi);background:rgba(185,140,246,.12);border:1px solid rgba(185,140,246,.25)}
+.tag.pubt{color:var(--bl);background:rgba(76,155,245,.12);border:1px solid rgba(76,155,245,.25)}
 
 .section-t{color:var(--faint);font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin:20px 6px 9px}
 
 /* pending / activate banners */
-.banner{display:flex;align-items:center;gap:12px;background:linear-gradient(135deg,rgba(245,160,60,.16),rgba(224,126,42,.10));
-  border:1px solid rgba(245,160,60,.28);border-radius:16px;padding:14px 15px;margin:14px}
-.banner .bi{width:40px;height:40px;border-radius:50%;background:rgba(245,160,60,.2);display:flex;align-items:center;justify-content:center;flex:0 0 auto}
+.banner{display:flex;align-items:center;gap:12px;background:linear-gradient(135deg,rgba(255,180,60,.16),rgba(230,154,40,.10));
+  border:1px solid rgba(255,180,60,.28);border-radius:16px;padding:14px 15px;margin:14px}
+.banner .bi{width:40px;height:40px;border-radius:50%;background:rgba(255,180,60,.2);display:flex;align-items:center;justify-content:center;flex:0 0 auto}
 .banner .bi svg{width:19px;height:19px;color:var(--purple)}
 .banner .bt{flex:1}.banner .bt .t{font-weight:600;font-size:14px}.banner .bt .d{color:var(--muted);font-size:12.5px}
 .banner button{width:auto;padding:9px 16px;font-size:13.5px;flex:0 0 auto}
@@ -98,26 +107,33 @@ body{margin:0;background:
 /* buttons + inputs (shared) */
 button{font:inherit;font-weight:600;border-radius:13px;border:0;background:var(--surface2);color:var(--ink);padding:14px 16px;cursor:pointer;width:100%}
 button:hover{background:var(--surface3)}
-button.primary{background:var(--purple);color:#2a1a05}button.primary:hover{background:var(--purple-d)}
+button.primary{background:var(--purple);color:#1a1206}button.primary:hover{background:var(--purple-d)}
 button.ghost{background:transparent;border:1px solid var(--line)}button.ghost:hover{background:var(--surface2)}
 button.danger{background:transparent;border:1px solid rgba(240,97,109,.4);color:var(--red)}button.danger:hover{background:rgba(240,97,109,.1)}
 .row{display:flex;gap:11px}.row button{width:auto;flex:1}
 label{display:block;font-size:12px;font-weight:600;letter-spacing:.03em;color:var(--muted);margin:0 0 7px}
 input{width:100%;border:1px solid var(--line);border-radius:13px;padding:14px;font:inherit;outline:none;margin-bottom:15px;
-  background:var(--surface2);color:var(--ink)}
-input::placeholder{color:var(--faint)}
+  background:var(--surface2);color:var(--ink);
+  font-family:'JetBrains Mono',ui-monospace,Menlo,Consolas,monospace;font-size:13.5px;font-variant-numeric:tabular-nums}
+input::placeholder{color:var(--faint);font-family:'Space Grotesk',system-ui,sans-serif;font-size:14px}
 input:focus{border-color:var(--purple);background:var(--surface3)}
+
+/* staggered reveal on wallet mount */
+.rise{opacity:0;transform:translateY(12px);animation:rise .55s cubic-bezier(.2,.9,.25,1) forwards}
+.r1{animation-delay:.02s}.r2{animation-delay:.09s}.r3{animation-delay:.16s}.r4{animation-delay:.23s}.r5{animation-delay:.3s}
+@keyframes rise{to{opacity:1;transform:none}}
+@media(prefers-reduced-motion:reduce){.rise{animation:none;opacity:1;transform:none}}
 
 /* onboarding */
 .onb{flex:1;display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;padding:34px 26px}
 .ghost-logo{width:96px;height:96px;border-radius:28px;background:linear-gradient(150deg,var(--grad1),var(--grad2));
-  display:flex;align-items:center;justify-content:center;margin-bottom:26px;box-shadow:0 18px 50px rgba(224,126,42,.45)}
+  display:flex;align-items:center;justify-content:center;margin-bottom:26px;box-shadow:0 18px 50px rgba(230,154,40,.45)}
 .ghost-logo svg{width:56px;height:56px;color:#fff}
 .onb h1{font-size:26px;margin:0 0 8px;font-weight:700}
 .onb p{color:var(--muted);margin:0 0 30px;max-width:300px}
 .onb .full{width:100%;max-width:320px}
 .onb .full button{margin-bottom:12px}
-.seedbox{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;color:#dcdce6;word-break:break-all;
+.seedbox{font-family:'JetBrains Mono',ui-monospace,Menlo,Consolas,monospace;font-size:13px;color:#dcdce6;word-break:break-all;
   background:var(--surface2);border:1px solid var(--line);border-radius:14px;padding:15px;text-align:left;line-height:1.7}
 .warn{display:flex;gap:11px;text-align:left;background:rgba(240,97,109,.08);border:1px solid rgba(240,97,109,.28);
   color:#f4a3a9;border-radius:14px;padding:13px 14px;font-size:13px;margin-bottom:18px}
@@ -134,7 +150,7 @@ input:focus{border-color:var(--purple);background:var(--surface3)}
 .sheet h3{margin:0 0 4px;font-size:19px}
 .sheet .sub{color:var(--muted);font-size:13.5px;margin:0 0 18px}
 .qr{width:170px;height:170px;margin:6px auto 16px;border-radius:16px;background:#fff;display:flex;align-items:center;justify-content:center;padding:12px}
-.addrbox{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;color:#dcdce6;word-break:break-all;
+.addrbox{font-family:'JetBrains Mono',ui-monospace,Menlo,Consolas,monospace;font-size:13px;color:#dcdce6;word-break:break-all;
   background:var(--surface2);border:1px solid var(--line);border-radius:14px;padding:14px;text-align:center;margin-bottom:14px}
 .set-row{display:flex;align-items:center;gap:13px;padding:15px 4px;border-bottom:1px solid var(--line);cursor:pointer}
 .set-row:last-child{border-bottom:0}
@@ -146,11 +162,12 @@ input:focus{border-color:var(--purple);background:var(--surface3)}
 .pillnode input{margin:0;flex:1;padding:11px 13px;font-size:13px}
 .pillnode button{width:auto;padding:11px 15px}
 
-/* segmented toggle (send source / move direction) */
-.seg{display:flex;background:var(--surface2);border-radius:13px;padding:4px;margin:0 0 14px;gap:4px}
-.seg button{flex:1;padding:10px 6px;border-radius:10px;background:transparent;font-size:13px;color:var(--muted)}
+/* segmented toggle (send source / move direction) — springy select */
+.seg{display:flex;background:var(--surface2);border:1px solid var(--line);border-radius:13px;padding:4px;margin:0 0 14px;gap:4px}
+.seg button{flex:1;padding:10px 6px;border-radius:10px;background:transparent;font-size:13px;color:var(--muted);
+  transition:background .18s,color .18s,transform .3s cubic-bezier(.34,1.56,.64,1)}
 .seg button:hover{background:var(--surface3)}
-.seg button.on,.seg button.on:hover{background:var(--purple);color:#2a1a05}
+.seg button.on,.seg button.on:hover{background:var(--purple);color:#1a1206;transform:scale(1.03)}
 .hint{font-size:12.5px;color:var(--muted);background:var(--surface2);border:1px solid var(--line);
   border-radius:12px;padding:11px 13px;margin:0 0 15px;line-height:1.55}
 .hint b{color:var(--ink)}
@@ -163,12 +180,12 @@ input:focus{border-color:var(--purple);background:var(--surface3)}
 .toast.err{background:#3a2226;border-color:rgba(240,97,109,.4)}
 
 /* welcome + splash logo */
-.welcome-mark{width:104px;height:104px;margin-bottom:24px;filter:drop-shadow(0 14px 34px rgba(245,160,60,.4))}
+.welcome-mark{width:104px;height:104px;margin-bottom:24px;filter:drop-shadow(0 14px 34px rgba(255,180,60,.4))}
 .splash{position:fixed;inset:0;z-index:200;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:24px;
-  background:radial-gradient(1200px 600px at 50% -10%, #2c2114 0%, rgba(44,33,20,0) 60%), var(--bg);
+  background:radial-gradient(900px 420px at 50% -12%, #171019 0%, rgba(5,5,6,0) 62%), var(--bg);
   transition:opacity .55s ease}
 .splash.hide{opacity:0;pointer-events:none}
-.splash .mark{width:128px;height:128px;filter:drop-shadow(0 12px 34px rgba(245,160,60,.42));
+.splash .mark{width:128px;height:128px;filter:drop-shadow(0 12px 34px rgba(255,180,60,.42));
   animation:markin .8s cubic-bezier(.2,.9,.25,1) both}
 .splash .mark .px rect{transform-box:fill-box;transform-origin:center;opacity:0;transform:scale(0);
   animation:pxin .5s cubic-bezier(.2,.9,.25,1) forwards}
@@ -198,8 +215,8 @@ input:focus{border-color:var(--purple);background:var(--surface3)}
         <path fill="#000" d="M192 180H362V292a24 24 0 0 1-24 24H216a24 24 0 0 1-24-24Z"/>
         <rect x="192" y="104" width="34" height="80" fill="#000"/>
       </mask></defs>
-      <g mask="url(#latm)"><rect width="512" height="512" fill="#F5A03C"/></g>
-      <g class="px" fill="#F5A03C">
+      <g mask="url(#latm)"><rect width="512" height="512" fill="#FFB43C"/></g>
+      <g class="px" fill="#FFB43C">
         <rect x="410" y="150" width="30" height="30" rx="5"/>
         <rect x="360" y="182" width="24" height="24" rx="4"/>
         <rect x="404" y="216" width="22" height="22" rx="4"/>
@@ -227,7 +244,7 @@ let SEED=localStorage.getItem('lat_seed')||'';
 let ADDR=localStorage.getItem('lat_addr')||'';
 let LAST={registered:false,spendable:'0.00000',pending:'0.00000',public:'0.00000',total:'0.00000'};
 let poll=null;
-const LOGO="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><defs><mask id='latm2'><rect width='512' height='512' fill='%23000'/><rect x='108' y='104' width='230' height='304' rx='52' fill='%23fff'/><path fill='%23000' d='M192 180H362V292a24 24 0 0 1-24 24H216a24 24 0 0 1-24-24Z'/><rect x='192' y='104' width='34' height='80' fill='%23000'/></mask></defs><g mask='url(%23latm2)'><rect width='512' height='512' fill='%23F5A03C'/></g><g fill='%23F5A03C'><rect x='410' y='150' width='30' height='30' rx='5'/><rect x='360' y='182' width='24' height='24' rx='4'/><rect x='404' y='216' width='22' height='22' rx='4'/><rect x='356' y='238' width='18' height='18' rx='3'/><rect x='392' y='262' width='30' height='30' rx='5'/><rect x='352' y='298' width='16' height='16' rx='3'/><rect x='404' y='300' width='14' height='14' rx='3'/><rect x='368' y='330' width='18' height='18' rx='3'/></g></svg>";
+const LOGO="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><defs><mask id='latm2'><rect width='512' height='512' fill='%23000'/><rect x='108' y='104' width='230' height='304' rx='52' fill='%23fff'/><path fill='%23000' d='M192 180H362V292a24 24 0 0 1-24 24H216a24 24 0 0 1-24-24Z'/><rect x='192' y='104' width='34' height='80' fill='%23000'/></mask></defs><g mask='url(%23latm2)'><rect width='512' height='512' fill='%23FFB43C'/></g><g fill='%23FFB43C'><rect x='410' y='150' width='30' height='30' rx='5'/><rect x='360' y='182' width='24' height='24' rx='4'/><rect x='404' y='216' width='22' height='22' rx='4'/><rect x='356' y='238' width='18' height='18' rx='3'/><rect x='392' y='262' width='30' height='30' rx='5'/><rect x='352' y='298' width='16' height='16' rx='3'/><rect x='404' y='300' width='14' height='14' rx='3'/><rect x='368' y='330' width='18' height='18' rx='3'/></g></svg>";
 
 /* ---- icons ---- */
 const I={
@@ -311,7 +328,7 @@ async function createWallet(){
 function showWallet(){
   closeSheet();
   $('app').innerHTML=`
-    <div class="hdr">
+    <div class="hdr rise r1">
       <button class="iconbtn" onclick="openReceive()" title="Receive">${I.recv}</button>
       <button class="acct" onclick="openSettings()">
         <span class="avatar"></span><span>Account 1</span><span class="chev">${I.chev}</span>
@@ -319,12 +336,12 @@ function showWallet(){
       <button class="iconbtn" onclick="openSettings()" title="Settings">${I.gear}</button>
     </div>
 
-    <div class="hero">
+    <div class="hero rise r2">
       <div class="amt" id="hero">0.00<small>LAT</small></div>
       <div class="chg flat" id="chg">Testnet · Latebra</div>
     </div>
 
-    <div class="actions">
+    <div class="actions rise r3">
       <button class="act" onclick="openReceive()"><span class="circ">${I.recv}</span><span>Receive</span></button>
       <button class="act" onclick="openSend()"><span class="circ">${I.send}</span><span>Send</span></button>
       <button class="act" onclick="openMove()"><span class="circ">${I.swap}</span><span>Shield</span></button>
@@ -334,7 +351,7 @@ function showWallet(){
     <div id="regbar"></div>
     <div id="pendbar"></div>
 
-    <div class="pad">
+    <div class="pad rise r4">
       <div class="section-t">Tokens</div>
       <div class="list">
         <div class="tok" onclick="openMove('unshield')">
@@ -369,7 +386,7 @@ async function refresh(){
   LAST=r;
   const reg=$('regbar'),pend=$('pendbar');
   if(r.registered===false){
-    $('hero').innerHTML='0.00<small>LAT</small>';
+    HERO_VAL=0;$('hero').innerHTML='0.00<small>LAT</small>';
     if($('spend'))$('spend').textContent='0.00000';
     if($('pub'))$('pub').textContent='0.00000';
     if(reg)reg.innerHTML=`
@@ -383,7 +400,7 @@ async function refresh(){
     return;
   }
   if(reg)reg.innerHTML='';
-  if($('hero'))$('hero').innerHTML=fmtHero(r.total);
+  setHero(r.total);
   if($('spend'))$('spend').textContent=r.spendable;
   if($('pub'))$('pub').textContent=r.public;
   const p=parseFloat(r.pending||'0');
@@ -398,6 +415,19 @@ async function refresh(){
 function fmtHero(total){
   const [i,f]=String(total||'0.00000').split('.');
   return `${Number(i).toLocaleString()}.${(f||'00').slice(0,2)}<small>LAT</small>`;
+}
+/* Count the hero balance up/down to its new value instead of snapping. */
+let HERO_VAL=0;
+function setHero(total){
+  const el=$('hero');if(!el)return;
+  const to=parseFloat(total||'0')||0, from=HERO_VAL;HERO_VAL=to;
+  if(from===to || matchMedia('(prefers-reduced-motion:reduce)').matches){el.innerHTML=fmtHero(to.toFixed(5));return;}
+  const t0=performance.now(),dur=650;
+  (function step(now){
+    const p=Math.min(1,(now-t0)/dur), e=1-Math.pow(1-p,3);
+    el.innerHTML=fmtHero((from+(to-from)*e).toFixed(5));
+    if(p<1)requestAnimationFrame(step);
+  })(t0);
 }
 
 /* ================= actions ================= */
@@ -532,7 +562,7 @@ function qrSvg(addr){
       rects+=`<rect x="${rx}" y="${ry}" width="${cell}" height="${cell}" rx="3"/>`;
       if(x<Math.floor(n/2))rects+=`<rect x="${pad+(n-1-x)*cell}" y="${ry}" width="${cell}" height="${cell}" rx="3"/>`;}
   }
-  return `<svg viewBox="0 0 ${n*cell+pad*2} ${n*cell+pad*2}" width="146" height="146" fill="#e07c25">${rects}</svg>`;
+  return `<svg viewBox="0 0 ${n*cell+pad*2} ${n*cell+pad*2}" width="146" height="146" fill="#0f0f12">${rects}</svg>`;
 }
 
 if(SEED)showWallet();else showWelcome();
