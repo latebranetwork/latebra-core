@@ -175,7 +175,11 @@ fn main() {
     println!("  state       : {}", if cfg.archive { "archive (all roots kept)".to_string() } else { format!("pruned (last {PRUNE_WINDOW} roots kept)") });
     println!(
         "  boot        : {}",
-        if chain.booted_from_snapshot() { "snapshot + tail replay" } else { "full replay" }
+        match chain.boot_mode() {
+            lat_chain::BootMode::Records => "state records + tail replay",
+            lat_chain::BootMode::Snapshot => "snapshot file + tail replay",
+            lat_chain::BootMode::FullReplay => "full replay",
+        }
     );
     println!("  genesis addr: {}", genesis_wallet.address_string());
     println!("  height      : {}", chain.height());

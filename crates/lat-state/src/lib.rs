@@ -294,6 +294,123 @@ impl Ledger {
         self.store.flush();
     }
 
+    /// Boot a ledger from the object records a previous run committed into
+    /// `base` (T7) — the replay-free inverse of [`with_base`](Self::with_base)'s
+    /// wipe. Every record is decoded (and thereby validated: ciphertext points,
+    /// bounds, exact lengths) and marked dirty, and the commitment is rebuilt
+    /// from scratch, so the returned ledger's `state_root()` is **derived from
+    /// the records themselves**, never read from disk. The caller MUST compare
+    /// that root against a trusted commitment (a PoW-bound block header) before
+    /// adopting the ledger — this is exactly the snapshot-file trust model.
+    ///
+    /// The ticker-uniqueness index is rebuilt from the decoded tokens (it is
+    /// not part of the commitment, so it can't be trusted from disk).
+    ///
+    /// `None` if `base` holds no state or any record is malformed — every
+    /// failure has the same correct handling: fall back to replay.
+    pub fn from_records(base: Arc<dyn KVStore>) -> Option<Ledger> {
+        // No records at all = nothing to boot from. The meta record only exists
+        // once a token has been created (`put_token` writes it); its absence on
+        // a token-less state simply means the initial id. A *wrong* value can't
+        // slip through either way: the commitment covers `next_token_id`, so
+        // the caller's header-root check catches any mismatch.
+        if base.scan_prefix(Column::Objects, b"").is_empty() {
+            return None;
+        }
+        let next_token_id = match base.get(Column::Objects, &[REC_META]) {
+            Some(meta) => u32::from_le_bytes(meta.as_slice().try_into().ok()?),
+            None => 1,
+        };
+        let mut ledger = Ledger::with_store(OverlayStore::new(base));
+        ledger.next_token_id = next_token_id;
+
+        let mut dirty: Vec<DirtyKey> = vec![DirtyKey::Meta];
+        for (key, body) in ledger.store.scan_prefix(Column::Objects, &[REC_ACCOUNT]) {
+            let id: [u8; 32] = key.get(1..)?.try_into().ok()?;
+            decode_account(&body)?;
+            dirty.push(DirtyKey::Account(id));
+        }
+        let mut tickers = Vec::new();
+        for (key, body) in ledger.store.scan_prefix(Column::Objects, &[REC_TOKEN]) {
+            let t = decode_token(&body)?;
+            // The record key must be the token's own id, or reads by id would
+            // silently diverge from what the commitment covers.
+            if key.get(1..)? != t.id.to_be_bytes() {
+                return None;
+            }
+            tickers.push((t.ticker.clone(), t.id));
+            dirty.push(DirtyKey::Token(t.id));
+        }
+        for (key, body) in ledger.store.scan_prefix(Column::Objects, &[REC_CONTRACT]) {
+            let id: [u8; 32] = key.get(1..)?.try_into().ok()?;
+            decode_contract(&body)?;
+            dirty.push(DirtyKey::Contract(id));
+        }
+        for (key, _) in ledger.store.scan_prefix(Column::Objects, &[REC_NULLIFIER]) {
+            let nf: [u8; 32] = key.get(1..)?.try_into().ok()?;
+            dirty.push(DirtyKey::Nullifier(nf));
+        }
+        // Rebuild the ticker index from committed tokens (self-heals tampering).
+        for (ticker, id) in tickers {
+            ledger.store.put(
+                Column::Objects,
+                rec_key(REC_TICKER, ticker.as_bytes()),
+                id.to_be_bytes().to_vec(),
+            );
+        }
+        ledger.mark_all(dirty);
+        ledger.state_root(); // rebuild the commitment; caller verifies this root
+        Some(ledger)
+    }
+
+    /// Atomically move this ledger's committed state onto `base`, replacing
+    /// whatever state `base` held: one write batch deletes `base`'s old
+    /// `Objects` + `State` keys, writes this ledger's, and appends
+    /// `staged_meta` (e.g. the chain's boot anchor, so the anchor can never
+    /// disagree with the state it describes). Returns the same logical ledger
+    /// now living over `base`. Used to adopt a reorg-rebuilt (in-memory) state
+    /// onto the durable store without a wipe-then-replay crash window: `base`
+    /// flips from old state to new in a single atomic commit.
+    pub fn rehome(
+        self,
+        base: Arc<dyn KVStore>,
+        staged_meta: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Ledger {
+        self.state_root(); // reconcile pending trie updates
+        self.flush(); // fold everything into our own base so one scan sees it all
+        let mut batch = WriteBatch::new();
+        for (key, _) in base.scan_prefix(Column::Objects, b"") {
+            batch.delete(Column::Objects, key);
+        }
+        for (key, _) in base.scan_prefix(Column::State, b"") {
+            batch.delete(Column::State, key);
+        }
+        // Ordered batch, last-writer-wins: puts land after the deletes above.
+        for (key, value) in self.store.scan_prefix(Column::Objects, b"") {
+            batch.put(Column::Objects, key, value);
+        }
+        for (key, value) in self.store.scan_prefix(Column::State, b"") {
+            batch.put(Column::State, key, value);
+        }
+        for (key, value) in staged_meta {
+            batch.put(Column::Meta, key, value);
+        }
+        base.write(batch);
+
+        let mut fresh = Ledger::with_store(OverlayStore::new(base));
+        fresh.next_token_id = self.next_token_id;
+        // Carry the reconciled commitment (root current, dirty set empty).
+        *fresh.commitment.get_mut() = self.commitment.borrow().clone();
+        fresh
+    }
+
+    /// Stage a chain-metadata write into this ledger's overlay so it commits
+    /// atomically with the next [`flush`](Self::flush) — e.g. the boot anchor
+    /// riding the same durable batch as the state it describes.
+    pub fn stage_meta(&self, key: Vec<u8>, value: Vec<u8>) {
+        self.store.put(Column::Meta, key, value);
+    }
+
     /// Garbage-collect the commitment trie (T6): drop from the committed base
     /// every trie node unreachable from the current `state_root` or from one of
     /// `retain_roots` (a window of recent historical roots kept queryable for
@@ -1478,7 +1595,7 @@ mod tests {
 
         let tx = anon_tx(&ledger, &sks, &ids, 1, 100_000, &receiver.public_key(), 5_000, 1_000, height, &mut rng);
         let (nullifier, output) = match &tx {
-            Transaction::AnonTransfer { xfer, .. } => (xfer.nullifier(), xfer.output.clone()),
+            Transaction::AnonTransfer { xfer, .. } => (xfer.nullifier(), xfer.output),
             _ => unreachable!(),
         };
         ledger.apply_at(&tx, height).unwrap();
@@ -2323,6 +2440,101 @@ mod tests {
         assert!(matches!(proof.terminal, lat_store::Terminal::Leaf { .. }), "account leaf persisted");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn from_records_boots_the_exact_state_and_rejects_tampering() {
+        let mut rng = OsRng;
+        let mem = Arc::new(lat_store::MemStore::new());
+        let base: Arc<dyn lat_store::KVStore> = mem.clone();
+        let ids: Vec<[u8; 32]> =
+            (0..6).map(|_| SecretKey::random(&mut rng).public_key().to_bytes()).collect();
+
+        let root = {
+            let mut ledger = Ledger::with_base(Arc::clone(&base));
+            for id in &ids {
+                ledger.register(*id).unwrap();
+                ledger.credit_public(id, LAT_TOKEN, 777);
+                ledger.credit_genesis(id, 1_000).unwrap();
+            }
+            ledger
+                .apply(&signed(
+                    Transaction::CreateToken {
+                        ticker: "BOOT".into(),
+                        creator: ids[0],
+                        supply: 500,
+                        sig: [0u8; 64],
+                    },
+                    &SecretKey::random(&mut rng),
+                ))
+                .unwrap_err(); // wrong key — just proves apply path is live
+            ledger.insert_nullifier(&[5u8; 32]);
+            ledger.mark(DirtyKey::Nullifier([5u8; 32]));
+            let root = ledger.state_root();
+            ledger.flush();
+            root
+        };
+
+        // Boot from the records alone: identical root, identical reads.
+        let booted = Ledger::from_records(Arc::clone(&base)).expect("records boot");
+        assert_eq!(booted.state_root(), root);
+        assert_eq!(booted.public_balance(&ids[0], LAT_TOKEN), Some(777));
+        assert!(booted.nullifier_seen(&[5u8; 32]));
+        // …and it keeps working (this also proves the ticker index is usable).
+        let mut booted = booted;
+        booted.credit_public(&ids[1], LAT_TOKEN, 1);
+        assert_ne!(booted.state_root(), root);
+
+        // Tamper one account record: the boot either fails to decode or commits
+        // a different root — never silently reproduces `root`.
+        let (key, mut body) =
+            base.scan_prefix(Column::Objects, &[REC_ACCOUNT]).into_iter().next().unwrap();
+        let last = body.len() - 1;
+        body[last] ^= 0xff;
+        mem.put(Column::Objects, key, body);
+        match Ledger::from_records(Arc::clone(&base)) {
+            None => {}
+            Some(l) => assert_ne!(l.state_root(), root, "tampering must change the root"),
+        }
+
+        // A base with no meta record is not bootable state at all.
+        let empty: Arc<dyn lat_store::KVStore> = Arc::new(lat_store::MemStore::new());
+        assert!(Ledger::from_records(empty).is_none());
+    }
+
+    #[test]
+    fn rehome_atomically_replaces_the_base_state() {
+        let mut rng = OsRng;
+        let old_id = SecretKey::random(&mut rng).public_key().to_bytes();
+        let new_id = SecretKey::random(&mut rng).public_key().to_bytes();
+
+        // The durable base holds an OLD state (as after an abandoned branch).
+        let base: Arc<dyn lat_store::KVStore> = Arc::new(lat_store::MemStore::new());
+        {
+            let mut old = Ledger::with_base(Arc::clone(&base));
+            old.register(old_id).unwrap();
+            old.credit_public(&old_id, LAT_TOKEN, 111);
+            old.state_root();
+            old.flush();
+        }
+
+        // A NEW state built off-base (as a reorg rebuild is), re-homed onto it
+        // with a staged meta write riding the same batch.
+        let mut fresh = Ledger::new();
+        fresh.register(new_id).unwrap();
+        fresh.credit_public(&new_id, LAT_TOKEN, 222);
+        let root = fresh.state_root();
+        let rehomed =
+            fresh.rehome(Arc::clone(&base), vec![(b"anchor-test".to_vec(), vec![7u8])]);
+
+        assert_eq!(rehomed.state_root(), root, "the logical state survives the move");
+        assert_eq!(rehomed.public_balance(&new_id, LAT_TOKEN), Some(222));
+        assert!(!rehomed.is_registered(&old_id), "the old base state is gone");
+        assert_eq!(base.get(Column::Meta, b"anchor-test"), Some(vec![7u8]));
+        // And the base now boots the new state directly.
+        let booted = Ledger::from_records(base).expect("records boot after rehome");
+        assert_eq!(booted.state_root(), root);
+        assert!(!booted.is_registered(&old_id));
     }
 
     #[test]

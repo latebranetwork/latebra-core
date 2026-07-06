@@ -2,7 +2,7 @@
 
 > Living document. Paste "continue from the latest checkpoint" in a new
 > conversation and work resumes from the **Current Task** below.
-> Last updated: 2026-07-06 (Checkpoint 8 — T6 pruning + archive mode).
+> Last updated: 2026-07-06 (Checkpoint 9 — T7 durable state + records boot; M1 complete).
 
 ## 0. Mission
 
@@ -126,7 +126,7 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
 ### M0 — Program setup
 - [x] T0 Decisions, roadmap, checkpoint mechanism, baseline bench.
 
-### M1 — Storage foundation (current milestone)
+### M1 — Storage foundation (COMPLETE 2026-07-06)
 - [x] **T1 `lat-store`: KVStore abstraction + in-memory backend.** Pluggable
   key/value layer with column families + atomic write batches + ordered prefix
   scan. `MemStore` reference backend, 7 tests, clippy-clean. No perf regression
@@ -190,9 +190,29 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
   leaf at depth d shares its content-address with internal(leaf@d+1, empty), so
   two stores can hold different — equally valid — physical materializations of
   the same root; cross-store node counts are not comparable.  ← T3, T5
-- [ ] T7 Snapshot format + fast snapshot sync.  ← T3, T5
+- [x] **T7 Boot-from-records + durable live state** (the local half of snapshot
+  sync). Persistent chains now keep their ledger ON the chain DB: the active
+  state's overlay base is the same redb store as the blocks, every adopted
+  block's flush commits state changes durably, and a **boot anchor**
+  (`Meta:"state/anchor"` = height ‖ block id) rides the *same atomic batch* —
+  the records on disk always describe exactly the anchored block.
+  `Ledger::from_records(base)` boots replay-free: decodes + validates every
+  object record, rebuilds the commitment from scratch (root is derived, never
+  read from disk), rebuilds the ticker index; lat-chain then applies the same
+  placement + PoW-bound-header `state_root` verification and tail replay as the
+  snapshot-file boot. `Ledger::rehome(base, staged_meta)` adopts an off-base
+  state (reorg rebuild, snapshot/replay boot) onto the durable base in ONE
+  atomic batch (old state out, new in, anchor included) — no wipe-then-replay
+  crash window. Boot order: records → `.snap` file → full replay; every
+  corruption/tamper case falls back and re-homes clean state. `BootMode`
+  enum replaces the bool (`latebrad` prints it). Closes §8 “chain ledger base
+  is still in-memory”: node state RAM is now bounded by the account cache.
+  Verified live: latebrad kill → restart boots "state records + tail replay"
+  at the exact tip. **Deferred to T19 (needs T14 peers):** serving/fetching
+  state chunks over P2P with per-chunk SMT-proof verification — the local
+  anchor + records format is the manifest groundwork.  ← T3, T5
 
-### M2 — Execution performance
+### M2 — Execution performance (current milestone)
 - [ ] T8 Deterministic parallel scheduler (Block-STM style) over transparent
   state; conflict detection + deterministic replay.  ← T3
 - [ ] T9 Per-tx access lists / state-dependency hints.  ← T8
@@ -282,16 +302,29 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
   - `lat-chain::Blockchain`: `set_prune_window(w)` — sweep every `w` blocks
     retaining the last `w` block state-roots; unset = archive (default).
   - `latebrad`: `--archive` flag (default prunes with window 64).
+- T7 durable state / records boot:
+  - `lat-state::Ledger`: `from_records(Arc<dyn KVStore>) -> Option<Ledger>`
+    (validate + rebuild commitment from `Column::Objects`; caller MUST verify
+    the returned `state_root()` against a trusted header),
+    `rehome(self, base, staged_meta) -> Ledger` (atomically replace `base`'s
+    State+Objects with this ledger's, staged Meta writes in the same batch),
+    `stage_meta(key, value)` (Meta write folded into the next `flush`).
+  - `lat-chain`: `enum BootMode { Records, Snapshot, FullReplay }`,
+    `Blockchain::boot_mode()`; boot anchor at `Meta:"state/anchor"`
+    (`height u64 LE ‖ block id [32]`), written atomically with every adopted
+    flush/rehome. `booted_from_snapshot()` = `boot_mode() != FullReplay`.
+  - `lat-store::Smt` is `S: KVStore + ?Sized`.
 
 ## 8. Known limitations / follow-ups
 
-- **Chain ledger base is still in-memory.** The running chain builds its ledger
-  with `Ledger::new()` (in-memory `MemStore` base), so a node's *state* still sits
-  in RAM behind the store and is rebuilt by replay on boot. T5b makes disk-backed
-  state *possible* (`with_base` + `RedbStore`, tested) and cheap to clone, but
-  wiring the live chain onto a durable ledger base needs care (reorg builds a
-  fresh ledger; speculative clones share the base; `with_base` wipes on open) and
-  is coupled to booting-state-without-replay — that's **T7 (snapshot sync)**.
+- **RESOLVED by T7** (was: chain ledger base is still in-memory). Persistent
+  chains commit state to the chain DB per adopted block and boot from records.
+  Remaining T7 residue: an in-memory chain (`Blockchain::genesis`) still keeps
+  everything in RAM by design; a **reorg rebuild still replays from genesis
+  in memory first** (correct, but O(chain) RAM+time at reorg) — replace with a
+  bounded undo-window when reorg depth matters; the records boot rebuilds the
+  whole commitment (O(state log state) hashing at boot, ~the cost the snapshot
+  boot already paid to decode+rehash).
 - **Prune sweep is O(history), not incremental.** T6's mark-and-sweep scans the
   whole `Column::State` and marks from the retained roots on every sweep (~17 s
   at 10M stranded nodes, in-memory). Amortized over a 64-block window this is
@@ -308,23 +341,23 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
 
 ## 9. Current Task
 
-**T7 — Snapshot format + fast snapshot sync** (M1's last open task; T6 done).
-Goal: boot a node's *state* from the on-disk object records + trie without a
-from-genesis replay, and serve/verify state snapshots to syncing peers. This is
-also the gate for wiring the live chain ledger onto a durable `RedbStore` base
-(§8: reorg builds a fresh ledger, speculative clones share the base, `with_base`
-wipes Objects on open — all three interactions must be redesigned together).
-Sketch: (1) a versioned snapshot manifest = block id + state_root + object-record
-range digests; (2) `Ledger::from_records(base)` that trusts records only after
-recomputing the trie root against the header's `state_root`; (3) chunked
-transfer over P2P with per-chunk verification against the root (SMT proofs);
-(4) reorg = open a fresh base (directory/generation per adopted branch) instead
-of wipe-in-place. Depends on: T3, T5. T6's pruning keeps what a snapshot must
-carry small.
+**T8 — Deterministic parallel scheduler over transparent state** (M1 storage
+milestone COMPLETE: T1–T7 all done; the P2P half of state sync is deferred to
+T19 where it belongs, after T14 gives it peers). T8 is the biggest throughput
+lever: execute a block's transparent transactions optimistically in parallel
+(Block-STM style), detect read/write conflicts, and re-execute conflicting
+transactions so the result is **bit-identical to sequential order** — consensus
+must never see a difference. Sketch: (1) a versioned read/write-set recorder
+over the ledger's account reads; (2) worker pool executing txs speculatively
+against a snapshot + write buffer; (3) validation pass in tx order, aborting
+and re-running any tx whose reads were clobbered; (4) the confidential lane
+(~23 ms proofs) stays OFF this path — proofs batch-verify in parallel
+trivially (T12). Bench target: multi-core scaling on the transparent-transfer
+workload in `lat-attack`'s bench. Depends on: T3 (done).
 
-Alternative order:
-- Jump to **M2 parallel execution** (T8, biggest throughput lever) — the state
-  model is settled; T7 is about boot/sync ergonomics, not correctness.
+Watch out for: `RefCell` interior mutability in `Ledger` (commitment, cache)
+is not `Sync` — the parallel engine needs its own state view, not `&Ledger`
+sharing across threads.
 
 ### Build/verify commands
 - Tests: `cargo test -p lat-store` (+ per-crate as tasks land).

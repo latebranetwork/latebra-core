@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lat_state::{Ledger, LedgerError};
-use lat_store::RedbStore;
+use lat_store::{Column, KVStore, RedbStore};
 use lat_types::Transaction;
 
 use lat_crypto::Ciphertext;
@@ -463,13 +463,45 @@ pub struct Blockchain {
     store: Option<ChainStore>,
     /// Where ledger snapshots are written (persistent chains only).
     snapshot_path: Option<PathBuf>,
-    /// Whether this instance booted from a snapshot instead of a full replay
-    /// (observability: tests assert on it, the daemon prints it).
-    booted_from_snapshot: bool,
+    /// How this instance's state was booted (observability: tests assert on
+    /// it, the daemon prints it).
+    boot_mode: BootMode,
     /// T6 pruning: `Some(w)` sweeps unreachable trie nodes every `w` blocks,
     /// keeping the last `w` block state-roots queryable. `None` = archive mode
     /// (every historical root stays readable forever) — the default.
     prune_window: Option<u64>,
+    /// T7 durable state: the shared persistent store (the same redb DB that
+    /// holds the blocks) the active ledger commits into. `None` for in-memory
+    /// chains. When set, every adopted flush also commits the boot anchor, so
+    /// the next open can boot from records instead of replaying.
+    state_base: Option<Arc<dyn KVStore>>,
+}
+
+/// How a chain instance obtained its boot-time state (fastest first).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootMode {
+    /// From the object records + boot anchor in the chain DB (T7): the
+    /// commitment was rebuilt from the records, verified against the anchored
+    /// block's PoW-bound header, then only the tail was replayed.
+    Records,
+    /// From the sibling `.snap` ledger-snapshot file (L8), same verification.
+    Snapshot,
+    /// From genesis, re-validating every block (also the fresh-chain case).
+    FullReplay,
+}
+
+/// Meta key holding the boot anchor: `height (8 LE) ‖ block id (32)` — which
+/// block's state the durably-committed object records represent. Written
+/// atomically WITH the state (same flush batch / rehome batch), so it can
+/// never disagree with the records; verified against the anchored header's
+/// `state_root` on boot regardless.
+const STATE_ANCHOR: &[u8] = b"state/anchor";
+
+fn anchor_bytes(height: u64, block_id: &[u8; 32]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(40);
+    v.extend_from_slice(&height.to_le_bytes());
+    v.extend_from_slice(block_id);
+    v
 }
 
 impl Blockchain {
@@ -522,8 +554,9 @@ impl Blockchain {
             active_chain: vec![gid],
             store: None,
             snapshot_path: None,
-            booted_from_snapshot: false,
+            boot_mode: BootMode::FullReplay,
             prune_window: None,
+            state_base: None,
         }
     }
 
@@ -584,17 +617,25 @@ impl Blockchain {
         difficulty: u64,
     ) -> io::Result<Blockchain> {
         let path = path.as_ref();
-        // Blocks + tx index live in a redb database at `path`; the ledger
-        // snapshot is a sibling file (unchanged).
-        let kv = RedbStore::open(path)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("open block db: {e}")))?;
-        let block_store = ChainStore::new(Arc::new(kv));
+        // Blocks + tx index + (T7) the committed ledger state all live in one
+        // redb database at `path`; the ledger snapshot is a sibling file (a
+        // legacy fallback the records boot supersedes).
+        let kv: Arc<dyn KVStore> = Arc::new(RedbStore::open(path).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("open block db: {e}"))
+        })?);
+        let block_store = ChainStore::new(Arc::clone(&kv));
         let existing = block_store.blocks_in_order();
         let snap_path = snapshot::snapshot_path(path);
 
-        let fast = snapshot::read(&snap_path).and_then(|snap| {
-            Self::replay_from_snapshot(snap, &existing, premine, public_premine, difficulty)
-        });
+        // Boot the state, fastest sound path first: (1) the object records the
+        // last run committed (verified against the anchored header), (2) the
+        // snapshot file, (3) full replay. Every path ends in the same state.
+        let fast = Self::boot_from_records(&kv, &existing, premine, public_premine, difficulty)
+            .or_else(|| {
+                snapshot::read(&snap_path).and_then(|snap| {
+                    Self::replay_from_snapshot(snap, &existing, premine, public_premine, difficulty)
+                })
+            });
         let mut chain = match fast {
             Some(chain) => chain,
             None => {
@@ -614,11 +655,63 @@ impl Blockchain {
         chain.snapshot_path = Some(snap_path);
         // After a full replay of a non-trivial chain, snapshot the tip now so the
         // NEXT boot is fast even before the interval trigger fires again.
-        if !chain.booted_from_snapshot && chain.active_height > 0 {
+        if chain.boot_mode == BootMode::FullReplay && chain.active_height > 0 {
             chain.write_snapshot();
         }
         chain.store = Some(block_store);
+        chain.state_base = Some(Arc::clone(&kv));
+        if chain.boot_mode == BootMode::Records {
+            // The tail replay may have advanced past the anchored height: stage
+            // the tip anchor and commit it atomically with the tail's state.
+            chain.active_state.stage_meta(
+                STATE_ANCHOR.to_vec(),
+                anchor_bytes(chain.active_height, &chain.active_tip),
+            );
+            chain.active_state.flush();
+        } else {
+            // The state was built off-base (snapshot or replay): move it onto
+            // the durable base so the NEXT open boots from records.
+            chain.rehome_state();
+        }
         Ok(chain)
+    }
+
+    /// T7 records boot: read the boot anchor, rebuild the ledger commitment
+    /// from the object records in `kv`, and hand it to the same
+    /// placement + header-root verification and tail replay the snapshot boot
+    /// uses. `None` on any problem — missing anchor, malformed record, root
+    /// mismatch — and the caller falls back to the next boot path.
+    fn boot_from_records(
+        kv: &Arc<dyn KVStore>,
+        existing: &[Vec<u8>],
+        premine: &[([u8; 32], u64)],
+        public_premine: &[([u8; 32], u64)],
+        difficulty: u64,
+    ) -> Option<Blockchain> {
+        let anchor = kv.get(Column::Meta, STATE_ANCHOR)?;
+        if anchor.len() != 40 {
+            return None;
+        }
+        let height = u64::from_le_bytes(anchor[..8].try_into().ok()?);
+        let block_id: [u8; 32] = anchor[8..40].try_into().ok()?;
+        let ledger = Ledger::from_records(Arc::clone(kv))?;
+        let snap = snapshot::Snapshot { height, block_id, ledger };
+        let mut chain =
+            Self::replay_from_snapshot(snap, existing, premine, public_premine, difficulty)?;
+        chain.boot_mode = BootMode::Records;
+        Some(chain)
+    }
+
+    /// Move the active state onto the durable base (with the tip anchor in the
+    /// same atomic batch), replacing whatever state the base held. Called when
+    /// the active ledger lives off-base: after a snapshot/full-replay boot and
+    /// after a reorg (whose rebuild is in-memory). No-op for in-memory chains.
+    fn rehome_state(&mut self) {
+        let Some(base) = &self.state_base else { return };
+        let staged =
+            vec![(STATE_ANCHOR.to_vec(), anchor_bytes(self.active_height, &self.active_tip))];
+        let old = std::mem::take(&mut self.active_state);
+        self.active_state = old.rehome(Arc::clone(base), staged);
     }
 
     /// Fast boot (L8): rebuild the tree from `existing` without state, verify
@@ -662,7 +755,7 @@ impl Blockchain {
             apply_block_state(&mut state, &block).ok()?;
         }
         chain.active_state = state;
-        chain.booted_from_snapshot = true;
+        chain.boot_mode = BootMode::Snapshot;
         Some(chain)
     }
 
@@ -721,9 +814,15 @@ impl Blockchain {
         }
     }
 
-    /// Whether this instance booted from a snapshot (vs a full replay).
+    /// Whether this instance booted from a snapshot — the durable records (T7)
+    /// or the snapshot file (L8) — rather than a full replay.
     pub fn booted_from_snapshot(&self) -> bool {
-        self.booted_from_snapshot
+        self.boot_mode != BootMode::FullReplay
+    }
+
+    /// How this instance's boot-time state was obtained.
+    pub fn boot_mode(&self) -> BootMode {
+        self.boot_mode
     }
 
     /// The state root of the active ledger (what the next mined block commits).
@@ -951,6 +1050,14 @@ impl Blockchain {
             self.active_chain.push(id);
             // Commit this block's trie writes into the overlay base, so the next
             // block's clone starts from an empty overlay (keeps clones cheap).
+            // On a durable base the boot anchor rides the same atomic batch, so
+            // the records on disk always describe exactly the anchored block.
+            if self.state_base.is_some() {
+                self.active_state.stage_meta(
+                    STATE_ANCHOR.to_vec(),
+                    anchor_bytes(block.header.height, &id),
+                );
+            }
             self.active_state.flush();
             self.maybe_prune();
             self.maybe_snapshot();
@@ -969,6 +1076,9 @@ impl Blockchain {
                     self.active_tip = id;
                     self.active_height = block.header.height;
                     self.active_chain = path;
+                    // The rebuild is in-memory: adopt it onto the durable base
+                    // (old branch's state out, new branch's in, one atomic batch).
+                    self.rehome_state();
                     self.maybe_prune();
                     self.maybe_snapshot();
                     Ok(())
@@ -1214,7 +1324,7 @@ mod tests {
         )
         .unwrap();
         let nullifier = xfer.nullifier();
-        let output = xfer.output.clone();
+        let output = xfer.output;
         let tx = Transaction::AnonTransfer { token: lat, xfer };
         assert!(check_tx(&tx).is_ok());
         let block1 = chain.mine_with_reward(miner_id, vec![tx.clone()]);
@@ -1614,8 +1724,10 @@ mod tests {
         let premine = [(gid, 1_000_000u64)];
 
         // Session 1: fresh chain — mine a registration and a solvent transfer.
+        // Every adopted block commits state + boot anchor to the DB (T7).
         {
             let mut chain = Blockchain::open(&path, &premine, DEFAULT_DIFFICULTY).unwrap();
+            assert_eq!(chain.boot_mode(), BootMode::FullReplay);
             assert!(!chain.booted_from_snapshot());
             let b1 = chain.mine(vec![mine_registration(receiver_id)]);
             chain.apply_block(&b1).unwrap();
@@ -1629,21 +1741,23 @@ mod tests {
         }
         assert!(!snap.exists(), "a fresh (height-0) open must not have snapshotted");
 
-        // Session 2: full replay (no snapshot existed); open snapshots the tip.
+        // Session 2: boots straight from the durable records — no snapshot file
+        // was ever needed or written.
         {
             let mut chain = Blockchain::open(&path, &premine, DEFAULT_DIFFICULTY).unwrap();
-            assert!(!chain.booted_from_snapshot(), "nothing to boot from yet");
-            assert!(snap.exists(), "a full-replay open leaves a snapshot for next boot");
+            assert_eq!(chain.boot_mode(), BootMode::Records);
+            assert!(chain.booted_from_snapshot());
+            assert!(!snap.exists(), "records boot never writes a snapshot file");
             let b3 = chain.mine(vec![]);
             chain.apply_block(&b3).unwrap();
         }
 
-        // Session 3: boots from the height-2 snapshot, replaying only block 3.
-        // Capture what a correct boot must reproduce, then release the DB (redb
-        // holds an exclusive lock, so the block DB can't be copied while open).
+        // Session 3: records boot again at the new tip. Capture what a correct
+        // boot must reproduce, then release the DB (redb holds an exclusive
+        // lock, so the block DB can't be copied while open).
         let (tip, difficulty, root) = {
             let chain = Blockchain::open(&path, &premine, DEFAULT_DIFFICULTY).unwrap();
-            assert!(chain.booted_from_snapshot(), "valid snapshot must be used");
+            assert_eq!(chain.boot_mode(), BootMode::Records);
             assert_eq!(chain.height(), 3);
             assert_eq!(
                 gsk.decrypt(&chain.balance(&gid, lat).unwrap(), 24),
@@ -1653,19 +1767,47 @@ mod tests {
             (chain.tip(), chain.difficulty(), chain.state_root())
         };
 
-        // A full replay of the same block DB (copied without its .snap sibling)
-        // must be indistinguishable from the snapshot boot above.
+        // Strip the anchor: with no records boot and no snapshot file the open
+        // falls back to a FULL replay — and must land in the identical state.
+        // That fallback also writes a snapshot file for the next boot.
+        strip_state_anchor(&path);
+        {
+            let chain = Blockchain::open(&path, &premine, DEFAULT_DIFFICULTY).unwrap();
+            assert_eq!(chain.boot_mode(), BootMode::FullReplay);
+            assert_eq!((chain.tip(), chain.difficulty(), chain.state_root()), (tip, difficulty, root));
+        }
+        assert!(snap.exists(), "a full-replay open leaves a snapshot for next boot");
+
+        // Strip the anchor again (the open above re-anchored on rehome): now the
+        // SNAPSHOT-FILE path boots, and must land in the identical state too.
+        strip_state_anchor(&path);
+        {
+            let chain = Blockchain::open(&path, &premine, DEFAULT_DIFFICULTY).unwrap();
+            assert_eq!(chain.boot_mode(), BootMode::Snapshot);
+            assert_eq!((chain.tip(), chain.difficulty(), chain.state_root()), (tip, difficulty, root));
+        }
+
+        // A copy of the DB (anchor stripped, no .snap sibling) full-replays to
+        // the same state — the durable records never diverge from the blocks.
         std::fs::copy(&path, &ref_path).unwrap();
+        strip_state_anchor(&ref_path);
         let full = Blockchain::open(&ref_path, &premine, DEFAULT_DIFFICULTY).unwrap();
-        assert!(!full.booted_from_snapshot());
+        assert_eq!(full.boot_mode(), BootMode::FullReplay);
         assert_eq!(tip, full.tip());
         assert_eq!(difficulty, full.difficulty());
-        assert_eq!(root, full.state_root(), "snapshot boot reproduces the exact state");
+        assert_eq!(root, full.state_root(), "every boot path reproduces the exact state");
 
         drop(full);
         for p in [&path, &snap, &ref_path, &super::snapshot::snapshot_path(&ref_path)] {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    /// Delete the T7 boot anchor so the next open exercises the snapshot-file /
+    /// full-replay paths (the records themselves are left in place).
+    fn strip_state_anchor(path: &Path) {
+        let kv = RedbStore::open(path).unwrap();
+        kv.delete(Column::Meta, STATE_ANCHOR.to_vec());
     }
 
     #[test]
@@ -1683,7 +1825,8 @@ mod tests {
         let _ = std::fs::remove_file(&snap);
         let premine = [(gid, 1_000_000u64)];
 
-        // Build a 2-block chain and get a snapshot on disk (second open writes it).
+        // Build a 2-block chain, then force a full-replay open (anchor stripped,
+        // no snapshot yet) so it writes a snapshot file to attack.
         {
             let mut chain = Blockchain::open(&path, &premine, DEFAULT_DIFFICULTY).unwrap();
             let b1 = chain.mine(vec![mine_registration([3u8; 32])]);
@@ -1691,18 +1834,21 @@ mod tests {
             let b2 = chain.mine(vec![]);
             chain.apply_block(&b2).unwrap();
         }
+        strip_state_anchor(&path);
         { Blockchain::open(&path, &premine, DEFAULT_DIFFICULTY).unwrap(); }
         assert!(snap.exists());
 
         // Corrupt a byte of the ledger body — the checksum rejects the file and
         // boot falls back to full replay, ending in the same correct state.
+        // (Anchor stripped each time so the snapshot path is actually reached.)
         let mut bytes = std::fs::read(&snap).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 0xff;
         std::fs::write(&snap, &bytes).unwrap();
+        strip_state_anchor(&path);
         {
             let chain = Blockchain::open(&path, &premine, DEFAULT_DIFFICULTY).unwrap();
-            assert!(!chain.booted_from_snapshot(), "corrupt snapshot must be ignored");
+            assert_eq!(chain.boot_mode(), BootMode::FullReplay, "corrupt snapshot must be ignored");
             assert_eq!(chain.height(), 2);
             assert!(chain.is_registered(&[3u8; 32]));
         }
@@ -1713,10 +1859,111 @@ mod tests {
         let mut bytes = std::fs::read(&snap).unwrap();
         bytes[20] ^= 0xff; // inside the block_id at offset 16..48
         std::fs::write(&snap, &bytes).unwrap();
+        strip_state_anchor(&path);
         {
             let chain = Blockchain::open(&path, &premine, DEFAULT_DIFFICULTY).unwrap();
-            assert!(!chain.booted_from_snapshot(), "misplaced snapshot must be ignored");
+            assert_eq!(chain.boot_mode(), BootMode::FullReplay, "misplaced snapshot must be ignored");
             assert_eq!(chain.height(), 2);
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&snap);
+    }
+
+    #[test]
+    fn corrupt_state_records_fall_back_and_reboot_correctly() {
+        let gid = SecretKey::random(&mut OsRng).public_key().to_bytes();
+        let path = std::env::temp_dir().join(format!(
+            "lat-reccorrupt-{}-{}.dat",
+            std::process::id(),
+            gid[0]
+        ));
+        let snap = super::snapshot::snapshot_path(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&snap);
+        let premine = [(gid, 1_000_000u64)];
+
+        let (tip, root) = {
+            let mut chain = Blockchain::open(&path, &premine, DEFAULT_DIFFICULTY).unwrap();
+            let b1 = chain.mine(vec![mine_registration([3u8; 32])]);
+            chain.apply_block(&b1).unwrap();
+            (chain.tip(), chain.state_root())
+        };
+
+        // Flip a byte inside an account record ('a'-prefixed key in Objects).
+        // Whether that makes the record undecodable or just commit a different
+        // root, the records boot must reject it and fall back — ending in the
+        // exact state the blocks prescribe.
+        {
+            let kv = RedbStore::open(&path).unwrap();
+            let accounts = kv.scan_prefix(Column::Objects, b"a");
+            let (key, mut body) = accounts.into_iter().next().expect("an account record exists");
+            let last = body.len() - 1;
+            body[last] ^= 0xff;
+            kv.put(Column::Objects, key, body);
+        }
+        {
+            let chain = Blockchain::open(&path, &premine, DEFAULT_DIFFICULTY).unwrap();
+            assert_ne!(chain.boot_mode(), BootMode::Records, "tampered records must be rejected");
+            assert_eq!((chain.tip(), chain.state_root()), (tip, root));
+            assert!(chain.is_registered(&[3u8; 32]));
+        }
+        // The fallback open re-homed clean records; the next boot uses them.
+        {
+            let chain = Blockchain::open(&path, &premine, DEFAULT_DIFFICULTY).unwrap();
+            assert_eq!(chain.boot_mode(), BootMode::Records);
+            assert_eq!((chain.tip(), chain.state_root()), (tip, root));
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&snap);
+    }
+
+    #[test]
+    fn persistent_chain_reorgs_durably() {
+        let gid = SecretKey::random(&mut OsRng).public_key().to_bytes();
+        let path = std::env::temp_dir().join(format!(
+            "lat-reorgdur-{}-{}.dat",
+            std::process::id(),
+            gid[0]
+        ));
+        let snap = super::snapshot::snapshot_path(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&snap);
+        let premine = [(gid, 1_000_000u64)];
+        let x = [9u8; 32]; // registered only on the rival branch
+
+        // A rival in-memory chain builds the heavier branch.
+        let mut rival = Blockchain::genesis(&premine, DEFAULT_DIFFICULTY);
+        let r1 = rival.mine(vec![]);
+        rival.apply_block(&r1).unwrap();
+        let r2 = rival.mine(vec![mine_registration(x)]);
+        rival.apply_block(&r2).unwrap();
+        let r3 = rival.mine(vec![]);
+        rival.apply_block(&r3).unwrap();
+
+        // The persistent chain mines its own block, then reorgs to the rival.
+        {
+            let mut chain = Blockchain::open(&path, &premine, DEFAULT_DIFFICULTY).unwrap();
+            let own = chain.mine(vec![mine_registration([7u8; 32])]);
+            chain.apply_block(&own).unwrap();
+            for h in 1..=3u64 {
+                let b = Block::decode(rival.block_bytes(h).unwrap()).unwrap();
+                chain.apply_block(&b).unwrap();
+            }
+            assert_eq!(chain.tip(), rival.tip(), "reorged to the heavier branch");
+            assert!(chain.is_registered(&x));
+            assert_eq!(chain.state_root(), rival.state_root());
+        }
+        // Reboot: the records boot must reproduce the REORGED state (the old
+        // branch's records were atomically replaced on adoption).
+        {
+            let chain = Blockchain::open(&path, &premine, DEFAULT_DIFFICULTY).unwrap();
+            assert_eq!(chain.boot_mode(), BootMode::Records);
+            assert_eq!(chain.tip(), rival.tip());
+            assert!(chain.is_registered(&x));
+            assert!(!chain.is_registered(&[7u8; 32]), "the abandoned branch's state is gone");
+            assert_eq!(chain.state_root(), rival.state_root());
         }
 
         let _ = std::fs::remove_file(&path);
