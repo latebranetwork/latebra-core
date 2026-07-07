@@ -25,15 +25,20 @@ use lat_types::Transaction;
 
 use lat_crypto::Ciphertext;
 
+pub mod finality;
 mod mempool;
 mod snapshot;
 mod store;
+pub use finality::{Certificate, Vote};
 pub use mempool::{tx_hash, Mempool};
 pub use store::ChainStore;
 
 /// Anonymity-epoch parameters, re-exported so wallets/tools don't need a direct
 /// `lat-state` dependency to target the right epoch.
 pub use lat_state::{epoch_of, EPOCH_BLOCKS};
+
+/// Staking parameters (T13), re-exported for node/tooling crates.
+pub use lat_state::{MAX_VALIDATORS, MIN_VALIDATOR_STAKE, UNBONDING_BLOCKS};
 
 /// Starting block-PoW difficulty `D`: a block is valid when the top 64 bits of
 /// its hash are `<= u64::MAX / D`, so the chance per hash is ~`1/D`. Low here so
@@ -475,7 +480,28 @@ pub struct Blockchain {
     /// chains. When set, every adopted flush also commits the boot anchor, so
     /// the next open can boot from records instead of replaying.
     state_base: Option<Arc<dyn KVStore>>,
+    /// T14/T15 finality watermark: the highest certified block. Fork choice
+    /// refuses any reorganization that does not descend from it.
+    finalized: Option<(u64, [u8; 32])>,
+    /// The validator set committed by each recently adopted active block
+    /// (newest last, ≤ [`FINALITY_SET_WINDOW`] entries) — what certificates
+    /// for those blocks are judged against. Cleared on reorg (old-branch sets
+    /// don't apply to the new branch) and rebuilt as blocks are adopted.
+    recent_sets: std::collections::VecDeque<(u64, ValidatorSet)>,
 }
+
+/// A validator set as `(account id, bonded stake)` pairs (see
+/// `Ledger::validator_set` — stake descending, id ascending, capped).
+pub type ValidatorSet = Vec<([u8; 32], u64)>;
+
+/// How many recent blocks' validator sets are kept verifiable. Certificates
+/// older than this window are ignored — finality is a recent anti-reorg
+/// guarantee; deep history is secured by accumulated work.
+pub const FINALITY_SET_WINDOW: usize = 64;
+
+/// Meta key persisting the finality watermark: `height (8 LE) ‖ block id (32)
+/// ‖ certificate bytes`. Local data, trusted like the node's own block DB.
+const FINALITY_ANCHOR: &[u8] = b"finality/anchor";
 
 /// How a chain instance obtained its boot-time state (fastest first).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -543,7 +569,7 @@ impl Blockchain {
         let mut tree = HashMap::new();
         tree.insert(gid, genesis_node);
 
-        Blockchain {
+        let mut chain = Blockchain {
             tree,
             genesis_id: gid,
             premine: premine.to_vec(),
@@ -557,7 +583,11 @@ impl Blockchain {
             boot_mode: BootMode::FullReplay,
             prune_window: None,
             state_base: None,
-        }
+            finalized: None,
+            recent_sets: std::collections::VecDeque::new(),
+        };
+        chain.note_validator_set();
+        chain
     }
 
     /// Enable state-trie pruning (T6): every `window` blocks, trie nodes not
@@ -673,6 +703,12 @@ impl Blockchain {
             // the durable base so the NEXT open boots from records.
             chain.rehome_state();
         }
+        // Fast boots skip apply_block, so the set window may hold stale
+        // entries: re-record at the booted tip, then restore the persisted
+        // finality watermark (trusted local data, position re-checked).
+        chain.recent_sets.clear();
+        chain.note_validator_set();
+        chain.restore_finality_anchor();
         Ok(chain)
     }
 
@@ -879,6 +915,11 @@ impl Blockchain {
         (self.active_chain.get(h as usize) == Some(id)).then_some(h)
     }
 
+    /// The active-chain block id at `height`, if the chain reaches it.
+    pub fn active_id_at(&self, height: u64) -> Option<[u8; 32]> {
+        self.active_chain.get(height as usize).copied()
+    }
+
     pub fn height(&self) -> u64 {
         self.active_height
     }
@@ -1048,6 +1089,7 @@ impl Blockchain {
             self.active_tip = id;
             self.active_height = block.header.height;
             self.active_chain.push(id);
+            self.note_validator_set();
             // Commit this block's trie writes into the overlay base, so the next
             // block's clone starts from an empty overlay (keeps clones cheap).
             // On a durable base the boot anchor rides the same atomic batch, so
@@ -1066,6 +1108,15 @@ impl Blockchain {
             // Reorg: this competing branch is now heaviest. Rebuild + revalidate.
             self.tree.insert(id, node);
             let path = self.path_to(&id);
+            // T15: finality overrides work. A branch that does not descend from
+            // the finalized block cannot become active, however heavy — keep it
+            // as a side branch (same handling as valid-but-not-heaviest).
+            if let Some((fh, fid)) = self.finalized {
+                if path.get(fh as usize) != Some(&fid) {
+                    self.persist(block, &encoded)?;
+                    return Ok(());
+                }
+            }
             match self.rebuild_state(&path) {
                 Ok(new_state) => {
                     if let Err(e) = self.persist(block, &encoded) {
@@ -1076,6 +1127,10 @@ impl Blockchain {
                     self.active_tip = id;
                     self.active_height = block.header.height;
                     self.active_chain = path;
+                    // The old branch's recorded validator sets don't describe
+                    // the new branch — drop them and record the new tip's.
+                    self.recent_sets.clear();
+                    self.note_validator_set();
                     // The rebuild is in-memory: adopt it onto the durable base
                     // (old branch's state out, new branch's in, one atomic batch).
                     self.rehome_state();
@@ -1114,6 +1169,81 @@ impl Blockchain {
     /// block, active chain or side branch).
     pub fn block_by_id(&self, id: &[u8; 32]) -> Option<Vec<u8>> {
         self.tree.get(id).map(|n| n.encoded.clone())
+    }
+
+    // --- finality (T14/T15) --------------------------------------------------
+
+    /// Record the validator set the just-adopted active block commits (from
+    /// the active ledger — T13), so certificates for it can be judged later.
+    fn note_validator_set(&mut self) {
+        let set = self.active_state.validator_set();
+        self.recent_sets.push_back((self.active_height, set));
+        while self.recent_sets.len() > FINALITY_SET_WINDOW {
+            self.recent_sets.pop_front();
+        }
+    }
+
+    /// The validator set committed by the active block at `height`, if it is
+    /// still inside the recent window.
+    pub fn validator_set_at(&self, height: u64) -> Option<&[([u8; 32], u64)]> {
+        self.recent_sets
+            .iter()
+            .rev()
+            .find(|(h, _)| *h == height)
+            .map(|(_, set)| set.as_slice())
+    }
+
+    /// The finality watermark, if any block has been certified.
+    pub fn finalized(&self) -> Option<(u64, [u8; 32])> {
+        self.finalized
+    }
+
+    /// Adopt a finality certificate: the block must sit on the ACTIVE chain at
+    /// its claimed height, be newer than the current watermark, and carry
+    /// more than 2/3 of the stake of the validator set that block itself
+    /// commits (see the `finality` module). Returns whether the watermark
+    /// advanced. The watermark persists (with its certificate) in the chain DB.
+    pub fn try_finalize(&mut self, cert: &Certificate) -> bool {
+        if let Some((fh, _)) = self.finalized {
+            if cert.height <= fh {
+                return false;
+            }
+        }
+        if self.active_chain.get(cert.height as usize) != Some(&cert.block_id) {
+            return false;
+        }
+        let Some(set) = self.validator_set_at(cert.height) else { return false };
+        if !cert.verify(set) {
+            return false;
+        }
+        self.finalized = Some((cert.height, cert.block_id));
+        if let Some(base) = &self.state_base {
+            let mut value = Vec::with_capacity(40 + cert.votes.len() * 96);
+            value.extend_from_slice(&cert.height.to_le_bytes());
+            value.extend_from_slice(&cert.block_id);
+            value.extend_from_slice(&cert.encode());
+            let mut batch = lat_store::WriteBatch::new();
+            batch.put(Column::Meta, FINALITY_ANCHOR.to_vec(), value);
+            base.write(batch);
+        }
+        true
+    }
+
+    /// Restore the persisted finality watermark (boot): trusted like the rest
+    /// of the node's own DB, but only adopted if the anchored block is still
+    /// on the active chain at its height.
+    fn restore_finality_anchor(&mut self) {
+        let Some(base) = &self.state_base else { return };
+        let Some(bytes) = base.get(Column::Meta, FINALITY_ANCHOR) else { return };
+        let (Some(h), Some(id)) = (
+            bytes.get(0..8).and_then(|b| b.try_into().ok().map(u64::from_le_bytes)),
+            bytes.get(8..40).and_then(|b| <[u8; 32]>::try_from(b).ok()),
+        ) else {
+            return;
+        };
+        if self.active_chain.get(h as usize) == Some(&id) {
+            self.finalized = Some((h, id));
+        }
     }
 
     /// Sweep unreachable trie nodes every `prune_window` blocks (no-op in
@@ -1546,6 +1676,144 @@ mod tests {
         }
         assert_eq!(pruned.tip(), rival.tip(), "pruned chain reorged to the heavier branch");
         assert_eq!(pruned.state_root(), rival.state_root());
+    }
+
+    /// A signed `Stake` transaction by `sk` (helper for finality tests).
+    fn stake_tx(sk: &SecretKey, amount: u64, nonce: u64) -> Transaction {
+        let mut tx = Transaction::Stake {
+            validator: sk.public_key().to_bytes(),
+            amount,
+            nonce,
+            sig: [0u8; 64],
+        };
+        let sig = sk.sign(&tx.signing_bytes()).to_bytes();
+        if let Transaction::Stake { sig: s, .. } = &mut tx {
+            *s = sig;
+        }
+        tx
+    }
+
+    /// A chain whose genesis publicly funds `sk`'s account, with the stake
+    /// bonded in block 1. Returns the chain (tip = height 1).
+    fn chain_with_validator(sk: &SecretKey) -> Blockchain {
+        let id = sk.public_key().to_bytes();
+        let mut chain = Blockchain::genesis_with_public(
+            &[],
+            &[(id, 10 * lat_state::MIN_VALIDATOR_STAKE)],
+            DEFAULT_DIFFICULTY,
+        );
+        let b1 = chain.mine(vec![stake_tx(sk, lat_state::MIN_VALIDATOR_STAKE, 0)]);
+        chain.apply_block(&b1).unwrap();
+        chain
+    }
+
+    #[test]
+    fn finality_certificate_blocks_reorgs_across_the_watermark() {
+        let sk = SecretKey::random(&mut OsRng);
+        let id = sk.public_key().to_bytes();
+        let mut chain = chain_with_validator(&sk);
+        let b2 = chain.mine(vec![]);
+        chain.apply_block(&b2).unwrap();
+        assert_eq!(
+            chain.validator_set_at(2),
+            Some(&[(id, lat_state::MIN_VALIDATOR_STAKE)][..]),
+            "the adopted block's committed validator set is recorded"
+        );
+
+        // Our sole validator is 100% of the stake: one vote certifies block 2.
+        let vote = Vote::sign(&sk, chain.tip(), 2);
+        let cert =
+            Certificate { block_id: vote.block_id, height: 2, votes: vec![(vote.validator, vote.sig)] };
+        assert!(chain.try_finalize(&cert));
+        assert_eq!(chain.finalized(), Some((2, chain.tip())));
+        // Monotonic: an older certificate can never move the watermark back.
+        assert!(!chain.try_finalize(&cert));
+
+        // A rival branch forking BELOW the watermark out-works us (4 blocks vs
+        // 2 on a same-difficulty chain) — pre-T15 it would reorg. Now it must
+        // be refused, however heavy it grows.
+        let mut rival = Blockchain::genesis_with_public(
+            &[],
+            &[(id, 10 * lat_state::MIN_VALIDATOR_STAKE)],
+            DEFAULT_DIFFICULTY,
+        );
+        for _ in 0..4 {
+            let b = rival.mine(vec![]);
+            rival.apply_block(&b).unwrap();
+        }
+        let tip_before = chain.tip();
+        for h in 1..=4u64 {
+            let b = Block::decode(rival.block_bytes(h).unwrap()).unwrap();
+            chain.apply_block(&b).unwrap(); // accepted as side branch only
+        }
+        assert_eq!(chain.tip(), tip_before, "finality must override cumulative work");
+        assert_eq!(chain.height(), 2);
+
+        // A fork ABOVE the watermark still reorgs normally (it keeps block 2).
+        let mut above = chain.mine(vec![]); // our own block 3 (kept private)
+        chain.apply_block(&above).unwrap();
+        above = chain.mine(vec![]);
+        chain.apply_block(&above).unwrap();
+        assert_eq!(chain.height(), 4);
+        assert_eq!(chain.active_id_at(2), Some(cert.block_id), "finalized prefix intact");
+    }
+
+    #[test]
+    fn empty_validator_set_means_pure_pow() {
+        // No stake anywhere: no certificate can verify, and reorgs behave
+        // exactly as before — the dev/single-node experience is unchanged.
+        let sk = SecretKey::random(&mut OsRng);
+        let mut chain = Blockchain::genesis(&[([1u8; 32], 100)], DEFAULT_DIFFICULTY);
+        let b1 = chain.mine(vec![]);
+        chain.apply_block(&b1).unwrap();
+        assert_eq!(chain.validator_set_at(1), Some(&[][..]));
+
+        let vote = Vote::sign(&sk, chain.tip(), 1);
+        let cert =
+            Certificate { block_id: vote.block_id, height: 1, votes: vec![(vote.validator, vote.sig)] };
+        assert!(!chain.try_finalize(&cert), "no stake, no finality");
+        assert_eq!(chain.finalized(), None);
+    }
+
+    #[test]
+    fn finality_watermark_survives_reboot() {
+        let sk = SecretKey::random(&mut OsRng);
+        let id = sk.public_key().to_bytes();
+        let path = std::env::temp_dir().join(format!(
+            "lat-finality-{}-{}.dat",
+            std::process::id(),
+            id[0]
+        ));
+        let snap = super::snapshot::snapshot_path(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&snap);
+        let public_premine = [(id, 10 * lat_state::MIN_VALIDATOR_STAKE)];
+
+        let finalized = {
+            let mut chain =
+                Blockchain::open_with_public(&path, &[], &public_premine, DEFAULT_DIFFICULTY)
+                    .unwrap();
+            let b1 = chain.mine(vec![stake_tx(&sk, lat_state::MIN_VALIDATOR_STAKE, 0)]);
+            chain.apply_block(&b1).unwrap();
+            let b2 = chain.mine(vec![]);
+            chain.apply_block(&b2).unwrap();
+            let vote = Vote::sign(&sk, chain.tip(), 2);
+            let cert = Certificate {
+                block_id: vote.block_id,
+                height: 2,
+                votes: vec![(vote.validator, vote.sig)],
+            };
+            assert!(chain.try_finalize(&cert));
+            chain.finalized().unwrap()
+        };
+        {
+            let chain =
+                Blockchain::open_with_public(&path, &[], &public_premine, DEFAULT_DIFFICULTY)
+                    .unwrap();
+            assert_eq!(chain.finalized(), Some(finalized), "watermark restored from the DB");
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&snap);
     }
 
     #[test]

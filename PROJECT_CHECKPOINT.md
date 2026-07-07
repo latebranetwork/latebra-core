@@ -2,7 +2,7 @@
 
 > Living document. Paste "continue from the latest checkpoint" in a new
 > conversation and work resumes from the **Current Task** below.
-> Last updated: 2026-07-06 (Checkpoint 12 — T13 validator set + staking; M3 begun).
+> Last updated: 2026-07-07 (Checkpoint 13 — T14/T15 hybrid finality + fork choice).
 
 ## 0. Mission
 
@@ -275,8 +275,31 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
   renders both kinds. LAUNCH.md: 3 new params + a validator-genesis
   mainnet-must-decide note. PoW still produces blocks — T14 swaps finality
   and only *reads* this module.  ← T3
-- [ ] T14 BFT-PoS deterministic finality engine.  ← T13
-- [ ] T15 Fork choice integrated with finality.  ← T14
+- [x] **T14 Finality certificates (v1, hybrid)** — `lat_chain::finality`:
+  validators sign a `Vote` (domain-separated Schnorr over block id ‖ height);
+  votes for one block summing to **strictly >2/3** of the stake of the
+  validator set THAT BLOCK COMMITS (recorded from `Ledger::validator_set()`
+  when the chain adopts it — a `FINALITY_SET_WINDOW`=64 rolling window) form a
+  `Certificate` that finalizes it. PoW keeps producing blocks (hybrid);
+  **an empty validator set = pure PoW, semantics unchanged** (dev UX + the
+  live testnet). Vote pool + `cast_vote`/`add_vote`/`accept_cert` live in
+  `NodeState`; `Msg::FinalityVote`/`FinalityCert` (tags 26/27) gossip with
+  the same flood-once semantics as `NewBlock`; `GetFinalized` RPC (28/29);
+  `latebrad --validator` votes with the miner wallet's key on every adopted
+  tip. Watermark persists in the chain DB (`Meta:"finality/anchor"`) and is
+  restored on boot (position re-checked). Honest v1 limits (documented in the
+  module): no slashing yet (T16 — >1/3 colluding stake could equivocate
+  without loss), no liveness rounds (a height may never certify; PoW carries
+  on), no proposer rotation (PoW is the producer), and certificates older
+  than the set window are ignored (finality = recent anti-reorg; deep history
+  is secured by work). Proven over real TCP in tests.  ← T13
+- [x] **T15 Fork choice integrated with finality** (landed with T14): the
+  chain keeps a finalized watermark and `apply_block` refuses any
+  reorganization whose path does not include the finalized block — however
+  heavy the rival branch — keeping it as a side branch instead. Behavioral
+  test: a 2× heavier rival forking below the watermark is refused; forks
+  above it reorg normally. Reorg adoption clears the (branch-specific)
+  validator-set window and re-records at the new tip.  ← T14
 - [ ] T16 Slashing, epochs, governance parameters.  ← T14
 
 ### M4 — Networking
@@ -381,6 +404,17 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
     `struct Validator { staked, unbonding: Vec<(amount, release_height)> }`,
     `Ledger::{staked, unbonding, validator_set}`,
     `LedgerError::InsufficientStake`. Snapshot magic `LATLEDG3`.
+- T14/T15 finality:
+  - `lat-chain::finality`: `Vote { block_id, height, validator, sig }`
+    (`sign`/`verify`/136-byte codec), `Certificate { block_id, height, votes }`
+    (`verify(set)` = distinct staked signers, valid sigs, >2/3 stake).
+  - `lat-chain`: `FINALITY_SET_WINDOW` (64), `Blockchain::{validator_set_at,
+    finalized, try_finalize, active_id_at}`; watermark at
+    `Meta:"finality/anchor"`; re-exports `MIN_VALIDATOR_STAKE` etc.
+  - `lat-p2p`: `NodeState::{set_validator_key, add_vote, accept_cert,
+    cast_vote}`; `Msg::FinalityVote`/`FinalityCert`/`GetFinalized` (26–29);
+    `announce_vote`/`announce_cert`/`get_finalized` client fns.
+  - `lat-wallet`: `Wallet::secret_key()`. `latebrad --validator`.
 
 ## 8. Known limitations / follow-ups
 
@@ -408,28 +442,26 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
 
 ## 9. Current Task
 
-**T14 — BFT-PoS deterministic finality engine** (T13's staking module is in;
-this is the heart of M3 and the program's biggest structural change, D2).
-Goal: blocks become FINAL — no more heaviest-work reorgs beyond the finalized
-prefix. Sketch (Tendermint-flavored, adapted to the existing tree): (1) an
-epoch's validator set = `Ledger::validator_set()` at the last block of the
-previous epoch (so the set is bound by an already-final root); (2)
-deterministic round-robin proposer weighted by stake; (3) prevote/precommit
-vote messages (new P2P kinds) signed with validator keys; ≥2/3 stake
-precommits = a **finality certificate** carried with (or after) the block;
-(4) fork choice (T15) becomes "longest finalized chain, then heaviest work
-for the unfinalized tail" — `Blockchain` gains a finalized-height watermark
-that `apply_block` refuses to reorg across; (5) PoW can remain as the
-proposer's block-production spam bound during transition (hybrid), with the
-certificate what actually finalizes. Big open decisions for the session:
-vote transport (lat-p2p message kinds + rebroadcast), certificate encoding in
-the block wire format (header extension vs side-channel), and how latebrad
-runs a validator (key from wallet seed; `--validator` flag). Keep single-node
-dev UX working: a chain with an EMPTY validator set runs exactly as today
-(pure PoW) — finality activates only when a set exists.
+**T16 — Slashing, validator operations, and finality hardening** (T14/T15's
+hybrid finality is in; this closes M3). The v1 gaps, in priority order:
+(1) **equivocation slashing** — two valid votes by one validator for
+different blocks at the same height are a self-contained fraud proof (both
+sigs verify); add a `SlashEvidence` transaction that burns (part of) the
+offender's bonded stake; the unbonding window (T13) is what makes this bite.
+(2) **Validator operations UX** — there is currently NO way to send a
+`Stake` tx from any wallet: add `stake`/`unstake` commands to lat-wallet-cli
+(and the web wallet), so a testnet operator can actually become a validator
+(today only a hand-crafted tx can). Miner rewards are confidential — staking
+needs public LAT (faucet or unshield first); document the onboarding path in
+LAUNCH.md. (3) **Vote-on-sync gaps** — a validator votes on tips it adopts;
+consider re-voting on restart and a periodic re-cast so a quorum that missed
+each other's votes converges. (4) Epoch-boundary set snapshots (bind the set
+at epoch starts rather than per block) if vote volume matters. Free Stake(0)
+tx spam is nonce+registration-PoW bounded — revisit with a fee floor if it
+shows up in practice.
 
-Alternative order: T15 fork-choice integration is inseparable and will likely
-land WITH T14; T16 (slashing/epochs/governance) after.
+Alternative order: T17 (gossip efficiency) / T18 (DNS seeds) to round out
+networking, or T22 (Docker/CI) for launch ops.
 
 ### Build/verify commands
 - Tests: `cargo test -p lat-store` (+ per-crate as tasks land).

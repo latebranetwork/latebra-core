@@ -68,6 +68,9 @@ struct Config {
     mine_blocks: Option<u64>,
     /// Keep every historical state root (no trie pruning).
     archive: bool,
+    /// Vote for finality with the miner wallet's key (T14). The account must
+    /// be staked (`Stake` tx) or its votes are ignored by every node.
+    validator: bool,
 }
 
 /// Default T6 prune window: sweep unreachable trie nodes every 64 blocks,
@@ -84,6 +87,7 @@ fn parse_config() -> Config {
         mine: false,
         mine_blocks: None,
         archive: false,
+        validator: false,
     };
     let args: Vec<String> = env::args().skip(1).collect();
     let mut i = 0;
@@ -109,6 +113,7 @@ fn parse_config() -> Config {
             }
             "--mine" => cfg.mine = true,
             "--archive" => cfg.archive = true,
+            "--validator" => cfg.validator = true,
             "--mine-blocks" => {
                 i += 1;
                 cfg.mine_blocks = args.get(i).and_then(|s| s.parse().ok());
@@ -135,6 +140,8 @@ fn print_usage() {
     println!("  --mine-blocks <n>     mine n blocks then exit");
     println!("  --archive             keep all historical state roots (default: prune,");
     println!("                        retaining the last {PRUNE_WINDOW} block state-roots)");
+    println!("  --validator           vote for finality with the miner wallet's key");
+    println!("                        (the account must be staked via a Stake tx)");
 }
 
 fn main() {
@@ -190,6 +197,10 @@ fn main() {
     let miner_wallet = Wallet::from_seed(Network::Testnet, MINER_SEED);
     println!("  miner  addr : {}", miner_wallet.address_string());
     let node: SharedNode = Arc::new(Mutex::new(NodeState::with_miner(chain, miner_wallet.id())));
+    if cfg.validator {
+        lock_node(&node).set_validator_key(miner_wallet.secret_key().clone());
+        println!("  finality    : validator (voting with the miner wallet)");
+    }
 
     // The address we advertise to other nodes (peer exchange).
     let public_addr = cfg.public_addr.clone().unwrap_or_else(|| cfg.listen.clone());
@@ -272,6 +283,7 @@ fn main() {
                 if let Ok(n) = sync_shared(&node, peer.as_str()) {
                     if n > 0 {
                         println!("[sync] adopted {n} block(s) from {peer}");
+                        cast_and_announce_vote(&node);
                     }
                 }
                 if let Ok(theirs) = lat_p2p::get_peers(peer.as_str()) {
@@ -321,6 +333,26 @@ fn mine_one(node: &SharedNode) {
         println!("[mine] new block -> height {height}  reward {}.{:05} LAT", reward / 100_000, reward % 100_000);
         for peer in peers {
             let _ = announce_block(peer.as_str(), &bytes);
+        }
+        cast_and_announce_vote(node);
+    }
+}
+
+/// If this node is a validator, sign a finality vote for the adopted tip and
+/// gossip it (plus any certificate the vote completes) to every peer. A no-op
+/// when not a validator or when this tip was already voted for.
+fn cast_and_announce_vote(node: &SharedNode) {
+    let Some((vote, cert)) = lock_node(node).cast_vote() else { return };
+    let peers = lock_node(node).peers();
+    for p in &peers {
+        let _ = lat_p2p::announce_vote(p.as_str(), &vote);
+    }
+    if let Some(cert) = cert {
+        if let Some((h, _)) = lock_node(node).chain.finalized() {
+            println!("[finality] height {h} finalized (certificate formed)");
+        }
+        for p in &peers {
+            let _ = lat_p2p::announce_cert(p.as_str(), &cert);
         }
     }
 }

@@ -12,6 +12,7 @@
 //! discovery (DHT/mDNS). Those are a production upgrade — the message protocol and
 //! sync logic here are what they'd carry.
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::Path;
@@ -19,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use lat_chain::{Block, Blockchain, Mempool};
+use lat_chain::{Block, Blockchain, Certificate, Mempool, Vote};
 use lat_types::Transaction;
 
 /// P2P protocol version. Nodes refuse to peer across a version mismatch — a
@@ -69,6 +70,9 @@ struct Peer {
     failures: u32,
 }
 
+/// One vote bucket: validator id → vote signature.
+type VoteBucket = HashMap<[u8; 32], [u8; 64]>;
+
 pub struct NodeState {
     pub chain: Blockchain,
     pub mempool: Mempool,
@@ -77,16 +81,38 @@ pub struct NodeState {
     /// This node's own advertised address, if known — never recorded as a peer
     /// (a node must not try to sync from itself).
     self_addr: Option<String>,
+    /// T14 finality vote pool: `(height, block id)` → validator → signature.
+    /// First vote per validator per bucket wins; pruned as blocks finalize.
+    votes: HashMap<(u64, [u8; 32]), VoteBucket>,
+    /// If set, this node is a validator: it signs a finality [`Vote`] for
+    /// every block it adopts as its tip ([`cast_vote`](Self::cast_vote)).
+    validator_key: Option<lat_crypto::SecretKey>,
 }
 
 impl NodeState {
     pub fn new(chain: Blockchain) -> Self {
-        NodeState { chain, mempool: Mempool::new(), miner: [0u8; 32], peers: Vec::new(), self_addr: None }
+        NodeState {
+            chain,
+            mempool: Mempool::new(),
+            miner: [0u8; 32],
+            peers: Vec::new(),
+            self_addr: None,
+            votes: HashMap::new(),
+            validator_key: None,
+        }
     }
 
     /// Like [`new`](Self::new) but mined blocks reward `miner`.
     pub fn with_miner(chain: Blockchain, miner: [u8; 32]) -> Self {
-        NodeState { chain, mempool: Mempool::new(), miner, peers: Vec::new(), self_addr: None }
+        let mut n = Self::new(chain);
+        n.miner = miner;
+        n
+    }
+
+    /// Make this node a validator: it will vote for blocks it adopts. The key
+    /// must belong to a staked account or its votes are simply ignored.
+    pub fn set_validator_key(&mut self, sk: lat_crypto::SecretKey) {
+        self.validator_key = Some(sk);
     }
 
     /// Record this node's own advertised address so it's never added as a peer.
@@ -196,6 +222,82 @@ impl NodeState {
         }
     }
 
+    /// Pool a finality vote from the network (or our own [`cast_vote`]).
+    /// Returns `(newly pooled, certificate bytes if this vote completed one)`.
+    /// A vote is pooled only if it is for a block on OUR active chain inside
+    /// the recent set window, above the watermark, signed by a member of that
+    /// block's validator set. When the pooled stake crosses 2/3 of the set, a
+    /// [`Certificate`] is built, adopted (`Blockchain::try_finalize`), and
+    /// returned for gossip.
+    pub fn add_vote(&mut self, bytes: &[u8]) -> (bool, Option<Vec<u8>>) {
+        let Some(vote) = Vote::decode(bytes) else { return (false, None) };
+        if let Some((fh, _)) = self.chain.finalized() {
+            if vote.height <= fh {
+                return (false, None);
+            }
+        }
+        if self.chain.active_id_at(vote.height) != Some(vote.block_id) {
+            return (false, None);
+        }
+        // Copy what we need from the set before touching the pool (borrows).
+        let Some(set) = self.chain.validator_set_at(vote.height).map(|s| s.to_vec()) else {
+            return (false, None);
+        };
+        if !set.iter().any(|(id, _)| *id == vote.validator) || !vote.verify() {
+            return (false, None);
+        }
+
+        let bucket = self.votes.entry((vote.height, vote.block_id)).or_default();
+        if bucket.contains_key(&vote.validator) {
+            return (false, None); // already pooled — gossip loop dies here
+        }
+        bucket.insert(vote.validator, vote.sig);
+
+        let total: u128 = set.iter().map(|(_, s)| *s as u128).sum();
+        let voted: u128 = set
+            .iter()
+            .filter(|(id, _)| bucket.contains_key(id))
+            .map(|(_, s)| *s as u128)
+            .sum();
+        if 3 * voted > 2 * total {
+            // Deterministic vote order (by validator id) for a canonical cert.
+            let mut votes: Vec<([u8; 32], [u8; 64])> =
+                bucket.iter().map(|(v, s)| (*v, *s)).collect();
+            votes.sort_by_key(|(validator, _)| *validator);
+            let cert = Certificate { block_id: vote.block_id, height: vote.height, votes };
+            if self.chain.try_finalize(&cert) {
+                let fh = vote.height;
+                self.votes.retain(|(h, _), _| *h > fh);
+                return (true, Some(cert.encode()));
+            }
+        }
+        (true, None)
+    }
+
+    /// Adopt a finality certificate from a peer. `true` only if it advanced
+    /// our watermark (so certificate gossip floods once and dies out).
+    pub fn accept_cert(&mut self, bytes: &[u8]) -> bool {
+        let Some(cert) = Certificate::decode(bytes) else { return false };
+        if self.chain.try_finalize(&cert) {
+            let fh = cert.height;
+            self.votes.retain(|(h, _), _| *h > fh);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// If this node is a validator, sign a vote for the current tip and pool
+    /// it. Returns `(vote bytes to gossip, certificate bytes if it completed
+    /// one)` — `None` when not a validator, not staked, or already voted.
+    pub fn cast_vote(&mut self) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+        let sk = self.validator_key.as_ref()?;
+        let vote = Vote::sign(sk, self.chain.tip(), self.chain.height());
+        let bytes = vote.encode();
+        let (pooled, cert) = self.add_vote(&bytes);
+        pooled.then_some((bytes, cert))
+    }
+
     /// Accept an encoded block from a peer. The chain's fork-choice decides what
     /// to do (extend, store as a side branch, or reorg); on success the block's
     /// transactions are dropped from the mempool. Returns whether it was accepted
@@ -282,6 +384,17 @@ enum Msg {
     ContractStorageReply(u64),
     /// RPC: ask whether a contract is deployed at `id`. Replied with `Ack`.
     HasContract([u8; 32]),
+    /// T14 finality gossip: an encoded [`Vote`]. Replied with `Ack` (whether
+    /// it was newly pooled); newly pooled votes flood on to peers.
+    FinalityVote(Vec<u8>),
+    /// T14 finality gossip: an encoded [`Certificate`]. Replied with `Ack`
+    /// (whether it advanced the watermark); advancing certs flood on.
+    FinalityCert(Vec<u8>),
+    /// RPC: ask for the node's finality watermark.
+    GetFinalized,
+    /// Reply: the finalized `(height, block id)`, or `None` if nothing has
+    /// been certified yet.
+    FinalizedReply(Option<(u64, [u8; 32])>),
 }
 
 /// Cap on ring candidates returned by one RPC (bounds the reply size; well
@@ -434,6 +547,26 @@ impl Msg {
                 v.push(24);
                 v.extend_from_slice(&val.to_le_bytes());
             }
+            Msg::FinalityVote(b) => {
+                v.push(26);
+                v.extend_from_slice(b);
+            }
+            Msg::FinalityCert(b) => {
+                v.push(27);
+                v.extend_from_slice(b);
+            }
+            Msg::GetFinalized => v.push(28),
+            Msg::FinalizedReply(opt) => {
+                v.push(29);
+                match opt {
+                    Some((h, id)) => {
+                        v.push(1);
+                        v.extend_from_slice(&h.to_le_bytes());
+                        v.extend_from_slice(id);
+                    }
+                    None => v.push(0),
+                }
+            }
             Msg::HasContract(id) => {
                 v.push(25);
                 v.extend_from_slice(id);
@@ -562,6 +695,17 @@ impl Msg {
             },
             24 => Msg::ContractStorageReply(u64::from_le_bytes(rest.get(0..8)?.try_into().ok()?)),
             25 => Msg::HasContract(rest.get(0..32)?.try_into().ok()?),
+            26 => Msg::FinalityVote(rest.to_vec()),
+            27 => Msg::FinalityCert(rest.to_vec()),
+            28 => Msg::GetFinalized,
+            29 => match rest.first()? {
+                0 => Msg::FinalizedReply(None),
+                1 => Msg::FinalizedReply(Some((
+                    u64::from_le_bytes(rest.get(1..9)?.try_into().ok()?),
+                    rest.get(9..41)?.try_into().ok()?,
+                ))),
+                _ => return None,
+            },
             _ => return None,
         })
     }
@@ -635,6 +779,39 @@ fn handle_conn(mut stream: TcpStream, node: SharedNode) -> io::Result<()> {
                 }
                 Msg::Ack(ok)
             }
+            // --- finality gossip (T14): flood-once, like NewBlock ---
+            Msg::FinalityVote(bytes) => {
+                let (pooled, cert) = lock_node(&node).add_vote(&bytes);
+                if pooled {
+                    let peers = lock_node(&node).peers();
+                    thread::spawn(move || {
+                        for p in &peers {
+                            let _ = announce_vote(p.as_str(), &bytes);
+                        }
+                        if let Some(cert) = cert {
+                            for p in &peers {
+                                let _ = announce_cert(p.as_str(), &cert);
+                            }
+                        }
+                    });
+                    Msg::Ack(true)
+                } else {
+                    Msg::Ack(false)
+                }
+            }
+            Msg::FinalityCert(bytes) => {
+                let advanced = lock_node(&node).accept_cert(&bytes);
+                if advanced {
+                    let peers = lock_node(&node).peers();
+                    thread::spawn(move || {
+                        for p in peers {
+                            let _ = announce_cert(p.as_str(), &bytes);
+                        }
+                    });
+                }
+                Msg::Ack(advanced)
+            }
+            Msg::GetFinalized => Msg::FinalizedReply(lock_node(&node).chain.finalized()),
             // --- peer exchange ---
             Msg::Hello(addr) => Msg::Ack(lock_node(&node).add_peer(&addr)),
             Msg::GetPeers => Msg::Peers(lock_node(&node).peers()),
@@ -787,6 +964,36 @@ pub fn sync_shared<A: ToSocketAddrs>(node: &SharedNode, addr: A) -> io::Result<u
 pub fn announce_block<A: ToSocketAddrs>(addr: A, block_bytes: &[u8]) -> io::Result<bool> {
     let mut stream = connect_timeout(addr)?;
     write_msg(&mut stream, &Msg::NewBlock(block_bytes.to_vec()))?;
+    match read_msg(&mut stream)? {
+        Msg::Ack(ok) => Ok(ok),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected ack")),
+    }
+}
+
+/// Push an encoded finality [`Vote`] to a peer (T14 gossip).
+pub fn announce_vote<A: ToSocketAddrs>(addr: A, vote_bytes: &[u8]) -> io::Result<bool> {
+    let mut stream = connect_timeout(addr)?;
+    write_msg(&mut stream, &Msg::FinalityVote(vote_bytes.to_vec()))?;
+    match read_msg(&mut stream)? {
+        Msg::Ack(ok) => Ok(ok),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected ack")),
+    }
+}
+
+/// Ask a node for its finality watermark (`None` if nothing certified yet).
+pub fn get_finalized<A: ToSocketAddrs>(addr: A) -> io::Result<Option<(u64, [u8; 32])>> {
+    let mut stream = connect_timeout(addr)?;
+    write_msg(&mut stream, &Msg::GetFinalized)?;
+    match read_msg(&mut stream)? {
+        Msg::FinalizedReply(f) => Ok(f),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected finalized reply")),
+    }
+}
+
+/// Push an encoded finality [`Certificate`] to a peer (T14 gossip).
+pub fn announce_cert<A: ToSocketAddrs>(addr: A, cert_bytes: &[u8]) -> io::Result<bool> {
+    let mut stream = connect_timeout(addr)?;
+    write_msg(&mut stream, &Msg::FinalityCert(cert_bytes.to_vec()))?;
     match read_msg(&mut stream)? {
         Msg::Ack(ok) => Ok(ok),
         _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected ack")),
@@ -959,6 +1166,122 @@ mod tests {
     use rand::rngs::OsRng;
 
     const PREMINE_ID: [u8; 32] = [7u8; 32];
+
+    #[test]
+    fn votes_pool_into_a_certificate_and_finalize() {
+        use lat_crypto::SecretKey;
+        use lat_chain::MIN_VALIDATOR_STAKE;
+
+        // Three validators staked whale/small/small: the whale alone holds
+        // 5/7 of the stake (> 2/3), the two smalls together only 2/7.
+        let mut rng = OsRng;
+        let sks: Vec<SecretKey> = (0..3).map(|_| SecretKey::random(&mut rng)).collect();
+        let ids: Vec<[u8; 32]> = sks.iter().map(|s| s.public_key().to_bytes()).collect();
+        let premine: Vec<([u8; 32], u64)> =
+            ids.iter().map(|id| (*id, 10 * MIN_VALIDATOR_STAKE)).collect();
+        let mut chain =
+            Blockchain::genesis_with_public(&[], &premine, DEFAULT_DIFFICULTY);
+        let stake = |sk: &SecretKey, amount: u64| {
+            let mut tx = Transaction::Stake {
+                validator: sk.public_key().to_bytes(),
+                amount,
+                nonce: 0,
+                sig: [0u8; 64],
+            };
+            let sig = sk.sign(&tx.signing_bytes()).to_bytes();
+            if let Transaction::Stake { sig: s, .. } = &mut tx {
+                *s = sig;
+            }
+            tx
+        };
+        let b1 = chain.mine(vec![
+            stake(&sks[0], 5 * MIN_VALIDATOR_STAKE),
+            stake(&sks[1], MIN_VALIDATOR_STAKE),
+            stake(&sks[2], MIN_VALIDATOR_STAKE),
+        ]);
+        chain.apply_block(&b1).unwrap();
+        let mut node = NodeState::new(chain);
+
+        // A small validator's vote pools but does not certify (1/7 of stake).
+        let tip = node.chain.tip();
+        let small = Vote::sign(&sks[1], tip, 1);
+        assert_eq!(node.add_vote(&small.encode()), (true, None));
+        // Re-sending it is not "new" — that's what kills the gossip loop.
+        assert_eq!(node.add_vote(&small.encode()), (false, None));
+        assert_eq!(node.chain.finalized(), None);
+
+        // The whale votes through cast_vote: 6/7 pooled → certificate forms.
+        node.set_validator_key(sks[0].clone());
+        let (vote_bytes, cert) = node.cast_vote().expect("whale is a staked validator");
+        assert!(!vote_bytes.is_empty());
+        let cert = cert.expect("whale's stake crosses 2/3");
+        assert_eq!(node.chain.finalized(), Some((1, tip)));
+
+        // A second node adopts the certificate wholesale — and only once.
+        let mut chain2 =
+            Blockchain::genesis_with_public(&[], &premine, DEFAULT_DIFFICULTY);
+        chain2.apply_block(&Block::decode(&b1.encode()).unwrap()).unwrap();
+        let mut node2 = NodeState::new(chain2);
+        assert!(node2.accept_cert(&cert));
+        assert_eq!(node2.chain.finalized(), Some((1, tip)));
+        assert!(!node2.accept_cert(&cert), "replays don't re-flood");
+
+        // Votes at or below the watermark are ignored (pool stays clean).
+        let late = Vote::sign(&sks[2], tip, 1);
+        assert_eq!(node.add_vote(&late.encode()), (false, None));
+
+        // A non-validator (or unstaked) node never casts.
+        let mut idle = NodeState::new(Blockchain::genesis_with_public(
+            &[],
+            &premine,
+            DEFAULT_DIFFICULTY,
+        ));
+        assert!(idle.cast_vote().is_none(), "no key, no vote");
+        idle.set_validator_key(SecretKey::random(&mut rng));
+        assert!(idle.cast_vote().is_none(), "unstaked key's vote is refused");
+    }
+
+    #[test]
+    fn vote_gossip_finalizes_over_tcp() {
+        use lat_crypto::SecretKey;
+        use lat_chain::MIN_VALIDATOR_STAKE;
+
+        // A server node whose sole validator (100% of stake) is staked in
+        // block 1; a client pushes the validator's vote over the wire and the
+        // server forms the certificate, queryable via GetFinalized.
+        let sk = SecretKey::random(&mut OsRng);
+        let id = sk.public_key().to_bytes();
+        let mut chain = Blockchain::genesis_with_public(
+            &[],
+            &[(id, 10 * MIN_VALIDATOR_STAKE)],
+            DEFAULT_DIFFICULTY,
+        );
+        let mut tx = Transaction::Stake {
+            validator: id,
+            amount: MIN_VALIDATOR_STAKE,
+            nonce: 0,
+            sig: [0u8; 64],
+        };
+        let sig = sk.sign(&tx.signing_bytes()).to_bytes();
+        if let Transaction::Stake { sig: s, .. } = &mut tx {
+            *s = sig;
+        }
+        let b1 = chain.mine(vec![tx]);
+        chain.apply_block(&b1).unwrap();
+        let tip = chain.tip();
+
+        let server = shared(chain);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        serve(listener, Arc::clone(&server));
+
+        assert_eq!(get_finalized(addr).unwrap(), None);
+        let vote = Vote::sign(&sk, tip, 1);
+        assert!(announce_vote(addr, &vote.encode()).unwrap(), "vote newly pooled");
+        assert_eq!(get_finalized(addr).unwrap(), Some((1, tip)), "certified over the wire");
+        // The same vote again is not new (gossip dies out).
+        assert!(!announce_vote(addr, &vote.encode()).unwrap());
+    }
 
     fn fresh_chain() -> Blockchain {
         Blockchain::genesis(&[(PREMINE_ID, 100)], DEFAULT_DIFFICULTY)

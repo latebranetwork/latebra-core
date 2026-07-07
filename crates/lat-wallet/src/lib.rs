@@ -91,6 +91,12 @@ impl Wallet {
         hex::encode(self.seed)
     }
 
+    /// The wallet's secret key — e.g. to sign finality votes when the account
+    /// runs as a validator (T14). Guard it like the seed.
+    pub fn secret_key(&self) -> &SecretKey {
+        &self.secret
+    }
+
     /// This wallet's address.
     pub fn address(&self) -> Address {
         Address::new(self.network, self.secret.public_key())
