@@ -310,9 +310,16 @@ fn main() {
         });
     }
 
+    // A validator re-votes for its booted tip right away (T16): after a
+    // restart, its earlier votes are gone from every pool, and a quorum that
+    // never converged needs the periodic heartbeat re-cast below too (the
+    // vote pool dedups, so this never spams).
+    cast_and_announce_vote(&node);
+
     // Heartbeat — keep the process alive and show liveness.
     loop {
         thread::sleep(Duration::from_secs(15));
+        cast_and_announce_vote(&node);
         let n = lock_node(&node);
         let (h, p) = (n.chain.height(), n.peers().len());
         drop(n);

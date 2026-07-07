@@ -130,7 +130,9 @@ impl Wallet {
             | Transaction::PublicTransfer { sig, .. }
             | Transaction::Shield { sig, .. }
             | Transaction::Unshield { sig, .. }
-            | Transaction::ShieldStealth { sig, .. } => *sig = sig_bytes,
+            | Transaction::ShieldStealth { sig, .. }
+            | Transaction::Stake { sig, .. }
+            | Transaction::Unstake { sig, .. } => *sig = sig_bytes,
             _ => {}
         }
         tx
@@ -526,6 +528,18 @@ impl Wallet {
             nonce,
             sig: [0u8; 64],
         })
+    }
+
+    /// Build a signed `Stake` (T13): bond `amount` public LAT into this
+    /// account's validator stake. `amount = 0` claims matured unbonding funds.
+    pub fn stake_tx(&self, amount: u64, nonce: u64) -> Transaction {
+        self.sign_tx(Transaction::Stake { validator: self.id(), amount, nonce, sig: [0u8; 64] })
+    }
+
+    /// Build a signed `Unstake` (T13): begin unbonding `amount` of this
+    /// account's stake (released after the unbonding window).
+    pub fn unstake_tx(&self, amount: u64, nonce: u64) -> Transaction {
+        self.sign_tx(Transaction::Unstake { validator: self.id(), amount, nonce, sig: [0u8; 64] })
     }
 
     /// Build a solvent transfer from data fetched over RPC (balance ciphertext +

@@ -2,7 +2,7 @@
 
 > Living document. Paste "continue from the latest checkpoint" in a new
 > conversation and work resumes from the **Current Task** below.
-> Last updated: 2026-07-07 (Checkpoint 13 — T14/T15 hybrid finality + fork choice).
+> Last updated: 2026-07-07 (Checkpoint 14 — T16 slashing + validator ops; M3 complete).
 
 ## 0. Mission
 
@@ -255,7 +255,7 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
   ineligible-fallback path; `lat-attack` red-team green (same checks, just
   scheduled earlier).  ← T8
 
-### M3 — Consensus & finality (BFT-PoS)
+### M3 — Consensus & finality (BFT-PoS) (COMPLETE 2026-07-07, hybrid form)
 - [x] **T13 Validator set + staking module.** New transparent transactions
   `Stake`/`Unstake` (wire tags 0x0C/0x0D; Schnorr-signed, nonce-bound, LAT
   only). Stake bonds from the public balance into a validator record
@@ -300,7 +300,24 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
   test: a 2× heavier rival forking below the watermark is refused; forks
   above it reorg normally. Reorg adoption clears the (branch-specific)
   validator-set window and re-records at the new tip.  ← T14
-- [ ] T16 Slashing, epochs, governance parameters.  ← T14
+- [x] **T16 Slashing + validator operations** (M3 COMPLETE 2026-07-07).
+  `Transaction::SlashEvidence` (tag 0x0E, fixed 233 bytes): two signed
+  finality votes by one validator for DIFFERENT blocks at one height — a
+  self-authenticating fraud proof (`finality_vote_signing_bytes` moved to
+  lat-types so the ledger verifies it without a dep cycle), so the tx needs
+  no signature/nonce and anyone may submit it. Penalty: **full burn** of
+  bonded stake AND unbonding entries (the unbonding window exists exactly so
+  the exit door doesn't dodge it); replay finds `NothingToSlash` and is
+  rejected; the offender drops out of every future validator set. Validator
+  UX: `Wallet::{stake_tx, unstake_tx}` + lat-wallet-cli `stake` / `unstake` /
+  `staking` commands, `GetStake` RPC (tags 30/31), LAUNCH.md "Becoming a
+  validator" walkthrough + finality/slash parameter rows. Liveness: a
+  validator re-votes for its tip on boot and on every 15 s heartbeat (the
+  vote pool dedups, so no spam) — restarts and missed gossip converge.
+  Deferred (revisit when real): partial-slash fractions + whistleblower
+  reward, epoch-boundary set snapshots, proposer rotation (meaningless while
+  PoW produces), governance parameters (there is no on-chain governance to
+  parameterize yet).  ← T14
 
 ### M4 — Networking
 - [ ] T17 Efficient block/tx propagation (structured gossip) + compression.  ← T14
@@ -415,6 +432,14 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
     cast_vote}`; `Msg::FinalityVote`/`FinalityCert`/`GetFinalized` (26–29);
     `announce_vote`/`announce_cert`/`get_finalized` client fns.
   - `lat-wallet`: `Wallet::secret_key()`. `latebrad --validator`.
+- T16 slashing + validator ops:
+  - `lat-types`: `finality_vote_signing_bytes` (moved from lat-chain),
+    `Transaction::SlashEvidence { validator, height, block_a, sig_a, block_b,
+    sig_b }` (tag 0x0E, 233 bytes, unsigned — self-authenticating).
+  - `lat-state`: `LedgerError::{BadEvidence, NothingToSlash}`.
+  - `lat-wallet`: `stake_tx`/`unstake_tx`; CLI `stake`/`unstake`/`staking`.
+  - `lat-p2p`: `Msg::GetStake`/`StakeReply` (30/31), `get_stake` client;
+    `lat-chain`: `Blockchain::{staked, unbonding}`.
 
 ## 8. Known limitations / follow-ups
 
@@ -442,26 +467,21 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
 
 ## 9. Current Task
 
-**T16 — Slashing, validator operations, and finality hardening** (T14/T15's
-hybrid finality is in; this closes M3). The v1 gaps, in priority order:
-(1) **equivocation slashing** — two valid votes by one validator for
-different blocks at the same height are a self-contained fraud proof (both
-sigs verify); add a `SlashEvidence` transaction that burns (part of) the
-offender's bonded stake; the unbonding window (T13) is what makes this bite.
-(2) **Validator operations UX** — there is currently NO way to send a
-`Stake` tx from any wallet: add `stake`/`unstake` commands to lat-wallet-cli
-(and the web wallet), so a testnet operator can actually become a validator
-(today only a hand-crafted tx can). Miner rewards are confidential — staking
-needs public LAT (faucet or unshield first); document the onboarding path in
-LAUNCH.md. (3) **Vote-on-sync gaps** — a validator votes on tips it adopts;
-consider re-voting on restart and a periodic re-cast so a quorum that missed
-each other's votes converges. (4) Epoch-boundary set snapshots (bind the set
-at epoch starts rather than per block) if vote volume matters. Free Stake(0)
-tx spam is nonce+registration-PoW bounded — revisit with a fee floor if it
-shows up in practice.
+**T17 — Efficient block/tx propagation** (M4; M3 complete in hybrid form).
+Today's gossip re-sends FULL blocks to every peer (flood), transactions are
+only pulled implicitly via blocks, and a mempool tx reaches other nodes only
+if the submitting wallet sends it to each. Goals: (1) **tx gossip** — a
+`NewTx` flood-once message so a tx submitted to one node reaches every
+miner's mempool; (2) **compact block announces** — announce (id, height)
+first, peers fetch the body only if unknown (saves re-sending 100-KB blocks
+to nodes that already have them); (3) dedup/rate bookkeeping per peer.
+Simple, high-value, and self-contained in lat-p2p. Then **T18 DNS seeds +
+bootstrap** (needs deploy-time hostnames — coordinate with the user's
+deployment) and **T19 fast sync** (records-based state sync using the T7
+anchor + SMT proofs — the deferred half of T7, now unblocked by finality
+giving light verification a trust root).
 
-Alternative order: T17 (gossip efficiency) / T18 (DNS seeds) to round out
-networking, or T22 (Docker/CI) for launch ops.
+Alternative order: T22 (Docker/CI) if launch ops become urgent.
 
 ### Build/verify commands
 - Tests: `cargo test -p lat-store` (+ per-crate as tasks land).

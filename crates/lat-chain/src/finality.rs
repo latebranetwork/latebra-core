@@ -31,18 +31,9 @@
 
 use lat_crypto::{PublicKey, SecretKey, Signature};
 
-/// Domain tag for vote signatures, so a vote can never double as any other
-/// kind of signed message (and vice versa).
-const VOTE_DOMAIN: &[u8; 16] = b"LAT-finality-v1\0";
-
-/// The bytes a finality vote signs: domain ‖ block id ‖ height.
-pub fn vote_signing_bytes(block_id: &[u8; 32], height: u64) -> Vec<u8> {
-    let mut v = Vec::with_capacity(16 + 32 + 8);
-    v.extend_from_slice(VOTE_DOMAIN);
-    v.extend_from_slice(block_id);
-    v.extend_from_slice(&height.to_le_bytes());
-    v
-}
+/// The bytes a finality vote signs — defined in lat-types so the ledger can
+/// verify `SlashEvidence` (T16) without a dependency cycle.
+pub use lat_types::finality_vote_signing_bytes as vote_signing_bytes;
 
 /// One validator's signed attestation: "the block `block_id` at `height` is
 /// on my adopted chain".

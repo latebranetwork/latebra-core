@@ -395,6 +395,10 @@ enum Msg {
     /// Reply: the finalized `(height, block id)`, or `None` if nothing has
     /// been certified yet.
     FinalizedReply(Option<(u64, [u8; 32])>),
+    /// RPC: ask for an account's staking state (T13/T16).
+    GetStake([u8; 32]),
+    /// Reply: `(bonded stake, unbonding entries as (amount, release height))`.
+    StakeReply(u64, Vec<(u64, u64)>),
 }
 
 /// Cap on ring candidates returned by one RPC (bounds the reply size; well
@@ -567,6 +571,19 @@ impl Msg {
                     None => v.push(0),
                 }
             }
+            Msg::GetStake(id) => {
+                v.push(30);
+                v.extend_from_slice(id);
+            }
+            Msg::StakeReply(staked, unbonding) => {
+                v.push(31);
+                v.extend_from_slice(&staked.to_le_bytes());
+                v.extend_from_slice(&(unbonding.len() as u32).to_le_bytes());
+                for (amount, release) in unbonding {
+                    v.extend_from_slice(&amount.to_le_bytes());
+                    v.extend_from_slice(&release.to_le_bytes());
+                }
+            }
             Msg::HasContract(id) => {
                 v.push(25);
                 v.extend_from_slice(id);
@@ -698,6 +715,24 @@ impl Msg {
             26 => Msg::FinalityVote(rest.to_vec()),
             27 => Msg::FinalityCert(rest.to_vec()),
             28 => Msg::GetFinalized,
+            30 => Msg::GetStake(rest.get(0..32)?.try_into().ok()?),
+            31 => {
+                let staked = u64::from_le_bytes(rest.get(0..8)?.try_into().ok()?);
+                let count = u32::from_le_bytes(rest.get(8..12)?.try_into().ok()?) as usize;
+                let mut unbonding = Vec::new();
+                let mut off = 12;
+                for _ in 0..count {
+                    unbonding.push((
+                        u64::from_le_bytes(rest.get(off..off + 8)?.try_into().ok()?),
+                        u64::from_le_bytes(rest.get(off + 8..off + 16)?.try_into().ok()?),
+                    ));
+                    off += 16;
+                }
+                if off != rest.len() {
+                    return None;
+                }
+                Msg::StakeReply(staked, unbonding)
+            }
             29 => match rest.first()? {
                 0 => Msg::FinalizedReply(None),
                 1 => Msg::FinalizedReply(Some((
@@ -812,6 +847,10 @@ fn handle_conn(mut stream: TcpStream, node: SharedNode) -> io::Result<()> {
                 Msg::Ack(advanced)
             }
             Msg::GetFinalized => Msg::FinalizedReply(lock_node(&node).chain.finalized()),
+            Msg::GetStake(id) => {
+                let n = lock_node(&node);
+                Msg::StakeReply(n.chain.staked(&id), n.chain.unbonding(&id))
+            }
             // --- peer exchange ---
             Msg::Hello(addr) => Msg::Ack(lock_node(&node).add_peer(&addr)),
             Msg::GetPeers => Msg::Peers(lock_node(&node).peers()),
@@ -977,6 +1016,17 @@ pub fn announce_vote<A: ToSocketAddrs>(addr: A, vote_bytes: &[u8]) -> io::Result
     match read_msg(&mut stream)? {
         Msg::Ack(ok) => Ok(ok),
         _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected ack")),
+    }
+}
+
+/// Ask a node for an account's staking state: `(bonded stake, unbonding
+/// entries as (amount, release height))`.
+pub fn get_stake<A: ToSocketAddrs>(addr: A, id: [u8; 32]) -> io::Result<(u64, Vec<(u64, u64)>)> {
+    let mut stream = connect_timeout(addr)?;
+    write_msg(&mut stream, &Msg::GetStake(id))?;
+    match read_msg(&mut stream)? {
+        Msg::StakeReply(staked, unbonding) => Ok((staked, unbonding)),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected stake reply")),
     }
 }
 

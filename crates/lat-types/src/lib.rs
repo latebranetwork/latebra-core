@@ -245,6 +245,22 @@ pub enum Transaction {
         /// Schnorr signature by `validator` over the signing bytes.
         sig: [u8; 64],
     },
+    /// **Slash evidence** (T16): proof that `validator` equivocated — signed
+    /// finality votes for TWO different blocks at the same height. The
+    /// evidence is self-authenticating (both signatures verify against
+    /// [`finality_vote_signing_bytes`]), so the transaction itself needs no
+    /// signature or nonce: anyone may submit it, and it burns the offender's
+    /// entire bonded stake AND unbonding entries (the unbonding window exists
+    /// exactly so misbehavior stays punishable). Replays find nothing left to
+    /// slash and are rejected.
+    SlashEvidence {
+        validator: [u8; 32],
+        height: u64,
+        block_a: [u8; 32],
+        sig_a: [u8; 64],
+        block_b: [u8; 32],
+        sig_b: [u8; 64],
+    },
 }
 
 impl Transaction {
@@ -383,6 +399,17 @@ impl Transaction {
                 v.extend_from_slice(&amount.to_le_bytes());
                 v.extend_from_slice(&nonce.to_le_bytes());
                 v.extend_from_slice(sig);
+                v
+            }
+            Transaction::SlashEvidence { validator, height, block_a, sig_a, block_b, sig_b } => {
+                let mut v = Vec::with_capacity(1 + 32 + 8 + 32 + 64 + 32 + 64);
+                v.push(0x0E);
+                v.extend_from_slice(validator);
+                v.extend_from_slice(&height.to_le_bytes());
+                v.extend_from_slice(block_a);
+                v.extend_from_slice(sig_a);
+                v.extend_from_slice(block_b);
+                v.extend_from_slice(sig_b);
                 v
             }
         }
@@ -548,9 +575,33 @@ impl Transaction {
                     Transaction::Unstake { validator, amount, nonce, sig }
                 })
             }
+            0x0E => {
+                if rest.len() != 32 + 8 + 32 + 64 + 32 + 64 {
+                    return None;
+                }
+                Some(Transaction::SlashEvidence {
+                    validator: rest.get(0..32)?.try_into().ok()?,
+                    height: u64::from_le_bytes(rest.get(32..40)?.try_into().ok()?),
+                    block_a: rest.get(40..72)?.try_into().ok()?,
+                    sig_a: rest.get(72..136)?.try_into().ok()?,
+                    block_b: rest.get(136..168)?.try_into().ok()?,
+                    sig_b: rest.get(168..232)?.try_into().ok()?,
+                })
+            }
             _ => None,
         }
     }
+}
+
+/// The bytes a T14 finality vote signs: domain ‖ block id ‖ height. Lives here
+/// (not lat-chain) so the ledger can verify [`Transaction::SlashEvidence`]
+/// without a dependency cycle — the chain's finality module reuses it.
+pub fn finality_vote_signing_bytes(block_id: &[u8; 32], height: u64) -> Vec<u8> {
+    let mut v = Vec::with_capacity(16 + 32 + 8);
+    v.extend_from_slice(b"LAT-finality-v1\0");
+    v.extend_from_slice(block_id);
+    v.extend_from_slice(&height.to_le_bytes());
+    v
 }
 
 /// Normalize a ticker to its canonical form: strip a leading `$`, uppercase, and

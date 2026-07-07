@@ -410,9 +410,9 @@ fn tx_involves(tx: &Transaction, id: &[u8; 32]) -> bool {
         // ring members are visible (as the anonymity set), but membership is
         // not involvement, so an anonymous transfer never links to an address.
         Transaction::AnonTransfer { .. } => false,
-        Transaction::Stake { validator, .. } | Transaction::Unstake { validator, .. } => {
-            validator == id
-        }
+        Transaction::Stake { validator, .. }
+        | Transaction::Unstake { validator, .. }
+        | Transaction::SlashEvidence { validator, .. } => validator == id,
     }
 }
 
@@ -572,6 +572,7 @@ fn tag(tx: &Transaction) -> (&'static str, &'static str) {
         Transaction::AnonTransfer { .. } => ("xfer", "Anonymous Transfer"),
         Transaction::Stake { .. } => ("stake", "Stake"),
         Transaction::Unstake { .. } => ("stake", "Unstake"),
+        Transaction::SlashEvidence { .. } => ("stake", "Slash"),
     }
 }
 
@@ -621,6 +622,10 @@ fn tx_detail(tx: &Transaction) -> (String, String) {
         Transaction::Unstake { validator, amount, .. } => (
             format!("{} unbonds", short(validator)),
             format!("<span class='pill-amt'>{}</span> unstake", commafy(*amount)),
+        ),
+        Transaction::SlashEvidence { validator, height, .. } => (
+            format!("{} slashed", short(validator)),
+            format!("equivocation at height {height} — stake burned"),
         ),
     }
 }
@@ -775,6 +780,7 @@ fn feed_badge(tx: &Transaction) -> (&'static str, &'static str) {
         Transaction::CallContract { .. } => ("b-ct", "Call"),
         Transaction::Stake { .. } => ("b-pub", "Stake"),
         Transaction::Unstake { .. } => ("b-pub", "Unstake"),
+        Transaction::SlashEvidence { .. } => ("b-reg", "Slash"),
     }
 }
 
@@ -797,6 +803,7 @@ fn feed_amount(tx: &Transaction) -> String {
         Transaction::Stake { amount, .. } | Transaction::Unstake { amount, .. } => {
             format!("<span class='tamt'>{} LAT</span>", fmt_lat(*amount))
         }
+        Transaction::SlashEvidence { .. } => "<span class='tamt muted'>burned</span>".to_string(),
     }
 }
 

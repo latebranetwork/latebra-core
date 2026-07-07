@@ -32,12 +32,39 @@ automatically. These are the consensus/economic constants as shipped:
 | Min validator stake | 1,000 LAT (`MIN_VALIDATOR_STAKE`) | lat-state |
 | Unbonding window | 240 blocks (`UNBONDING_BLOCKS`) | lat-state |
 | Max validators | 64 (`MAX_VALIDATORS`) | lat-state |
+| Finality quorum | strictly > 2/3 of bonded stake | lat-chain |
+| Finality set window | 64 blocks (`FINALITY_SET_WINDOW`) | lat-chain |
+| Slash penalty (equivocation) | full burn: bonded stake + unbonding | lat-state |
 
 **Mainnet must additionally decide a validator genesis** (T13/T14): with the
 testnet premine, the genesis wallet can trivially hold every validator seat.
 A real launch needs a deliberate initial stake distribution (or a PoW→PoS
-transition height) before BFT-PoS finality (T14) activates — revisit all three
-staking parameters at the same time.
+transition height) before BFT-PoS finality (T14) activates — revisit the
+staking + finality parameters at the same time.
+
+### Becoming a validator (testnet)
+
+Finality (T14) is live but opt-in: with no stake bonded the network is pure
+PoW. To run a validator:
+
+1. Get **public** LAT (staking spends the transparent balance; miner rewards
+   are confidential — `unshield` them first, or use the faucet):
+   `lat-wallet balance --seed <hex>`
+2. Bond at least the minimum stake:
+   `lat-wallet stake --seed <hex> --amount 1000`
+3. Restart your node with `--validator` (it votes with the **miner wallet**'s
+   key, so stake THAT wallet's account):
+   `latebrad --mine --validator --data ... --listen ...`
+4. Check it: `lat-wallet staking --seed <hex>` shows the bond;
+   the node log prints `[finality] height N finalized` once a >2/3 quorum of
+   stake has voted; peers expose it via the `GetFinalized` RPC.
+5. Leave with `lat-wallet unstake --amount <LAT>`, wait out the unbonding
+   window, then claim with `lat-wallet stake --amount 0`.
+
+**Equivocation is fatal**: signing finality votes for two different blocks at
+one height is provable by anyone (`SlashEvidence` transaction) and burns the
+offender's entire bond, including funds still unbonding. Run ONE node per
+validator key.
 
 Testnet genesis (in `latebrad`) — **well-known, testnet-only secrets**:
 

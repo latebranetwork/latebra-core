@@ -302,6 +302,12 @@ pub enum LedgerError {
     StaleRingBalance,
     /// An `Unstake` asked for more than the validator's bonded stake.
     InsufficientStake,
+    /// A `SlashEvidence` transaction is not a valid equivocation proof (same
+    /// block twice, a bad signature, or a key that doesn't decode).
+    BadEvidence,
+    /// Valid evidence, but the named validator holds no stake and no
+    /// unbonding funds — already slashed (a replay) or never bonded.
+    NothingToSlash,
 }
 
 impl Ledger {
@@ -701,6 +707,9 @@ impl Ledger {
             }
             Transaction::Stake { validator, .. } | Transaction::Unstake { validator, .. } => {
                 vec![DirtyKey::Account(*validator), DirtyKey::Validator(*validator)]
+            }
+            Transaction::SlashEvidence { validator, .. } => {
+                vec![DirtyKey::Validator(*validator)]
             }
         }
     }
@@ -1289,6 +1298,37 @@ impl Ledger {
                 acct.nonce += 1;
                 self.put_account(validator, acct);
                 self.put_validator(validator, &val);
+                Ok(())
+            }
+
+            Transaction::SlashEvidence { validator, height: vote_height, block_a, sig_a, block_b, sig_b } => {
+                // Equivocation proof (T16): the same validator signed finality
+                // votes for two DIFFERENT blocks at one height. The evidence
+                // authenticates itself — both signatures must verify — so the
+                // transaction carries no signature or nonce of its own; anyone
+                // may submit it. The penalty burns the offender's entire
+                // bonded stake and every unbonding entry: the unbonding delay
+                // (T13) exists precisely so this can still bite after the
+                // validator heads for the exit.
+                if block_a == block_b {
+                    return Err(LedgerError::BadEvidence);
+                }
+                let pk =
+                    PublicKey::from_bytes(validator).ok_or(LedgerError::BadEvidence)?;
+                for (block, sig) in [(block_a, sig_a), (block_b, sig_b)] {
+                    let sig = Signature::from_bytes(sig).ok_or(LedgerError::BadEvidence)?;
+                    let msg = lat_types::finality_vote_signing_bytes(block, *vote_height);
+                    if !pk.verify(&msg, &sig) {
+                        return Err(LedgerError::BadEvidence);
+                    }
+                }
+                let val = self.validator(validator).unwrap_or_default();
+                if val.staked == 0 && val.unbonding.is_empty() {
+                    return Err(LedgerError::NothingToSlash); // replay or never bonded
+                }
+                // Burn: write the drained record (put_validator deletes it),
+                // removing the offender from every future validator set.
+                self.put_validator(validator, &Validator::default());
                 Ok(())
             }
         }
@@ -2888,6 +2928,73 @@ mod tests {
         assert_eq!(l.staked(&id), 0);
         assert!(l.validator_set().is_empty());
         assert_eq!(l.public_balance(&id, LAT_TOKEN), Some(3 * MIN_VALIDATOR_STAKE));
+    }
+
+    #[test]
+    fn slash_evidence_burns_stake_and_rejects_fabrications() {
+        let mut rng = OsRng;
+        let sk = SecretKey::random(&mut rng);
+        let id = sk.public_key().to_bytes();
+        let mut l = Ledger::new();
+        l.register(id).unwrap();
+        l.credit_public(&id, LAT_TOKEN, 4 * MIN_VALIDATOR_STAKE);
+        l.apply_at(&stake_tx(&sk, 2 * MIN_VALIDATOR_STAKE, 0), 5).unwrap();
+        l.apply_at(&unstake_tx(&sk, MIN_VALIDATOR_STAKE, 1), 6).unwrap();
+        assert_eq!(l.staked(&id), MIN_VALIDATOR_STAKE);
+        assert_eq!(l.unbonding(&id).len(), 1);
+
+        // Equivocation: two finality votes at one height for different blocks.
+        let vote = |block: [u8; 32]| {
+            sk.sign(&lat_types::finality_vote_signing_bytes(&block, 9)).to_bytes()
+        };
+        let evidence = Transaction::SlashEvidence {
+            validator: id,
+            height: 9,
+            block_a: [1u8; 32],
+            sig_a: vote([1u8; 32]),
+            block_b: [2u8; 32],
+            sig_b: vote([2u8; 32]),
+        };
+
+        // Fabrications are rejected before anything burns.
+        let mut same_block = evidence.clone();
+        if let Transaction::SlashEvidence { block_b, sig_b, .. } = &mut same_block {
+            *block_b = [1u8; 32];
+            *sig_b = vote([1u8; 32]);
+        }
+        assert_eq!(l.apply_at(&same_block, 10), Err(LedgerError::BadEvidence));
+        let mut bad_sig = evidence.clone();
+        if let Transaction::SlashEvidence { sig_b, .. } = &mut bad_sig {
+            sig_b[0] ^= 1;
+        }
+        assert_eq!(l.apply_at(&bad_sig, 10), Err(LedgerError::BadEvidence));
+
+        // Real evidence burns bonded stake AND unbonding entries; the public
+        // balance is untouched (the bond is what's at risk).
+        let root_before = l.state_root();
+        l.apply_at(&evidence, 10).unwrap();
+        assert_eq!(l.staked(&id), 0);
+        assert!(l.unbonding(&id).is_empty());
+        assert!(l.validator_set().is_empty());
+        assert_eq!(l.public_balance(&id, LAT_TOKEN), Some(2 * MIN_VALIDATOR_STAKE));
+        assert_ne!(l.state_root(), root_before, "slashing is committed state");
+
+        // Replaying the same evidence finds nothing to slash.
+        assert_eq!(l.apply_at(&evidence, 11), Err(LedgerError::NothingToSlash));
+        // And an unbonded bystander can't be slashed by valid-looking votes.
+        let other = SecretKey::random(&mut rng);
+        let ovote = |block: [u8; 32]| {
+            other.sign(&lat_types::finality_vote_signing_bytes(&block, 9)).to_bytes()
+        };
+        let bystander = Transaction::SlashEvidence {
+            validator: other.public_key().to_bytes(),
+            height: 9,
+            block_a: [1u8; 32],
+            sig_a: ovote([1u8; 32]),
+            block_b: [2u8; 32],
+            sig_b: ovote([2u8; 32]),
+        };
+        assert_eq!(l.apply_at(&bystander, 11), Err(LedgerError::NothingToSlash));
     }
 
     #[test]

@@ -56,6 +56,9 @@ fn main() {
         "unshield" => cmd_unshield(&flags, network, &node),
         "scan-stealth" => cmd_scan_stealth(&flags, network, &node),
         "rollover" => cmd_rollover(&flags, network, &node),
+        "stake" => cmd_stake(&flags, network, &node),
+        "unstake" => cmd_unstake(&flags, network, &node),
+        "staking" => cmd_staking(&flags, network, &node),
         _ => {
             usage();
             Ok(())
@@ -81,6 +84,10 @@ fn usage() {
     println!("  unshield      --seed <hex> --to <addr> --amount <LAT> [--fee] [--node]   private → public");
     println!("  scan-stealth  --seed <hex> [--from <height>] [--node]  find stealth funds sent to you");
     println!("  rollover      --seed <hex> [--node]   move pending funds to spendable");
+    println!("  stake         --seed <hex> --amount <LAT> [--node]  bond public LAT as validator stake");
+    println!("                                        (--amount 0 claims matured unbonding funds)");
+    println!("  unstake       --seed <hex> --amount <LAT> [--node]  begin unbonding stake");
+    println!("  staking       --seed <hex> [--node]   show bonded stake + unbonding entries");
     println!("  (add --network mainnet for mainnet addresses; default testnet)");
 }
 
@@ -186,6 +193,44 @@ fn cmd_rollover(flags: &HashMap<String, String>, network: Network, node: &str) -
     let nonce = nonce_of(node, &w)?;
     let tx = w.rollover_tx(nonce);
     submit(node, &tx, "rollover")
+}
+
+fn cmd_stake(flags: &HashMap<String, String>, network: Network, node: &str) -> Result<(), String> {
+    let w = wallet(flags, network)?;
+    // --amount 0 is meaningful (claim matured unbonding funds), so it is
+    // required but may be zero.
+    let amount = parse_lat(flags.get("amount").ok_or("missing --amount <LAT> (0 = claim matured unbonding funds)")?)?;
+    let nonce = nonce_of(node, &w)?;
+    let tx = w.stake_tx(amount, nonce);
+    if amount == 0 {
+        println!("Claiming matured unbonding funds (stake unchanged)");
+    } else {
+        println!("Bonding {} as validator stake (from your PUBLIC balance)", lat(amount));
+    }
+    submit(node, &tx, "stake")
+}
+
+fn cmd_unstake(flags: &HashMap<String, String>, network: Network, node: &str) -> Result<(), String> {
+    let w = wallet(flags, network)?;
+    let amount = require_amount(flags)?;
+    let nonce = nonce_of(node, &w)?;
+    let tx = w.unstake_tx(amount, nonce);
+    println!("Unbonding {} (released after the unbonding window; claim with `stake --amount 0`)", lat(amount));
+    submit(node, &tx, "unstake")
+}
+
+fn cmd_staking(flags: &HashMap<String, String>, network: Network, node: &str) -> Result<(), String> {
+    let w = wallet(flags, network)?;
+    let (staked, unbonding) = lat_p2p::get_stake(node, w.id()).map_err(net_err(node))?;
+    println!("Bonded stake : {}", lat(staked));
+    if unbonding.is_empty() {
+        println!("Unbonding    : none");
+    } else {
+        for (amount, release) in unbonding {
+            println!("Unbonding    : {} (releases at height {release})", lat(amount));
+        }
+    }
+    Ok(())
 }
 
 fn cmd_send(flags: &HashMap<String, String>, network: Network, node: &str) -> Result<(), String> {

@@ -920,6 +920,16 @@ impl Blockchain {
         self.active_chain.get(height as usize).copied()
     }
 
+    /// An account's bonded validator stake (0 if none) — T13.
+    pub fn staked(&self, id: &[u8; 32]) -> u64 {
+        self.active_state.staked(id)
+    }
+
+    /// An account's unbonding entries as `(amount, release height)` — T13.
+    pub fn unbonding(&self, id: &[u8; 32]) -> Vec<(u64, u64)> {
+        self.active_state.unbonding(id)
+    }
+
     pub fn height(&self) -> u64 {
         self.active_height
     }
