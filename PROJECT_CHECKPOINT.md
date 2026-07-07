@@ -2,7 +2,7 @@
 
 > Living document. Paste "continue from the latest checkpoint" in a new
 > conversation and work resumes from the **Current Task** below.
-> Last updated: 2026-07-07 (Checkpoint 14 — T16 slashing + validator ops; M3 complete).
+> Last updated: 2026-07-07 (Checkpoint 15 — T17 tx gossip + compact announces; protocol v2).
 
 ## 0. Mission
 
@@ -320,7 +320,20 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
   parameterize yet).  ← T14
 
 ### M4 — Networking
-- [ ] T17 Efficient block/tx propagation (structured gossip) + compression.  ← T14
+- [x] **T17 Tx gossip + compact block announces.** (1) `Msg::NewTx` (tag 32):
+  transactions flood node-to-node with the same flood-once semantics as
+  blocks — and a wallet's `SubmitTx` now triggers the same forward, so a tx
+  submitted to ANY node reaches every miner's mempool (previously it only
+  ever sat in the one node it was sent to). Dedup = the mempool's duplicate
+  check. (2) `Msg::BlockAnnounce { id, height }` (tag 33): announce ~40 bytes
+  first; the peer replies "send it" only if it lacks the block, so gossip to
+  peers that already hold a block costs an announce, not a re-transmitted
+  body. Both the miner's announce and the relay path use it. Proven by a TCP
+  test that offers a GARBAGE body with a known id — never read — vs an
+  unknown id — fetched and rejected. `PROTOCOL_VERSION` bumped 1→2 (the
+  handshake refuses old nodes; all testnet binaries must be rebuilt
+  together). Deferred: compression (blocks are small until traffic says
+  otherwise), set-reconciliation gossip (Erlay-style) at real scale.  ← T14
 - [ ] T18 Peer discovery, DNS seeds, bootstrap nodes.
 - [ ] T19 Fast sync + state sync integration.  ← T7, T14
 
@@ -467,21 +480,24 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
 
 ## 9. Current Task
 
-**T17 — Efficient block/tx propagation** (M4; M3 complete in hybrid form).
-Today's gossip re-sends FULL blocks to every peer (flood), transactions are
-only pulled implicitly via blocks, and a mempool tx reaches other nodes only
-if the submitting wallet sends it to each. Goals: (1) **tx gossip** — a
-`NewTx` flood-once message so a tx submitted to one node reaches every
-miner's mempool; (2) **compact block announces** — announce (id, height)
-first, peers fetch the body only if unknown (saves re-sending 100-KB blocks
-to nodes that already have them); (3) dedup/rate bookkeeping per peer.
-Simple, high-value, and self-contained in lat-p2p. Then **T18 DNS seeds +
-bootstrap** (needs deploy-time hostnames — coordinate with the user's
-deployment) and **T19 fast sync** (records-based state sync using the T7
-anchor + SMT proofs — the deferred half of T7, now unblocked by finality
-giving light verification a trust root).
+**T19 — Fast state sync** (T17 done; T18 DNS seeds is deliberately parked:
+it needs real deployment hostnames, which is the user's infra step — the
+code side is a seed-list constant + resolve loop, an hour of work once hosts
+exist). T19 is the deferred network half of T7: a fresh node today replays
+every block (re-verifying every proof) to reach the tip. Goal: download the
+state records at a FINALIZED block instead. Sketch: (1) new P2P messages —
+`GetStateManifest` (reply: finalized block id/height + record count + chunk
+digests), `GetStateChunk(n)` (reply: a contiguous run of Objects records);
+(2) the syncing node rebuilds the commitment from the received records
+(`Ledger::from_records` already does exactly this validation) and accepts
+iff the derived root equals the FINALIZED header's `state_root` — the T14
+certificate is what makes trusting that header sound without replay; (3)
+then tail-sync blocks after the anchor as today. Bound chunk sizes
+(MAX_MSG_BYTES); serve from the durable base (T7 anchor). Honest limit: the
+serving node must still hold the anchor's exact record set — serve only the
+CURRENT anchor.
 
-Alternative order: T22 (Docker/CI) if launch ops become urgent.
+Alternative order: T20 (RPC surface consolidation) or T22 (Docker/CI).
 
 ### Build/verify commands
 - Tests: `cargo test -p lat-store` (+ per-crate as tasks land).

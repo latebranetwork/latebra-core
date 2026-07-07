@@ -26,7 +26,8 @@ use lat_types::Transaction;
 /// P2P protocol version. Nodes refuse to peer across a version mismatch — a
 /// simple guard so an incompatible wire format can't corrupt a sync. Bump it on
 /// any breaking change to the [`Msg`] codec or sync semantics.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// v2: finality gossip (T14/T16) + tx gossip and compact block announces (T17).
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Consecutive contact failures before a peer is evicted from the set. Keeps the
 /// peer list self-healing: a node that goes offline is forgotten instead of
@@ -399,6 +400,16 @@ enum Msg {
     GetStake([u8; 32]),
     /// Reply: `(bonded stake, unbonding entries as (amount, release height))`.
     StakeReply(u64, Vec<(u64, u64)>),
+    /// T17 tx gossip: an encoded transaction, flooding node-to-node so a tx
+    /// submitted anywhere reaches every miner's mempool. Replied with `Ack`
+    /// (whether it was newly added); newly added txs flood on.
+    NewTx(Vec<u8>),
+    /// T17 compact block announce: `(block id, height)`. The receiver replies
+    /// `Ack(true)` iff it does NOT have the block — "send it" — so a ~100-byte
+    /// announce replaces re-transmitting whole blocks to peers that already
+    /// hold them. The announcer follows up with `NewBlock` on the same
+    /// connection when asked.
+    BlockAnnounce { id: [u8; 32], height: u64 },
 }
 
 /// Cap on ring candidates returned by one RPC (bounds the reply size; well
@@ -575,6 +586,15 @@ impl Msg {
                 v.push(30);
                 v.extend_from_slice(id);
             }
+            Msg::NewTx(b) => {
+                v.push(32);
+                v.extend_from_slice(b);
+            }
+            Msg::BlockAnnounce { id, height } => {
+                v.push(33);
+                v.extend_from_slice(id);
+                v.extend_from_slice(&height.to_le_bytes());
+            }
             Msg::StakeReply(staked, unbonding) => {
                 v.push(31);
                 v.extend_from_slice(&staked.to_le_bytes());
@@ -716,6 +736,16 @@ impl Msg {
             27 => Msg::FinalityCert(rest.to_vec()),
             28 => Msg::GetFinalized,
             30 => Msg::GetStake(rest.get(0..32)?.try_into().ok()?),
+            32 => Msg::NewTx(rest.to_vec()),
+            33 => {
+                if rest.len() != 40 {
+                    return None;
+                }
+                Msg::BlockAnnounce {
+                    id: rest.get(0..32)?.try_into().ok()?,
+                    height: u64::from_le_bytes(rest.get(32..40)?.try_into().ok()?),
+                }
+            }
             31 => {
                 let staked = u64::from_le_bytes(rest.get(0..8)?.try_into().ok()?);
                 let count = u32::from_le_bytes(rest.get(8..12)?.try_into().ok()?) as usize;
@@ -799,16 +829,20 @@ fn handle_conn(mut stream: TcpStream, node: SharedNode) -> io::Result<()> {
                 // Was the block new to us? Only then forward it, so a block
                 // floods the network once and gossip loops die out (peers that
                 // already have it don't re-announce).
-                let already_known = Block::decode(&bytes)
-                    .map(|b| lock_node(&node).chain.has_block(&b.header.id()))
+                let header = Block::decode(&bytes).map(|b| (b.header.id(), b.header.height));
+                let already_known = header
+                    .map(|(id, _)| lock_node(&node).chain.has_block(&id))
                     .unwrap_or(false);
                 let ok = lock_node(&node).accept_block_bytes(&bytes);
                 if ok && !already_known {
                     let peers = lock_node(&node).peers();
                     let fwd = bytes.clone();
                     thread::spawn(move || {
+                        // T17: forward compactly — peers that already hold the
+                        // block cost one 40-byte announce, not a whole block.
+                        let (id, height) = header.expect("accepted block decodes");
                         for p in peers {
-                            let _ = announce_block(p.as_str(), &fwd);
+                            let _ = announce_block_compact(p.as_str(), &id, height, &fwd);
                         }
                     });
                 }
@@ -870,12 +904,47 @@ fn handle_conn(mut stream: TcpStream, node: SharedNode) -> io::Result<()> {
                 let common = ids.iter().filter_map(|id| n.chain.active_height_of(id)).max().unwrap_or(0);
                 Msg::CommonHeight(common)
             }
+            // --- T17 tx gossip: flood-once, like NewBlock ---
+            Msg::NewTx(bytes) => {
+                let ok = match Transaction::decode(&bytes) {
+                    Some(tx) => lock_node(&node).submit_tx(tx),
+                    None => false,
+                };
+                if ok {
+                    // Newly added → forward; duplicates return false above,
+                    // which is where the gossip loop dies out.
+                    let peers = lock_node(&node).peers();
+                    thread::spawn(move || {
+                        for p in peers {
+                            let _ = announce_tx(p.as_str(), &bytes);
+                        }
+                    });
+                    Msg::Ack(true)
+                } else {
+                    Msg::Ack(false)
+                }
+            }
+            // --- T17 compact announce: "I have block X" → Ack(true) = send it
+            Msg::BlockAnnounce { id, .. } => {
+                Msg::Ack(!lock_node(&node).chain.has_block(&id))
+            }
             // --- RPC (clients) ---
             Msg::SubmitTx(bytes) => {
                 let ok = match Transaction::decode(&bytes) {
                     Some(tx) => lock_node(&node).submit_tx(tx),
                     None => false,
                 };
+                if ok {
+                    // A wallet submitted this tx to US alone (T17): gossip it
+                    // on so every miner's mempool sees it, not just ours.
+                    let peers = lock_node(&node).peers();
+                    let fwd = bytes.clone();
+                    thread::spawn(move || {
+                        for p in peers {
+                            let _ = announce_tx(p.as_str(), &fwd);
+                        }
+                    });
+                }
                 Msg::Ack(ok)
             }
             Msg::GetBalance { id, token } => {
@@ -1013,6 +1082,42 @@ pub fn announce_block<A: ToSocketAddrs>(addr: A, block_bytes: &[u8]) -> io::Resu
 pub fn announce_vote<A: ToSocketAddrs>(addr: A, vote_bytes: &[u8]) -> io::Result<bool> {
     let mut stream = connect_timeout(addr)?;
     write_msg(&mut stream, &Msg::FinalityVote(vote_bytes.to_vec()))?;
+    match read_msg(&mut stream)? {
+        Msg::Ack(ok) => Ok(ok),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected ack")),
+    }
+}
+
+/// Push an encoded transaction to a peer's mempool (T17 gossip). `Ok(true)`
+/// iff it was newly added there.
+pub fn announce_tx<A: ToSocketAddrs>(addr: A, tx_bytes: &[u8]) -> io::Result<bool> {
+    let mut stream = connect_timeout(addr)?;
+    write_msg(&mut stream, &Msg::NewTx(tx_bytes.to_vec()))?;
+    match read_msg(&mut stream)? {
+        Msg::Ack(ok) => Ok(ok),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected ack")),
+    }
+}
+
+/// Announce a block compactly (T17): send `(id, height)` first and the full
+/// block only if the peer asks for it. `Ok(true)` iff the peer ended up
+/// accepting the block (or already had it — nothing to do).
+pub fn announce_block_compact<A: ToSocketAddrs>(
+    addr: A,
+    id: &[u8; 32],
+    height: u64,
+    block_bytes: &[u8],
+) -> io::Result<bool> {
+    let mut stream = connect_timeout(addr)?;
+    write_msg(&mut stream, &Msg::BlockAnnounce { id: *id, height })?;
+    let wants = match read_msg(&mut stream)? {
+        Msg::Ack(wants) => wants,
+        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "expected ack")),
+    };
+    if !wants {
+        return Ok(true); // peer already has it
+    }
+    write_msg(&mut stream, &Msg::NewBlock(block_bytes.to_vec()))?;
     match read_msg(&mut stream)? {
         Msg::Ack(ok) => Ok(ok),
         _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected ack")),
@@ -1289,6 +1394,63 @@ mod tests {
         assert!(idle.cast_vote().is_none(), "no key, no vote");
         idle.set_validator_key(SecretKey::random(&mut rng));
         assert!(idle.cast_vote().is_none(), "unstaked key's vote is refused");
+    }
+
+    #[test]
+    fn tx_gossip_reaches_peer_mempools_over_tcp() {
+        // Two serving nodes; B knows A as a peer. A wallet submits one tx to
+        // B alone — T17 gossip must carry it into A's mempool too.
+        let a = shared(fresh_chain());
+        let la = TcpListener::bind("127.0.0.1:0").unwrap();
+        let a_addr = la.local_addr().unwrap();
+        serve(la, Arc::clone(&a));
+
+        let b = shared(fresh_chain());
+        b.lock().unwrap().add_peer(&a_addr.to_string());
+        let lb = TcpListener::bind("127.0.0.1:0").unwrap();
+        let b_addr = lb.local_addr().unwrap();
+        serve(lb, Arc::clone(&b));
+
+        let tx = lat_chain::mine_registration([9u8; 32]);
+        assert!(submit_tx(b_addr, &tx.encode()).unwrap(), "B accepts the wallet submission");
+        // The forward happens on a background thread — poll briefly.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if lock_node(&a).mempool.len() == 1 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "tx never reached A's mempool");
+            thread::sleep(Duration::from_millis(50));
+        }
+        // Re-announcing to A is not new (flood dies out).
+        assert!(!announce_tx(a_addr, &tx.encode()).unwrap());
+    }
+
+    #[test]
+    fn compact_announce_transfers_the_body_only_when_missing() {
+        // A mined one block; B (same genesis) hasn't seen it.
+        let mut chain = fresh_chain();
+        let block = chain.mine(vec![]);
+        chain.apply_block(&block).unwrap();
+        let (id, height, bytes) = (block.header.id(), 1u64, block.encode());
+
+        let b = shared(fresh_chain());
+        let lb = TcpListener::bind("127.0.0.1:0").unwrap();
+        let b_addr = lb.local_addr().unwrap();
+        serve(lb, Arc::clone(&b));
+
+        // Unknown block: B asks for the body and adopts it.
+        assert!(announce_block_compact(b_addr, &id, height, &bytes).unwrap());
+        assert_eq!(lock_node(&b).chain.height(), 1);
+
+        // Known block: B declines the body — proven by sending GARBAGE as the
+        // body, which would be rejected if it were ever transmitted.
+        assert!(
+            announce_block_compact(b_addr, &id, height, b"garbage").unwrap(),
+            "peer that has the block never reads the body"
+        );
+        // Unknown id with a garbage body: B asks, decode fails, Ack(false).
+        assert!(!announce_block_compact(b_addr, &[9u8; 32], 2, b"garbage").unwrap());
     }
 
     #[test]

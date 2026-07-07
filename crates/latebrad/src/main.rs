@@ -38,7 +38,7 @@ use std::thread;
 use std::time::Duration;
 
 use lat_chain::{emission, Blockchain, DEFAULT_DIFFICULTY};
-use lat_p2p::{announce_block, lock_node, serve, sync_shared, NodeState, SharedNode};
+use lat_p2p::{lock_node, serve, sync_shared, NodeState, SharedNode};
 use lat_types::Network;
 use lat_wallet::Wallet;
 
@@ -338,8 +338,13 @@ fn mine_one(node: &SharedNode) {
         };
         let reward = emission(height);
         println!("[mine] new block -> height {height}  reward {}.{:05} LAT", reward / 100_000, reward % 100_000);
-        for peer in peers {
-            let _ = announce_block(peer.as_str(), &bytes);
+        // T17: compact announce — peers that already have the block (e.g. via
+        // another peer's relay) cost one 40-byte message, not the whole block.
+        if let Some(block) = lat_chain::Block::decode(&bytes) {
+            let id = block.header.id();
+            for peer in peers {
+                let _ = lat_p2p::announce_block_compact(peer.as_str(), &id, height, &bytes);
+            }
         }
         cast_and_announce_vote(node);
     }
