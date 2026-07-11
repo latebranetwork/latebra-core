@@ -262,11 +262,13 @@ fn render_block(node: &str, height: u64, net: &str) -> String {
         rows.push_str(&tx_table_row(tx));
     }
 
-    let nav = format!(
-        "<div class='bnav'>{}<span>Block #{height}</span>{}</div>",
-        if height > 0 { format!("<a href='/block/{}?net={net}'>← Prev</a>", height - 1) } else { "<span class='muted'>← Prev</span>".into() },
-        format!("<a href='/block/{}?net={net}'>Next →</a>", height + 1),
-    );
+    let prev = if height > 0 {
+        format!("<a href='/block/{}?net={net}'>← Prev</a>", height - 1)
+    } else {
+        "<span class='muted'>← Prev</span>".into()
+    };
+    let next = format!("<a href='/block/{}?net={net}'>Next →</a>", height + 1);
+    let nav = format!("<div class='bnav'>{prev}<span>Block #{height}</span>{next}</div>");
 
     let body = format!(
         "<div class='wrap' style='padding-top:24px'>
@@ -438,12 +440,10 @@ fn cooldowns() -> &'static Mutex<(HashMap<String, Instant>, Option<Instant>)> {
 
 fn render_faucet(node: &str, net: &str, params: &HashMap<String, String>) -> String {
     if net == "mainnet" {
-        let body = format!(
-            "<div class='wrap' style='padding-top:24px'><div class='card'><div class='ph'>Faucet</div>
+        let body = "<div class='wrap' style='padding-top:24px'><div class='card'><div class='ph'>Faucet</div>
              <div class='kv'><div class='k'>Status</div><div>The faucet is <b>testnet-only</b> — mainnet LAT is never given away.</div></div>
              <div class='kv'><div class='k'>Get testnet LAT</div><div><a href='/faucet?net=testnet'>Switch to the testnet faucet →</a></div></div>
-             </div></div>"
-        );
+             </div></div>".to_string();
         return page("Faucet — Latscan", &body, net, "", false);
     }
 
@@ -1002,7 +1002,7 @@ fn commafy(n: u64) -> String {
     let bytes = s.as_bytes();
     let mut out = String::new();
     for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i) % 3 == 0 {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(*b as char);

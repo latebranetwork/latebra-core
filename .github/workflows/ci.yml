@@ -1,0 +1,45 @@
+# Latebra CI (T22 ops): lint + full test suite on every push/PR.
+#
+# Notes:
+# - `latfun` (the launchpad backend) is excluded like local builds do — it can
+#   hold file locks and is exercised by its own repo's flows.
+# - rustfmt is NOT enforced: the codebase predates a fmt pass, and reformatting
+#   18k LOC before the external audit would destroy git blame. Revisit after.
+# - clippy denies all warnings except the two structural style lints
+#   (type_complexity, too_many_arguments) which are accepted as-is in consensus
+#   code where splitting hurts readability.
+
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (deny warnings)
+        run: >
+          cargo clippy --workspace --exclude latfun --all-targets --
+          -A clippy::type-complexity -A clippy::too-many-arguments -D warnings
+      - name: tests
+        run: cargo test --workspace --exclude latfun
+      - name: release build (node daemon)
+        run: cargo build --release -p latebrad
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker image builds
+        run: docker build -t latebra .

@@ -1,0 +1,70 @@
+# Latebra multi-node testnet in one command (T22 ops):
+#
+#   docker compose up --build
+#
+# Topology: one mining validator + two syncing followers (the second follower
+# exercises T19 fast sync + peer exchange: it only knows node-b, and discovers
+# the miner through it), plus the block explorer on http://localhost:8080.
+#
+# Every node's /status endpoint is published on the host:
+#   miner  → http://localhost:4090/status
+#   node-b → http://localhost:4091/status
+#   node-c → http://localhost:4092/status
+
+services:
+  miner:
+    build: .
+    command: >
+      --mine --validator
+      --data /data/chain.db
+      --listen 0.0.0.0:4040 --public-addr miner:4040
+      --metrics 0.0.0.0:4090
+    ports:
+      - "4040:4040"
+      - "4090:4090"
+    volumes:
+      - miner-data:/data
+
+  node-b:
+    build: .
+    command: >
+      --data /data/chain.db
+      --listen 0.0.0.0:4040 --public-addr node-b:4040
+      --peer miner:4040
+      --metrics 0.0.0.0:4090
+    ports:
+      - "4041:4040"
+      - "4091:4090"
+    volumes:
+      - node-b-data:/data
+    depends_on:
+      - miner
+
+  node-c:
+    build: .
+    command: >
+      --data /data/chain.db
+      --listen 0.0.0.0:4040 --public-addr node-c:4040
+      --peer node-b:4040
+      --metrics 0.0.0.0:4090
+    ports:
+      - "4042:4040"
+      - "4092:4090"
+    volumes:
+      - node-c-data:/data
+    depends_on:
+      - node-b
+
+  explorer:
+    build: .
+    entrypoint: ["lat-explorer"]
+    command: ["--listen", "0.0.0.0:8080", "--testnet", "miner:4040"]
+    ports:
+      - "8080:8080"
+    depends_on:
+      - miner
+
+volumes:
+  miner-data:
+  node-b-data:
+  node-c-data:

@@ -66,6 +66,9 @@ struct Config {
     peers: Vec<String>,
     mine: bool,
     mine_blocks: Option<u64>,
+    /// T22 ops: HTTP status/metrics address, or "off". Serves GET /status
+    /// (JSON) and GET /metrics (Prometheus text) for monitoring/auditing.
+    metrics: String,
     /// Keep every historical state root (no trie pruning).
     archive: bool,
     /// Vote for finality with the miner wallet's key (T14). The account must
@@ -88,6 +91,7 @@ fn parse_config() -> Config {
         mine_blocks: None,
         archive: false,
         validator: false,
+        metrics: "127.0.0.1:4090".to_string(),
     };
     let args: Vec<String> = env::args().skip(1).collect();
     let mut i = 0;
@@ -110,6 +114,10 @@ fn parse_config() -> Config {
             "--public-addr" => {
                 i += 1;
                 cfg.public_addr = args.get(i).cloned();
+            }
+            "--metrics" => {
+                i += 1;
+                cfg.metrics = args.get(i).cloned().unwrap_or_else(|| "off".to_string());
             }
             "--mine" => cfg.mine = true,
             "--archive" => cfg.archive = true,
@@ -142,6 +150,8 @@ fn print_usage() {
     println!("                        retaining the last {PRUNE_WINDOW} block state-roots)");
     println!("  --validator           vote for finality with the miner wallet's key");
     println!("                        (the account must be staked via a Stake tx)");
+    println!("  --metrics <addr|off>  HTTP /status (JSON) + /metrics (Prometheus)");
+    println!("                        (default 127.0.0.1:4090)");
 }
 
 fn main() {
@@ -237,6 +247,18 @@ fn main() {
     println!("  listening on: {}", cfg.listen);
     println!("  public addr : {public_addr}");
     serve(listener, Arc::clone(&node));
+
+    // T22 ops: HTTP status/metrics for monitoring (loopback by default —
+    // exposing it publicly is an operator decision via --metrics 0.0.0.0:...).
+    if cfg.metrics != "off" {
+        match TcpListener::bind(&cfg.metrics) {
+            Ok(l) => {
+                println!("  metrics     : http://{}/status", cfg.metrics);
+                serve_metrics(l, Arc::clone(&node));
+            }
+            Err(e) => eprintln!("warning: metrics disabled ({}: {e})", cfg.metrics),
+        }
+    }
 
     // One-shot mining mode (for demos / tests): mine n blocks, then exit.
     if let Some(n) = cfg.mine_blocks {
@@ -342,6 +364,105 @@ fn main() {
         drop(n);
         println!("[heartbeat] height={h} peers={p}");
     }
+}
+
+/// T22 ops: serve GET `/status` (JSON) and GET `/metrics` (Prometheus text
+/// exposition) so monitoring and auditors can watch node health without the
+/// binary P2P protocol. Read-only; every request takes the node lock briefly.
+fn serve_metrics(listener: TcpListener, node: SharedNode) {
+    let started = std::time::Instant::now();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let node = Arc::clone(&node);
+            thread::spawn(move || {
+                let _ = handle_metrics(stream, &node, started);
+            });
+        }
+    });
+}
+
+fn handle_metrics(
+    stream: std::net::TcpStream,
+    node: &SharedNode,
+    started: std::time::Instant,
+) -> std::io::Result<()> {
+    use std::io::{BufRead, BufReader, Write};
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
+
+    // One snapshot of everything under a single brief lock.
+    let (height, tip, difficulty, peers, mempool, finalized, boot) = {
+        let n = lock_node(node);
+        (
+            n.chain.height(),
+            n.chain.tip(),
+            n.chain.difficulty(),
+            n.peers().len(),
+            n.mempool.len(),
+            n.chain.finalized(),
+            n.chain.boot_mode(),
+        )
+    };
+    let uptime = started.elapsed().as_secs();
+    let tip_hex: String = tip.iter().map(|b| format!("{b:02x}")).collect();
+    let (fin_height, fin_id) = match finalized {
+        Some((h, id)) => (h as i64, id.iter().map(|b| format!("{b:02x}")).collect()),
+        None => (-1, String::new()),
+    };
+    let boot = match boot {
+        lat_chain::BootMode::Records => "records",
+        lat_chain::BootMode::Snapshot => "snapshot",
+        lat_chain::BootMode::FullReplay => "full-replay",
+        lat_chain::BootMode::FastSync => "fast-sync",
+    };
+
+    let (content_type, body) = match path.as_str() {
+        "/metrics" => (
+            "text/plain; version=0.0.4",
+            format!(
+                "# HELP latebra_height Active chain height\n\
+                 # TYPE latebra_height gauge\n\
+                 latebra_height {height}\n\
+                 # HELP latebra_difficulty Next-block difficulty target\n\
+                 # TYPE latebra_difficulty gauge\n\
+                 latebra_difficulty {difficulty}\n\
+                 # HELP latebra_peers Known peer count\n\
+                 # TYPE latebra_peers gauge\n\
+                 latebra_peers {peers}\n\
+                 # HELP latebra_mempool_txs Pending transactions in the mempool\n\
+                 # TYPE latebra_mempool_txs gauge\n\
+                 latebra_mempool_txs {mempool}\n\
+                 # HELP latebra_finalized_height BFT-finalized height (-1 = none)\n\
+                 # TYPE latebra_finalized_height gauge\n\
+                 latebra_finalized_height {fin_height}\n\
+                 # HELP latebra_uptime_seconds Seconds since the daemon started\n\
+                 # TYPE latebra_uptime_seconds counter\n\
+                 latebra_uptime_seconds {uptime}\n"
+            ),
+        ),
+        "/status" | "/" => (
+            "application/json",
+            format!(
+                "{{\"height\":{height},\"tip\":\"{tip_hex}\",\"difficulty\":{difficulty},\
+                 \"peers\":{peers},\"mempool\":{mempool},\
+                 \"finalized_height\":{fin_height},\"finalized_id\":\"{fin_id}\",\
+                 \"boot_mode\":\"{boot}\",\"uptime_secs\":{uptime}}}"
+            ),
+        ),
+        _ => {
+            let mut s = stream;
+            s.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n")?;
+            return Ok(());
+        }
+    };
+    let mut s = stream;
+    write!(
+        s,
+        "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
 }
 
 /// Mine one block from the mempool, apply it, and gossip it to every known peer

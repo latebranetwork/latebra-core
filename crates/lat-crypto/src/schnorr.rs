@@ -117,9 +117,9 @@ mod tests {
 
         let mut bad = bytes;
         bad[40] ^= 1; // corrupt s
-        match Signature::from_bytes(&bad) {
-            Some(s) => assert!(!sk.public_key().verify(b"payload", &s)),
-            None => {} // non-canonical scalar is also a fine rejection
+        // A non-canonical scalar failing to decode at all is also a fine rejection.
+        if let Some(s) = Signature::from_bytes(&bad) {
+            assert!(!sk.public_key().verify(b"payload", &s));
         }
         assert!(Signature::from_bytes(&bytes[..63]).is_none(), "wrong length");
     }

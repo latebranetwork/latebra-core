@@ -736,8 +736,8 @@ mod tests {
         .unwrap();
         assert!(tx.verify());
         assert_eq!(sks[0].decrypt(&tx.enc[0], 24), Some(amount + fee), "sender debit = amount+fee");
-        for i in 1..4 {
-            assert_eq!(sks[i].decrypt(&tx.enc[i], 24), Some(0), "decoy debit = 0");
+        for (sk, enc) in sks.iter().zip(tx.enc.iter()).skip(1) {
+            assert_eq!(sk.decrypt(enc, 24), Some(0), "decoy debit = 0");
         }
     }
 

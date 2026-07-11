@@ -401,7 +401,7 @@ mod tests {
         // Zero amount, oversize amount, and overselling all revert with no change.
         assert!(!trade(&mut storage, &carol, true, 0), "zero-amount buy reverts");
         assert!(!trade(&mut storage, &carol, true, MAX_TRADE + 1), "oversize buy reverts");
-        assert!(!trade(&mut storage, &carol, false, u64::MAX & MASK63), "oversell reverts");
+        assert!(!trade(&mut storage, &carol, false, MASK63), "oversell reverts");
         let stranger = caller(9);
         assert!(!trade(&mut storage, &stranger, false, 1), "selling with no holdings reverts");
 

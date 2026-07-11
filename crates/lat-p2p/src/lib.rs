@@ -877,13 +877,11 @@ fn read_msg(s: &mut impl Read) -> io::Result<Msg> {
 /// `127.0.0.1:0`) so you can read the assigned address before serving.
 pub fn serve(listener: TcpListener, node: SharedNode) -> JoinHandle<()> {
     thread::spawn(move || {
-        for stream in listener.incoming() {
-            if let Ok(stream) = stream {
-                let node = Arc::clone(&node);
-                thread::spawn(move || {
-                    let _ = handle_conn(stream, node);
-                });
-            }
+        for stream in listener.incoming().flatten() {
+            let node = Arc::clone(&node);
+            thread::spawn(move || {
+                let _ = handle_conn(stream, node);
+            });
         }
     })
 }

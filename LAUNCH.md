@@ -116,6 +116,23 @@ database (created on first run); back it up — it is the chain.
 
 Publish the seed `ip:port`s so others can `--peer` them (see TESTNET.md §4).
 
+**Docker alternative:** `docker compose up --build` brings up a miner/validator,
+two followers, and the explorer in one command (see `docker-compose.yml`); the
+single-node image is the repo `Dockerfile`.
+
+**Monitoring (T22):** every node serves HTTP `GET /status` (JSON) and
+`GET /metrics` (Prometheus text) — default `127.0.0.1:4090`, set
+`--metrics 0.0.0.0:4090` to expose it (read-only, but consider firewalling it
+to your monitoring host anyway). Fields: height, tip, difficulty, peers,
+mempool, finalized height (T14 watermark; `-1` until a certificate forms),
+boot mode, uptime. Point Prometheus/Grafana or curl-in-cron at it; alert if
+`latebra_height` stalls or `latebra_peers` drops to 0.
+
+**New-node bootstrap (T19):** a fresh node fast-syncs automatically — it
+downloads a peer's state records and verifies the rebuilt state root against
+the PoW-validated header chain instead of re-verifying every historical proof,
+falling back to full block sync if anything mismatches.
+
 ## 4. Pre-flight checklist
 
 - [ ] All hosts built from the **same commit** (same genesis id) — verify each

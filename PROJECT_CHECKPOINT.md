@@ -2,7 +2,7 @@
 
 > Living document. Paste "continue from the latest checkpoint" in a new
 > conversation and work resumes from the **Current Task** below.
-> Last updated: 2026-07-11 (Checkpoint 16 — T19 fast state sync; M4 network complete except parked T18).
+> Last updated: 2026-07-11 (Checkpoint 17 — T22 ops: metrics endpoint, Docker+compose, GitHub Actions CI; clippy-clean gate).
 
 ## 0. Mission
 
@@ -361,8 +361,24 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
 - [ ] T21 SDKs, contract stdlib, tooling, debugger.  ← T11
 
 ### M6 — Ops, QA, security (continuous)
-- [ ] T22 Metrics, logging, monitoring, Docker/K8s, CI/CD.
-- [ ] T23 Fuzzing, integration tests, testnet, threat model.
+- [x] **T22 Metrics, monitoring, Docker, CI.** (2026-07-11) `latebrad
+  --metrics <addr|off>` (default loopback :4090) serves `GET /status` (JSON:
+  height/tip/difficulty/peers/mempool/finalized/boot_mode/uptime) and
+  `GET /metrics` (Prometheus text exposition) — one brief node lock per
+  request, verified live against a mining node. Multi-stage `Dockerfile`
+  (rust:1-slim → bookworm-slim; BLAKE3 PoW default needs no C toolchain) +
+  `docker-compose.yml` (miner/validator + 2 followers — the second discovers
+  the miner via peer exchange and exercises T19 fast sync — + explorer).
+  GitHub Actions CI (`.github/workflows/ci.yml`): clippy `-D warnings`
+  (allowing only type_complexity/too_many_arguments), full workspace tests
+  (excl. latfun), release build, and a docker-build job. Repo made
+  clippy-clean under that gate (auto-fix + 3 manual). rustfmt deliberately
+  NOT enforced (would churn 18k LOC of git blame right before audit).
+  LAUNCH.md updated (Docker bring-up, monitoring, fast-sync bootstrap).
+  Deferred: K8s manifests, structured logging, Grafana dashboards.
+- [ ] T23 Fuzzing, integration tests, testnet, threat model. (THREAT_MODEL.md
+  exists; remaining: decoder fuzzing — Msg/Block/Transaction — + multi-node
+  soak.)
 
 ## 6. Architectural Decision Records (ADRs)
 
@@ -499,21 +515,20 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
 
 ## 9. Current Task
 
-**T22 — Ops: metrics/logging, Docker, CI** (T19 done — see roadmap; the
-owner's stated path is testnet push → external audit → mainnet, which makes
-M6 the critical path now). Suggested scope: a Dockerfile + compose for a
-multi-node testnet, GitHub Actions CI (fmt/clippy/test on push), and basic
-node metrics (height, peers, mempool, finality watermark) exposed on an HTTP
-endpoint. Then T23 (fuzzing of decoders — Msg, Block, Transaction — plus a
-long-running multi-node soak) rounds out the audit package. Remaining
-non-ops gaps for mainnet: T18 (needs real seed hosts), T20/T21 (API/SDK
-polish, not launch-blocking).
-
-Design note honored vs the original T19 sketch: the anchor is the peer's
-CURRENT tip, not the finality watermark — every served header passes full
-PoW validation on the syncing side, so trust matches the snapshot-boot
-model; chunk digests were dropped as redundant (the rebuilt root check
-covers the whole record set).
+**T23 — QA for the audit package: fuzzing + soak** (T22 done — see roadmap;
+owner's path is testnet push → external audit → mainnet). Scope: (1)
+fuzz/property-test the untrusted-input decoders — `lat_p2p::Msg::decode`,
+`Block::decode`, `Transaction::decode` — malformed/truncated/oversized bytes
+must never panic, only return `None`/errors (a `cargo-fuzz` target per
+decoder, or a seeded random byte-mutation property test where a fuzzer
+toolchain is unavailable — note: cargo-fuzz needs nightly + libFuzzer, often
+awkward on Windows; the CI Linux runner can host it); (2) a multi-node soak
+script (compose- or process-based): hours of mining + transfers across 3
+nodes with periodic restart/kill of a follower, asserting height convergence,
+identical tips, no panics; (3) fold both into CI where runtime allows (fuzz
+smoke = N seconds per target, soak = nightly job). After T23, the remaining
+mainnet gate is the external audit itself + the LAUNCH.md §5 mainnet-must-
+change list (fresh genesis, seed hosts/T18, key ceremonies).
 
 ### Build/verify commands
 - Tests: `cargo test -p lat-store` (+ per-crate as tasks land).
