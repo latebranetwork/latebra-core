@@ -2625,4 +2625,103 @@ mod tests {
         assert!(!busy.fast_sync_adopt(&blocks, anchor_h, anchor_id, records));
         assert_eq!(busy.height(), 1);
     }
+
+    // --- T23: decoder robustness (fuzz-style property tests) ---
+    //
+    // Blocks and transactions arrive from untrusted peers (NewBlock/NewTx
+    // gossip, sync, SubmitTx RPC); finality votes/certificates likewise. All
+    // of their decoders must never panic on arbitrary bytes — only return
+    // `None`. Deterministic xorshift so failures reproduce exactly.
+
+    struct XorShift(u64);
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n.max(1) as u64) as usize
+        }
+    }
+
+    #[test]
+    fn chain_decoders_survive_random_and_mutated_input() {
+        let mut rng = XorShift(0xb10c_dec0_de5e_ed01);
+
+        // Real encodings to mutate: blocks with registration + confidential
+        // transfer txs, their headers and txs, plus a finality vote + cert.
+        let (_, blocks, _) = fast_sync_fixture();
+        let mut originals: Vec<Vec<u8>> = blocks.clone();
+        for bytes in &blocks {
+            let block = Block::decode(bytes).unwrap();
+            originals.push(block.header.encode());
+            for tx in &block.txs {
+                originals.push(tx.encode());
+            }
+        }
+        let sk = lat_crypto::SecretKey::random(&mut OsRng);
+        let vote = crate::finality::Vote::sign(&sk, [3u8; 32], 9);
+        originals.push(vote.encode());
+        originals.push(
+            crate::finality::Certificate {
+                block_id: vote.block_id,
+                height: vote.height,
+                votes: vec![(vote.validator, vote.sig)],
+            }
+            .encode(),
+        );
+
+        let decode_all = |buf: &[u8]| {
+            // Every decoder that faces peer bytes; none may panic.
+            let _ = Block::decode(buf);
+            let _ = BlockHeader::decode(buf);
+            let _ = Transaction::decode(buf);
+            let _ = crate::finality::Vote::decode(buf);
+            let _ = crate::finality::Certificate::decode(buf);
+        };
+
+        // Pure random buffers (first byte sweeps all tag values).
+        for i in 0..5_000usize {
+            let len = rng.below(400) + usize::from(i % 50 == 0) * rng.below(8192);
+            let mut buf = vec![0u8; len];
+            for b in buf.iter_mut() {
+                *b = rng.next() as u8;
+            }
+            if !buf.is_empty() {
+                buf[0] = (i % 256) as u8;
+            }
+            decode_all(&buf);
+        }
+
+        // Valid encodings, damaged: byte flips, truncations, extensions.
+        for _ in 0..20_000 {
+            let mut buf = originals[rng.below(originals.len())].clone();
+            match rng.below(3) {
+                0 if !buf.is_empty() => {
+                    let i = rng.below(buf.len());
+                    buf[i] ^= (rng.next() as u8) | 1;
+                }
+                1 => {
+                    let cut = rng.below(buf.len() + 1);
+                    buf.truncate(cut);
+                }
+                _ => {
+                    for _ in 0..rng.below(16) + 1 {
+                        buf.push(rng.next() as u8);
+                    }
+                }
+            }
+            decode_all(&buf);
+        }
+
+        // And the valid encodings themselves still round-trip.
+        for bytes in &blocks {
+            let block = Block::decode(bytes).unwrap();
+            assert_eq!(block.encode(), *bytes);
+        }
+    }
 }

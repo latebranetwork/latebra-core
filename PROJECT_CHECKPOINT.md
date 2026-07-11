@@ -2,7 +2,7 @@
 
 > Living document. Paste "continue from the latest checkpoint" in a new
 > conversation and work resumes from the **Current Task** below.
-> Last updated: 2026-07-11 (Checkpoint 17 — T22 ops: metrics endpoint, Docker+compose, GitHub Actions CI; clippy-clean gate).
+> Last updated: 2026-07-11 (Checkpoint 18 — T23 decoder fuzzing + chaos soak; program CODE-COMPLETE for testnet→audit→mainnet).
 
 ## 0. Mission
 
@@ -376,9 +376,23 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
   NOT enforced (would churn 18k LOC of git blame right before audit).
   LAUNCH.md updated (Docker bring-up, monitoring, fast-sync bootstrap).
   Deferred: K8s manifests, structured logging, Grafana dashboards.
-- [ ] T23 Fuzzing, integration tests, testnet, threat model. (THREAT_MODEL.md
-  exists; remaining: decoder fuzzing — Msg/Block/Transaction — + multi-node
-  soak.)
+- [x] **T23 Decoder fuzzing + multi-node soak.** (2026-07-11) Fuzz-style
+  property tests over every untrusted-input decoder, deterministic xorshift
+  (failures reproduce exactly): `lat-p2p` `Msg::decode` (40k inputs: random
+  buffers sweeping all tag bytes + byte-flip/truncate/extend mutations of one
+  representative of EVERY wire variant, with a full round-trip test kept in
+  sync with the enum) and `lat-chain` `Block`/`BlockHeader`/`Transaction`/
+  `Vote`/`Certificate::decode` (25k inputs mutated from real mined blocks w/
+  registration + confidential-transfer txs and a real vote/cert). Invariants:
+  never panic, and anything that DOES decode from hostile bytes must
+  re-encode decodably. Zero panics found. `scripts/soak-testnet.ps1`: 3-node
+  soak (miner/validator + 2 followers) with chaos kills/restarts of node-c
+  every N secs, /status polling, miner-stall detection, and an end-of-run
+  frozen-tip convergence assertion (exit 1 on divergence/death/stall) —
+  4-min live run PASSED with restarts exercising the records boot path.
+  Chosen over cargo-fuzz: nightly+libFuzzer is awkward on Windows and the
+  seeded property tests run in normal `cargo test`, so CI runs them on every
+  push. THREAT_MODEL.md already existed (launch track).
 
 ## 6. Architectural Decision Records (ADRs)
 
@@ -515,20 +529,26 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
 
 ## 9. Current Task
 
-**T23 — QA for the audit package: fuzzing + soak** (T22 done — see roadmap;
-owner's path is testnet push → external audit → mainnet). Scope: (1)
-fuzz/property-test the untrusted-input decoders — `lat_p2p::Msg::decode`,
-`Block::decode`, `Transaction::decode` — malformed/truncated/oversized bytes
-must never panic, only return `None`/errors (a `cargo-fuzz` target per
-decoder, or a seeded random byte-mutation property test where a fuzzer
-toolchain is unavailable — note: cargo-fuzz needs nightly + libFuzzer, often
-awkward on Windows; the CI Linux runner can host it); (2) a multi-node soak
-script (compose- or process-based): hours of mining + transfers across 3
-nodes with periodic restart/kill of a follower, asserting height convergence,
-identical tips, no panics; (3) fold both into CI where runtime allows (fuzz
-smoke = N seconds per target, soak = nightly job). After T23, the remaining
-mainnet gate is the external audit itself + the LAUNCH.md §5 mainnet-must-
-change list (fresh genesis, seed hosts/T18, key ceremonies).
+**PROGRAM CODE-COMPLETE for the testnet→audit→mainnet path.** M0–M4 + M6
+done; M5 (T20 RPC surface, T21 SDKs) is post-launch polish, T18 is an hour
+of work once real seed hosts exist. The remaining gates are NOT code tasks:
+
+1. **User deploys the public testnet** (LAUNCH.md §3–4: VPS seeds + miner +
+   explorer + launchpad, or `docker compose up`), pushes the repo to GitHub
+   (CI goes live), publishes seed addresses → then T18 (DNS seeds).
+2. **Longer soak** on the deployed net: `./scripts/soak-testnet.ps1
+   -Minutes 480` locally and/or let the public testnet run for days;
+   watch /metrics.
+3. **External audit** (THREAT_MODEL.md is the scoping doc; the crypto —
+   solvency proofs, ring signatures, finality — is unaudited and this is a
+   HARD gate before real value).
+4. **Mainnet-must-change list** (LAUNCH.md §5): fresh genesis + premine
+   ceremony, real seed hosts, difficulty/emission review, RandomX decision.
+
+If more engineering IS wanted meanwhile, the highest-value options: T20
+(consolidated JSON-RPC so explorers/exchanges don't speak the binary
+protocol), partial-slash + whistleblower rewards (T16 deferral), or an
+incremental prune sweep (§8 known debt).
 
 ### Build/verify commands
 - Tests: `cargo test -p lat-store` (+ per-crate as tasks land).

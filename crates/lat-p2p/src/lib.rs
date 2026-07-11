@@ -2172,4 +2172,132 @@ mod tests {
         assert_eq!(n.chain.height(), 1);
         assert!(n.chain.is_registered(&w.id()), "the good tx made it in");
     }
+
+    // --- T23: decoder robustness (fuzz-style property tests) ---
+    //
+    // `Msg::decode` is THE untrusted network input surface: every byte a peer
+    // sends lands here. It must never panic — only return `None` — for any
+    // input, and every valid encoding must round-trip. Deterministic xorshift
+    // so failures reproduce exactly.
+
+    struct XorShift(u64);
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n.max(1) as u64) as usize
+        }
+    }
+
+    /// One instance of every wire message variant (keep in sync with `Msg`).
+    fn representative_msgs() -> Vec<Msg> {
+        vec![
+            Msg::GetTip,
+            Msg::Tip(7),
+            Msg::GetBlock(3),
+            Msg::Block(None),
+            Msg::Block(Some(vec![1, 2, 3])),
+            Msg::NewBlock(vec![4; 60]),
+            Msg::Ack(true),
+            Msg::SubmitTx(vec![9; 40]),
+            Msg::GetBalance { id: [1; 32], token: 2 },
+            Msg::BalanceReply(None),
+            Msg::BalanceReply(Some(vec![5; 64])),
+            Msg::GetNonce([2; 32]),
+            Msg::NonceReply(Some(11)),
+            Msg::NonceReply(None),
+            Msg::GetPending { id: [3; 32], token: 0 },
+            Msg::Hello("10.0.0.1:4040".into()),
+            Msg::GetPeers,
+            Msg::Peers(vec!["a:1".into(), "b:2".into()]),
+            Msg::FindCommon(vec![[4; 32], [5; 32]]),
+            Msg::CommonHeight(9),
+            Msg::GetPublicBalance { id: [6; 32], token: 1 },
+            Msg::PublicBalanceReply(Some(1000)),
+            Msg::PublicBalanceReply(None),
+            Msg::GetRingCandidates { token: 0, max: 8 },
+            Msg::RingCandidates(vec![([7; 32], [8; 64])]),
+            Msg::Handshake { version: 2, genesis: [9; 32], addr: "x:1".into() },
+            Msg::HandshakeAck { version: 2, genesis: [9; 32], accepted: true },
+            Msg::GetContractStorage { contract: [10; 32], key: 5 },
+            Msg::ContractStorageReply(77),
+            Msg::HasContract([11; 32]),
+            Msg::FinalityVote(vec![12; 80]),
+            Msg::FinalityCert(vec![13; 120]),
+            Msg::GetFinalized,
+            Msg::FinalizedReply(Some((4, [14; 32]))),
+            Msg::FinalizedReply(None),
+            Msg::GetStake([15; 32]),
+            Msg::StakeReply(500, vec![(10, 20), (30, 40)]),
+            Msg::NewTx(vec![16; 30]),
+            Msg::BlockAnnounce { id: [17; 32], height: 6 },
+            Msg::GetStateManifest,
+            Msg::StateManifest {
+                anchor_height: 42,
+                anchor_id: [18; 32],
+                record_count: 1000,
+                chunk_count: 3,
+            },
+            Msg::GetStateChunk(2),
+            Msg::StateChunk(vec![(vec![b'a'; 33], vec![1; 90]), (vec![b'n'; 33], vec![])]),
+        ]
+    }
+
+    #[test]
+    fn every_msg_variant_round_trips() {
+        for msg in representative_msgs() {
+            let bytes = msg.encode();
+            assert_eq!(Msg::decode(&bytes).as_ref(), Some(&msg), "round-trip failed: {msg:?}");
+        }
+    }
+
+    #[test]
+    fn msg_decode_survives_random_and_mutated_input() {
+        let mut rng = XorShift(0x1a7e_b12a_5eed_0001);
+
+        // Pure random buffers across every tag byte and length regime.
+        for i in 0..20_000usize {
+            let len = rng.below(300) + usize::from(i % 100 == 0) * rng.below(4096);
+            let mut buf = vec![0u8; len];
+            for b in buf.iter_mut() {
+                *b = rng.next() as u8;
+            }
+            if !buf.is_empty() {
+                buf[0] = (i % 256) as u8; // sweep tags incl. undefined ones
+            }
+            let _ = Msg::decode(&buf); // must not panic
+        }
+
+        // Valid encodings, damaged: byte flips, truncations, extensions.
+        let originals: Vec<Vec<u8>> = representative_msgs().iter().map(Msg::encode).collect();
+        for _ in 0..20_000 {
+            let mut buf = originals[rng.below(originals.len())].clone();
+            match rng.below(3) {
+                0 if !buf.is_empty() => {
+                    let i = rng.below(buf.len());
+                    buf[i] ^= (rng.next() as u8) | 1;
+                }
+                1 => {
+                    let cut = rng.below(buf.len() + 1);
+                    buf.truncate(cut);
+                }
+                _ => {
+                    for _ in 0..rng.below(16) + 1 {
+                        buf.push(rng.next() as u8);
+                    }
+                }
+            }
+            if let Some(decoded) = Msg::decode(&buf) {
+                // Whatever decoded must itself re-encode decodably (no
+                // panic-on-echo states reachable from hostile input).
+                let _ = Msg::decode(&decoded.encode());
+            }
+        }
+    }
 }

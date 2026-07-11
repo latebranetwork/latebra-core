@@ -140,6 +140,8 @@ falling back to full block sync if anything mismatches.
 - [ ] `cargo test --workspace --exclude latfun` is green on the release commit.
 - [ ] Full local dry run passes: `./scripts/local-testnet.ps1` (miner + syncer +
       explorer) — a second node syncs and a wallet can register/send.
+- [ ] Long soak passes: `./scripts/soak-testnet.ps1 -Minutes 480` — 3 nodes,
+      chaos restarts, must end CONVERGED (exit 0).
 - [ ] Seed nodes reachable on their advertised `--public-addr` (firewall/port).
 - [ ] `--data` directories are on persistent disk and **backed up**.
 - [ ] Explorer + launchpad reachable; faucet pays a fresh address end-to-end.
