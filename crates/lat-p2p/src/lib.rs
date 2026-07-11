@@ -410,7 +410,31 @@ enum Msg {
     /// hold them. The announcer follows up with `NewBlock` on the same
     /// connection when asked.
     BlockAnnounce { id: [u8; 32], height: u64 },
+    /// T19 fast sync: ask for the peer's state-sync manifest. The peer
+    /// captures its tip anchor + full object-record set atomically (one node
+    /// lock) and keeps it FOR THIS CONNECTION, so subsequent chunk requests
+    /// see one consistent state even while the peer keeps mining.
+    GetStateManifest,
+    /// Reply: the anchor block `(height, id)` the records describe, the total
+    /// record count, and how many chunks to fetch. `chunk_count == 0` means
+    /// the peer can't serve fast sync (fresh chain) — full-sync instead.
+    StateManifest { anchor_height: u64, anchor_id: [u8; 32], record_count: u64, chunk_count: u32 },
+    /// T19 fast sync: ask for chunk `n` (0-based) of the manifest previously
+    /// captured on this connection.
+    GetStateChunk(u32),
+    /// Reply: that chunk's `(key, value)` object records — raw
+    /// `Column::Objects` entries. Empty if out of range or no manifest was
+    /// captured on this connection. The records need no per-chunk digests:
+    /// the syncing node rebuilds the state commitment from them and accepts
+    /// only if the derived root matches the anchor header's PoW-bound
+    /// `state_root`, so any tampering is caught wholesale.
+    StateChunk(Vec<(Vec<u8>, Vec<u8>)>),
 }
+
+/// T19: payload budget per [`Msg::StateChunk`] (sum of key+value bytes).
+/// Comfortably under [`MAX_MSG_BYTES`] once per-record length prefixes are
+/// added.
+const STATE_CHUNK_BYTES: usize = 1024 * 1024;
 
 /// Cap on ring candidates returned by one RPC (bounds the reply size; well
 /// above [`lat_chain::MAX_RING_SIZE`] so wallets can still sample freely).
@@ -608,6 +632,28 @@ impl Msg {
                 v.push(25);
                 v.extend_from_slice(id);
             }
+            Msg::GetStateManifest => v.push(34),
+            Msg::StateManifest { anchor_height, anchor_id, record_count, chunk_count } => {
+                v.push(35);
+                v.extend_from_slice(&anchor_height.to_le_bytes());
+                v.extend_from_slice(anchor_id);
+                v.extend_from_slice(&record_count.to_le_bytes());
+                v.extend_from_slice(&chunk_count.to_le_bytes());
+            }
+            Msg::GetStateChunk(n) => {
+                v.push(36);
+                v.extend_from_slice(&n.to_le_bytes());
+            }
+            Msg::StateChunk(records) => {
+                v.push(37);
+                v.extend_from_slice(&(records.len() as u32).to_le_bytes());
+                for (key, value) in records {
+                    v.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                    v.extend_from_slice(key);
+                    v.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                    v.extend_from_slice(value);
+                }
+            }
         }
         v
     }
@@ -771,6 +817,37 @@ impl Msg {
                 ))),
                 _ => return None,
             },
+            34 => Msg::GetStateManifest,
+            35 => {
+                if rest.len() != 52 {
+                    return None;
+                }
+                Msg::StateManifest {
+                    anchor_height: u64::from_le_bytes(rest.get(0..8)?.try_into().ok()?),
+                    anchor_id: rest.get(8..40)?.try_into().ok()?,
+                    record_count: u64::from_le_bytes(rest.get(40..48)?.try_into().ok()?),
+                    chunk_count: u32::from_le_bytes(rest.get(48..52)?.try_into().ok()?),
+                }
+            }
+            36 => Msg::GetStateChunk(u32::from_le_bytes(rest.get(0..4)?.try_into().ok()?)),
+            37 => {
+                let count = u32::from_le_bytes(rest.get(0..4)?.try_into().ok()?) as usize;
+                let mut records = Vec::with_capacity(count.min(1 << 16));
+                let mut off = 4;
+                for _ in 0..count {
+                    let klen = u32::from_le_bytes(rest.get(off..off + 4)?.try_into().ok()?) as usize;
+                    let key = rest.get(off + 4..off + 4 + klen)?.to_vec();
+                    off += 4 + klen;
+                    let vlen = u32::from_le_bytes(rest.get(off..off + 4)?.try_into().ok()?) as usize;
+                    let value = rest.get(off + 4..off + 4 + vlen)?.to_vec();
+                    off += 4 + vlen;
+                    records.push((key, value));
+                }
+                if off != rest.len() {
+                    return None;
+                }
+                Msg::StateChunk(records)
+            }
             _ => return None,
         })
     }
@@ -812,6 +889,11 @@ pub fn serve(listener: TcpListener, node: SharedNode) -> JoinHandle<()> {
 }
 
 fn handle_conn(mut stream: TcpStream, node: SharedNode) -> io::Result<()> {
+    // T19: state-sync manifest captured for THIS connection — anchor plus the
+    // record set pre-split into reply-sized chunks. Kept out of the node lock
+    // so serving chunks never blocks mining/RPC, and immune to the tip moving
+    // between chunk requests.
+    let mut state_sync: Option<Vec<Vec<(Vec<u8>, Vec<u8>)>>> = None;
     loop {
         let msg = match read_msg(&mut stream) {
             Ok(m) => m,
@@ -928,6 +1010,45 @@ fn handle_conn(mut stream: TcpStream, node: SharedNode) -> io::Result<()> {
             Msg::BlockAnnounce { id, .. } => {
                 Msg::Ack(!lock_node(&node).chain.has_block(&id))
             }
+            // --- T19 fast sync: serve a consistent state snapshot in chunks
+            Msg::GetStateManifest => {
+                let payload = lock_node(&node).chain.state_sync_payload();
+                match payload {
+                    Some((anchor_height, anchor_id, records)) => {
+                        let record_count = records.len() as u64;
+                        // Split into chunks under the payload budget (each
+                        // chunk keeps at least one record, so a single
+                        // oversized record can't stall the split).
+                        let mut chunks: Vec<Vec<(Vec<u8>, Vec<u8>)>> = vec![Vec::new()];
+                        let mut used = 0usize;
+                        for (key, value) in records {
+                            let cost = key.len() + value.len();
+                            if used + cost > STATE_CHUNK_BYTES && !chunks.last().unwrap().is_empty() {
+                                chunks.push(Vec::new());
+                                used = 0;
+                            }
+                            used += cost;
+                            chunks.last_mut().unwrap().push((key, value));
+                        }
+                        let chunk_count = chunks.len() as u32;
+                        state_sync = Some(chunks);
+                        Msg::StateManifest { anchor_height, anchor_id, record_count, chunk_count }
+                    }
+                    // Fresh chain: nothing to fast-sync from us.
+                    None => Msg::StateManifest {
+                        anchor_height: 0,
+                        anchor_id: [0u8; 32],
+                        record_count: 0,
+                        chunk_count: 0,
+                    },
+                }
+            }
+            Msg::GetStateChunk(n) => Msg::StateChunk(
+                state_sync
+                    .as_ref()
+                    .and_then(|chunks| chunks.get(n as usize).cloned())
+                    .unwrap_or_default(),
+            ),
             // --- RPC (clients) ---
             Msg::SubmitTx(bytes) => {
                 let ok = match Transaction::decode(&bytes) {
@@ -1066,6 +1187,67 @@ pub fn sync_shared<A: ToSocketAddrs>(node: &SharedNode, addr: A) -> io::Result<u
         }
     }
     Ok(adopted)
+}
+
+/// T19 fast sync: bootstrap a FRESH node (height 0) from `addr` without
+/// replaying historical transactions — download the peer's state records +
+/// full header chain, rebuild the state commitment locally, and adopt only if
+/// the derived root matches the anchor block's PoW-validated header (see
+/// [`Blockchain::fast_sync_adopt`] for the full trust argument).
+///
+/// `Ok(true)` iff the chain was adopted. `Ok(false)` = not applicable (we're
+/// not fresh, the peer can't serve, or verification failed) — the caller
+/// falls back to ordinary [`sync_shared`], which is always sound.
+pub fn fast_sync_shared<A: ToSocketAddrs>(node: &SharedNode, addr: A) -> io::Result<bool> {
+    if lock_node(node).chain.height() != 0 {
+        return Ok(false);
+    }
+    let mut stream = connect_timeout(addr)?;
+
+    write_msg(&mut stream, &Msg::GetStateManifest)?;
+    let (anchor_height, anchor_id, chunk_count) = match read_msg(&mut stream)? {
+        Msg::StateManifest { anchor_height, anchor_id, chunk_count, .. } => {
+            (anchor_height, anchor_id, chunk_count)
+        }
+        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "expected state manifest")),
+    };
+    if chunk_count == 0 {
+        return Ok(false); // peer has nothing to fast-sync
+    }
+
+    // The manifest is captured per-connection on the peer, so these chunks
+    // are one consistent snapshot even if the peer mines meanwhile.
+    let mut records: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for n in 0..chunk_count {
+        write_msg(&mut stream, &Msg::GetStateChunk(n))?;
+        match read_msg(&mut stream)? {
+            Msg::StateChunk(part) if !part.is_empty() => records.extend(part),
+            Msg::StateChunk(_) => return Ok(false), // peer lost the snapshot
+            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "expected state chunk")),
+        }
+    }
+
+    // The full block list (headers get fully PoW-validated; only the tail
+    // after the anchor gets its transactions replayed).
+    write_msg(&mut stream, &Msg::GetTip)?;
+    let peer_height = match read_msg(&mut stream)? {
+        Msg::Tip(h) => h,
+        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "expected tip")),
+    };
+    if peer_height < anchor_height {
+        return Ok(false); // peer reorged below its own anchor mid-sync
+    }
+    let mut blocks = Vec::with_capacity(peer_height as usize);
+    for h in 1..=peer_height {
+        write_msg(&mut stream, &Msg::GetBlock(h))?;
+        match read_msg(&mut stream)? {
+            Msg::Block(Some(b)) => blocks.push(b),
+            Msg::Block(None) => return Ok(false), // peer reorged mid-download
+            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "expected block")),
+        }
+    }
+
+    Ok(lock_node(node).chain.fast_sync_adopt(&blocks, anchor_height, anchor_id, records))
 }
 
 /// Push one encoded block to a peer (gossip). Returns whether the peer adopted it.
@@ -1501,6 +1683,47 @@ mod tests {
 
     fn shared(chain: Blockchain) -> SharedNode {
         Arc::new(Mutex::new(NodeState::new(chain)))
+    }
+
+    #[test]
+    fn fast_sync_bootstraps_a_fresh_node_over_tcp() {
+        // Node A mines a few blocks (with a real state change) and serves.
+        let a = shared(fresh_chain());
+        {
+            let mut n = lock_node(&a);
+            let b1 = n.chain.mine(vec![lat_chain::mine_registration([9u8; 32])]);
+            n.chain.apply_block(&b1).unwrap();
+            for _ in 0..2 {
+                let b = n.chain.mine(Vec::new());
+                n.chain.apply_block(&b).unwrap();
+            }
+        }
+        let la = TcpListener::bind("127.0.0.1:0").unwrap();
+        let a_addr = la.local_addr().unwrap();
+        serve(la, Arc::clone(&a));
+
+        // Fresh node B fast-syncs: same tip + state without replaying.
+        let b = shared(fresh_chain());
+        assert!(fast_sync_shared(&b, a_addr).unwrap());
+        let (na, nb) = (lock_node(&a), lock_node(&b));
+        assert_eq!(nb.chain.height(), na.chain.height());
+        assert_eq!(nb.chain.tip(), na.chain.tip());
+        assert_eq!(nb.chain.state_root(), na.chain.state_root());
+        assert!(nb.chain.is_registered(&[9u8; 32]), "synced state is queryable");
+        assert_eq!(nb.chain.boot_mode(), lat_chain::BootMode::FastSync);
+        drop((na, nb));
+
+        // A node that already has blocks refuses to fast-sync (full sync path).
+        assert!(!fast_sync_shared(&b, a_addr).unwrap());
+
+        // And a fresh peer has nothing to serve: manifest says chunk_count 0.
+        let empty = shared(fresh_chain());
+        let le = TcpListener::bind("127.0.0.1:0").unwrap();
+        let e_addr = le.local_addr().unwrap();
+        serve(le, empty);
+        let c = shared(fresh_chain());
+        assert!(!fast_sync_shared(&c, e_addr).unwrap());
+        assert_eq!(lock_node(&c).chain.height(), 0);
     }
 
     #[test]

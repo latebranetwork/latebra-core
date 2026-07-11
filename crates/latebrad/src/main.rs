@@ -186,6 +186,7 @@ fn main() {
             lat_chain::BootMode::Records => "state records + tail replay",
             lat_chain::BootMode::Snapshot => "snapshot file + tail replay",
             lat_chain::BootMode::FullReplay => "full replay",
+            lat_chain::BootMode::FastSync => "fast sync (peer state, root-verified)",
         }
     );
     println!("  genesis addr: {}", genesis_wallet.address_string());
@@ -278,6 +279,22 @@ fn main() {
                             println!("[peers] evicted unreachable peer {peer}");
                         }
                         continue;
+                    }
+                }
+                // T19: a FRESH node (height 0, e.g. first boot) bootstraps by
+                // downloading the peer's state records instead of replaying
+                // every historical proof; the derived state root is verified
+                // against the PoW-validated header chain. Any failure falls
+                // through to ordinary full-validation sync below.
+                if lock_node(&node).chain.height() == 0 {
+                    match lat_p2p::fast_sync_shared(&node, peer.as_str()) {
+                        Ok(true) => {
+                            let h = lock_node(&node).chain.height();
+                            println!("[sync] fast-synced to height {h} from {peer} (state root verified)");
+                            cast_and_announce_vote(&node);
+                        }
+                        Ok(false) => {} // not applicable; full sync handles it
+                        Err(e) => println!("[sync] fast sync from {peer} failed ({e}); falling back to full sync"),
                     }
                 }
                 if let Ok(n) = sync_shared(&node, peer.as_str()) {

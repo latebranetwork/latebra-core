@@ -511,6 +511,14 @@ impl Ledger {
         lat_store::prune_state(self.store.base().as_ref(), &roots)
     }
 
+    /// Every object record (accounts, tokens, ticker index, contracts,
+    /// nullifiers, validators, meta), key-ordered — the full material state.
+    /// T19 fast sync serves these to a syncing peer, which rebuilds and
+    /// verifies the commitment from them via [`from_records`](Self::from_records).
+    pub fn object_records(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.store.scan_prefix(Column::Objects, b"")
+    }
+
     /// Commitment-trie nodes currently in the committed base (diagnostics /
     /// benchmarks — e.g. asserting [`prune_history`](Self::prune_history)
     /// actually shrank the store). Meaningful after a [`flush`](Self::flush);

@@ -514,6 +514,10 @@ pub enum BootMode {
     Snapshot,
     /// From genesis, re-validating every block (also the fresh-chain case).
     FullReplay,
+    /// T19: state records downloaded from a peer, commitment rebuilt locally
+    /// and verified against the PoW-validated header chain — no historical
+    /// proof re-verification.
+    FastSync,
 }
 
 /// Meta key holding the boot anchor: `height (8 LE) ‖ block id (32)` — which
@@ -738,6 +742,78 @@ impl Blockchain {
         Some(chain)
     }
 
+    /// T19 fast sync: adopt a peer-supplied chain WITHOUT replaying historical
+    /// transactions. `blocks` is the peer's full block list (height 1..=tip,
+    /// genesis excluded); `(anchor_height, anchor_id)` names the block whose
+    /// state the `records` (raw `Column::Objects` entries) represent.
+    ///
+    /// Trust model — nothing from the peer is believed, everything is checked:
+    /// every block passes full structural + PoW validation (`insert_skeleton`:
+    /// linkage, tx roots, difficulty retarget chain), the records are decoded
+    /// and the commitment REBUILT from them locally (`Ledger::from_records`),
+    /// and the derived root must equal the anchored header's `state_root` —
+    /// the same guarantee replaying would give, minus re-running years of
+    /// proofs. Blocks after the anchor are fully replayed. Faking any of it
+    /// requires out-mining the whole chain.
+    ///
+    /// Only a FRESH chain (height 0) may fast-sync. Returns whether the chain
+    /// was adopted; on `false` the chain is untouched and the caller falls
+    /// back to ordinary full-validation sync.
+    pub fn fast_sync_adopt(
+        &mut self,
+        blocks: &[Vec<u8>],
+        anchor_height: u64,
+        anchor_id: [u8; 32],
+        records: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> bool {
+        if self.active_height != 0 || anchor_height == 0 || records.is_empty() {
+            return false;
+        }
+        // Rebuild the ledger from the raw records on a fresh in-memory base.
+        let base: Arc<dyn KVStore> = Arc::new(lat_store::MemStore::new());
+        {
+            let mut batch = lat_store::WriteBatch::new();
+            for (key, value) in records {
+                batch.put(Column::Objects, key, value);
+            }
+            base.write(batch);
+        }
+        let Some(ledger) = Ledger::from_records(base) else { return false };
+        let snap =
+            snapshot::Snapshot { height: anchor_height, block_id: anchor_id, ledger };
+        let genesis_difficulty = self.tree[&self.genesis_id].child_difficulty;
+        let Some(built) = Self::replay_from_snapshot(
+            snap,
+            blocks,
+            &self.premine,
+            &self.public_premine,
+            genesis_difficulty,
+        ) else {
+            return false;
+        };
+        if built.genesis_id != self.genesis_id {
+            return false; // wrong network
+        }
+        // Verified: adopt the tree + state, keep OUR stores/config, persist
+        // every block, and move the state onto the durable base (T7 anchor).
+        for bytes in blocks {
+            let Some(block) = Block::decode(bytes) else { return false };
+            if let Some(s) = &self.store {
+                s.append(&block.header.id(), bytes, &block.txs);
+            }
+        }
+        self.tree = built.tree;
+        self.active_tip = built.active_tip;
+        self.active_height = built.active_height;
+        self.active_chain = built.active_chain;
+        self.active_state = built.active_state;
+        self.recent_sets.clear();
+        self.note_validator_set();
+        self.rehome_state();
+        self.boot_mode = BootMode::FastSync;
+        true
+    }
+
     /// Move the active state onto the durable base (with the tip anchor in the
     /// same atomic batch), replacing whatever state the base held. Called when
     /// the active ledger lives off-base: after a snapshot/full-replay boot and
@@ -797,8 +873,11 @@ impl Blockchain {
 
     /// Insert an already-validated block into the tree WITHOUT applying its
     /// transactions — the structural half of [`apply_block`] (parent linkage,
-    /// height, tx root, PoW, fork choice). Only for replaying our own log
-    /// during a snapshot boot; never for blocks from the network.
+    /// height, tx root, PoW, fork choice). Sound only where skipped tx
+    /// application is re-checked elsewhere: replaying our own log (blocks were
+    /// fully validated when first accepted) and T19 fast sync (the anchor's
+    /// state is verified against the header-committed root, and the tail after
+    /// it is fully replayed).
     fn insert_skeleton(&mut self, block: Block, encoded: Vec<u8>) -> Result<(), ChainError> {
         let id = block.header.id();
         if self.tree.contains_key(&id) {
@@ -881,6 +960,22 @@ impl Blockchain {
     /// Whether a block id is known (active chain OR a side branch).
     pub fn has_block(&self, id: &[u8; 32]) -> bool {
         self.tree.contains_key(id)
+    }
+
+    /// T19 fast-sync serving side: the active tip's `(height, block id)` anchor
+    /// plus every object record of the state AT that tip, key-ordered. A
+    /// syncing peer rebuilds the commitment from the records and verifies the
+    /// derived root against this anchor block's header — so the whole payload
+    /// is self-authenticating and needs no extra digests. `None` at height 0
+    /// (a fresh chain has nothing worth fast-syncing).
+    ///
+    /// Capture this under one node lock (records and anchor must describe the
+    /// SAME tip) and serve chunks from the captured copy.
+    pub fn state_sync_payload(&self) -> Option<(u64, [u8; 32], Vec<(Vec<u8>, Vec<u8>)>)> {
+        if self.active_height == 0 {
+            return None;
+        }
+        Some((self.active_height, self.active_tip, self.active_state.object_records()))
     }
 
     /// A block locator: ids of the ACTIVE chain, newest first, exponentially
@@ -2446,5 +2541,88 @@ mod tests {
             amount: 1, fee: MIN_TRANSFER_FEE - 1, nonce: 0, sig: [0u8; 64],
         };
         assert!(matches!(check_tx(&tx), Err(ChainError::FeeTooLow)));
+    }
+
+    // --- T19 fast sync ---
+
+    /// A source chain with a few blocks of real state changes, plus its full
+    /// encoded block list (height 1..=tip) and fast-sync payload.
+    fn fast_sync_fixture() -> (Blockchain, Vec<Vec<u8>>, (u64, [u8; 32], Vec<(Vec<u8>, Vec<u8>)>)) {
+        let mut rng = OsRng;
+        let genesis_sk = SecretKey::random(&mut rng);
+        let genesis_id = genesis_sk.public_key().to_bytes();
+        let receiver_sk = SecretKey::random(&mut rng);
+        let receiver_id = receiver_sk.public_key().to_bytes();
+        let mut chain = Blockchain::genesis(&[(genesis_id, 1_000_000)], DEFAULT_DIFFICULTY);
+
+        let block1 = chain.mine(vec![mine_registration(receiver_id)]);
+        chain.apply_block(&block1).unwrap();
+        // Block 2: a real confidential transfer, so the synced state carries
+        // ciphertext balances, not just registrations.
+        let bal = chain.balance(&genesis_id, lat_state::LAT_TOKEN).unwrap();
+        let xfer = SolventTransfer::create(
+            &genesis_sk, &receiver_sk.public_key(), 250_000, MIN_TRANSFER_FEE,
+            1_000_000, &bal, 0, &mut rng,
+        )
+        .unwrap();
+        let block2 = chain.mine(chain.select_valid(vec![Transaction::SolventTransfer {
+            token: lat_state::LAT_TOKEN,
+            xfer,
+        }]));
+        chain.apply_block(&block2).unwrap();
+        let block3 = chain.mine(Vec::new());
+        chain.apply_block(&block3).unwrap();
+
+        let blocks: Vec<Vec<u8>> =
+            (1..=chain.height()).map(|h| chain.block_bytes(h).unwrap().to_vec()).collect();
+        let payload = chain.state_sync_payload().unwrap();
+        (chain, blocks, payload)
+    }
+
+    #[test]
+    fn fast_sync_adopts_peer_chain_without_replaying_history() {
+        let (source, blocks, (anchor_h, anchor_id, records)) = fast_sync_fixture();
+        // Same genesis parameters = same network.
+        let genesis_premine = source.premine.clone();
+        let mut fresh = Blockchain::genesis(&genesis_premine, DEFAULT_DIFFICULTY);
+
+        assert!(fresh.fast_sync_adopt(&blocks, anchor_h, anchor_id, records));
+        assert_eq!(fresh.height(), source.height());
+        assert_eq!(fresh.tip(), source.tip());
+        assert_eq!(fresh.state_root(), source.state_root());
+        assert_eq!(fresh.boot_mode(), BootMode::FastSync);
+    }
+
+    #[test]
+    fn fast_sync_rejects_tampered_records() {
+        let (source, blocks, (anchor_h, anchor_id, mut records)) = fast_sync_fixture();
+        // Flip a byte in one record value: the rebuilt commitment can no longer
+        // match the anchor header's state root.
+        let v = &mut records.last_mut().unwrap().1;
+        let last = v.len() - 1;
+        v[last] ^= 1;
+
+        let mut fresh = Blockchain::genesis(&source.premine.clone(), DEFAULT_DIFFICULTY);
+        assert!(!fresh.fast_sync_adopt(&blocks, anchor_h, anchor_id, records));
+        assert_eq!(fresh.height(), 0, "rejected sync must leave the chain untouched");
+        assert_eq!(fresh.boot_mode(), BootMode::FullReplay);
+    }
+
+    #[test]
+    fn fast_sync_rejects_wrong_network_and_non_fresh_chain() {
+        let (source, blocks, (anchor_h, anchor_id, records)) = fast_sync_fixture();
+
+        // Different premine = different genesis = foreign network.
+        let other_id = SecretKey::random(&mut OsRng).public_key().to_bytes();
+        let mut foreign = Blockchain::genesis(&[(other_id, 5)], DEFAULT_DIFFICULTY);
+        assert!(!foreign.fast_sync_adopt(&blocks, anchor_h, anchor_id, records.clone()));
+        assert_eq!(foreign.height(), 0);
+
+        // A chain that already has blocks must full-sync, never fast-sync.
+        let mut busy = Blockchain::genesis(&source.premine.clone(), DEFAULT_DIFFICULTY);
+        let b1 = busy.mine(Vec::new());
+        busy.apply_block(&b1).unwrap();
+        assert!(!busy.fast_sync_adopt(&blocks, anchor_h, anchor_id, records));
+        assert_eq!(busy.height(), 1);
     }
 }

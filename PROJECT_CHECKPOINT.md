@@ -2,7 +2,7 @@
 
 > Living document. Paste "continue from the latest checkpoint" in a new
 > conversation and work resumes from the **Current Task** below.
-> Last updated: 2026-07-07 (Checkpoint 15 — T17 tx gossip + compact announces; protocol v2).
+> Last updated: 2026-07-11 (Checkpoint 16 — T19 fast state sync; M4 network complete except parked T18).
 
 ## 0. Mission
 
@@ -334,8 +334,27 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
   handshake refuses old nodes; all testnet binaries must be rebuilt
   together). Deferred: compression (blocks are small until traffic says
   otherwise), set-reconciliation gossip (Erlay-style) at real scale.  ← T14
-- [ ] T18 Peer discovery, DNS seeds, bootstrap nodes.
-- [ ] T19 Fast sync + state sync integration.  ← T7, T14
+- [ ] T18 Peer discovery, DNS seeds, bootstrap nodes. (PARKED: code is a
+  seed-list constant + resolve loop; needs the user's real deployment hosts.)
+- [x] **T19 Fast sync + state sync integration.** A fresh node bootstraps by
+  downloading the peer's object records instead of replaying every historical
+  proof. New P2P messages (tags 34–37): `GetStateManifest` → `StateManifest`
+  (anchor height/id + record count + chunk count; the peer captures anchor +
+  records atomically under ONE node lock and keeps them per-connection, so
+  chunks stay consistent while it mines) and `GetStateChunk(n)` → `StateChunk`
+  (≤1 MiB record runs, under MAX_MSG_BYTES). No per-chunk digests needed: the
+  syncing node rebuilds the commitment locally (`Ledger::from_records`) and
+  `Blockchain::fast_sync_adopt` accepts only if the derived root equals the
+  anchor header's `state_root` on a chain whose every header passed full
+  structural+PoW validation (`insert_skeleton`), with the post-anchor tail
+  fully replayed — same guarantee as replay, minus re-running the proofs.
+  Only a FRESH chain (height 0) may fast-sync; any failure leaves it
+  untouched and the caller falls back to `sync_shared`. `latebrad` tries it
+  in the peer loop when at height 0; new `BootMode::FastSync`. Proven live:
+  a fresh node jumped to height 52 in one shot, tracked the miner to 57, and
+  RESTARTED as "state records + tail replay" at the tip (T7 anchor persisted
+  by `rehome_state`). Tests: 3 lat-chain (adopt / tampered-record reject /
+  wrong-network + non-fresh reject) + 1 lat-p2p TCP end-to-end.  ← T7, T14
 
 ### M5 — Ecosystem & APIs
 - [ ] T20 RPC / REST / WS / gRPC surface.  ← T3
@@ -480,24 +499,21 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
 
 ## 9. Current Task
 
-**T19 — Fast state sync** (T17 done; T18 DNS seeds is deliberately parked:
-it needs real deployment hostnames, which is the user's infra step — the
-code side is a seed-list constant + resolve loop, an hour of work once hosts
-exist). T19 is the deferred network half of T7: a fresh node today replays
-every block (re-verifying every proof) to reach the tip. Goal: download the
-state records at a FINALIZED block instead. Sketch: (1) new P2P messages —
-`GetStateManifest` (reply: finalized block id/height + record count + chunk
-digests), `GetStateChunk(n)` (reply: a contiguous run of Objects records);
-(2) the syncing node rebuilds the commitment from the received records
-(`Ledger::from_records` already does exactly this validation) and accepts
-iff the derived root equals the FINALIZED header's `state_root` — the T14
-certificate is what makes trusting that header sound without replay; (3)
-then tail-sync blocks after the anchor as today. Bound chunk sizes
-(MAX_MSG_BYTES); serve from the durable base (T7 anchor). Honest limit: the
-serving node must still hold the anchor's exact record set — serve only the
-CURRENT anchor.
+**T22 — Ops: metrics/logging, Docker, CI** (T19 done — see roadmap; the
+owner's stated path is testnet push → external audit → mainnet, which makes
+M6 the critical path now). Suggested scope: a Dockerfile + compose for a
+multi-node testnet, GitHub Actions CI (fmt/clippy/test on push), and basic
+node metrics (height, peers, mempool, finality watermark) exposed on an HTTP
+endpoint. Then T23 (fuzzing of decoders — Msg, Block, Transaction — plus a
+long-running multi-node soak) rounds out the audit package. Remaining
+non-ops gaps for mainnet: T18 (needs real seed hosts), T20/T21 (API/SDK
+polish, not launch-blocking).
 
-Alternative order: T20 (RPC surface consolidation) or T22 (Docker/CI).
+Design note honored vs the original T19 sketch: the anchor is the peer's
+CURRENT tip, not the finality watermark — every served header passes full
+PoW validation on the syncing side, so trust matches the snapshot-boot
+model; chunk digests were dropped as redundant (the rebuilt root check
+covers the whole record set).
 
 ### Build/verify commands
 - Tests: `cargo test -p lat-store` (+ per-crate as tasks land).
