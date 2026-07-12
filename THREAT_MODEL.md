@@ -5,6 +5,10 @@
 > it before running a node, and **before putting anything of value on the chain.**
 > The short version: Latebra is a working dual-mode privacy L1 suitable for a
 > public **testnet**; it is **not** ready to secure real value.
+>
+> Auditors: the mathematics of the privacy scheme is specified in
+> [CRYPTO_SPEC.md](CRYPTO_SPEC.md) — the intended scoping document for a
+> cryptographic review.
 
 ## 1. What is enforced (sound today)
 

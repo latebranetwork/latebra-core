@@ -1956,6 +1956,42 @@ mod tests {
     }
 
     #[test]
+    fn anon_transfer_conserves_total_supply_no_inflation() {
+        // Red-team (Gap 1): the strongest inflation check — decrypt EVERY
+        // balance before and after an anonymous transfer and assert the total
+        // is exactly conserved (sender's whole ring + receiver + the fee that
+        // will go to the miner). A hidden amount that credited more than it
+        // debited would show up here as minted supply.
+        let mut rng = OsRng;
+        let (mut ledger, sks, ids) = ledger_with_ring(5, 100_000, &mut rng);
+        let receiver = SecretKey::random(&mut rng);
+        let height = 3 * EPOCH_BLOCKS as usize as u64;
+
+        let ring_before: u64 =
+            sks.iter().zip(&ids).map(|(s, id)| s.decrypt(&ledger.balance(id, LAT_TOKEN).unwrap(), 24).unwrap()).sum();
+
+        let amount = 12_345;
+        let fee = 1_000;
+        let tx = anon_tx(&ledger, &sks, &ids, 2, 100_000, &receiver.public_key(), amount, fee, height, &mut rng);
+        let output = match &tx {
+            Transaction::AnonTransfer { xfer, .. } => xfer.output,
+            _ => unreachable!(),
+        };
+        ledger.apply_at(&tx, height).unwrap();
+
+        let ring_after: u64 =
+            sks.iter().zip(&ids).map(|(s, id)| s.decrypt(&ledger.balance(id, LAT_TOKEN).unwrap(), 24).unwrap()).sum();
+        let spend = lat_crypto::stealth_receive(&receiver, &output.ephemeral, &output.one_time).unwrap();
+        let received = spend.decrypt(&ledger.pending(&spend.public_key().to_bytes(), LAT_TOKEN).unwrap(), 24).unwrap();
+
+        // Value out of the ring == value into the receiver + fee (fee is
+        // credited to the miner at the block level, not modelled in apply_at).
+        assert_eq!(ring_before - ring_after, amount + fee, "debit total = amount + fee");
+        assert_eq!(received, amount, "receiver credited exactly the hidden amount");
+        assert_eq!(ring_before, ring_after + received + fee, "no supply created or destroyed");
+    }
+
+    #[test]
     fn anon_transfer_second_spend_same_epoch_is_rejected() {
         let mut rng = OsRng;
         let (mut ledger, sks, ids) = ledger_with_ring(3, 100_000, &mut rng);

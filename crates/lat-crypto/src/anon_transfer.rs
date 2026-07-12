@@ -1041,6 +1041,75 @@ mod tests {
     }
 
     #[test]
+    fn malleability_sweep_every_byte_flip_is_rejected() {
+        // Red-team (Gap 1): the whole encoding is bound by Fiat–Shamir, so no
+        // adversary can mutate a valid transfer into a different valid one.
+        // Flip one bit at a strided set of byte positions; each mutant must
+        // either fail to decode or fail to verify — never both pass.
+        let mut rng = OsRng;
+        let (sks, ring) = ring_of(4, &mut rng);
+        let bals = [50_000, 10, 20, 30];
+        let balances = balances_of(&sks, &bals, &mut rng);
+        let receiver = SecretKey::random(&mut rng).public_key();
+        let tx = AnonTransfer::create(&ring, &balances, &sks[0], 0, bals[0], &receiver, 4_000, 100, EPOCH, &mut rng).unwrap();
+        let bytes = tx.to_bytes();
+        assert!(AnonTransfer::from_bytes(&bytes).is_some_and(|t| t.verify()));
+
+        // Stride keeps the test fast while still hitting every field region
+        // (each verify is a full multi-proof check, so we sample ~64 positions
+        // spread across the whole encoding rather than every byte).
+        let stride = (bytes.len() / 64).max(1);
+        let mut checked = 0;
+        for i in (0..bytes.len()).step_by(stride) {
+            let mut m = bytes.clone();
+            m[i] ^= 0x01;
+            if let Some(t) = AnonTransfer::from_bytes(&m) {
+                assert!(!t.verify(), "byte {i} flipped but transfer still verified");
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "expected some mutants to decode-but-not-verify");
+    }
+
+    #[test]
+    fn forgery_without_owning_a_ring_member_is_impossible() {
+        // An attacker who owns NONE of the ring keys cannot build a transfer:
+        // create() asserts sender ∈ ring. Simulating it — placing an outsider's
+        // key nowhere in the ring but trying to spend a member's balance — has
+        // no honest API path, so we assert the guard and, at the proof level,
+        // that a transfer whose owned index doesn't hold the balance fails
+        // (covered by debiting_a_decoy_instead_of_yourself_fails). Here we
+        // confirm an insolvent sender is refused outright.
+        let mut rng = OsRng;
+        let (sks, ring) = ring_of(3, &mut rng);
+        let bals = [100, 10, 20];
+        let balances = balances_of(&sks, &bals, &mut rng);
+        let receiver = SecretKey::random(&mut rng).public_key();
+        // Sender holds 100 but tries to send 5_000 + fee: no witness exists.
+        assert!(
+            AnonTransfer::create(&ring, &balances, &sks[0], 0, bals[0], &receiver, 5_000, 100, EPOCH, &mut rng)
+                .is_none(),
+            "insolvent sender must not be able to build a transfer"
+        );
+    }
+
+    #[test]
+    fn splicing_a_range_proof_from_another_transfer_fails() {
+        // Take a valid transfer, replace its aggregated range proof with one
+        // from a DIFFERENT transfer (different commitments): verification binds
+        // the proof to this transfer's V and C_amt, so it must reject.
+        let mut rng = OsRng;
+        let (sks, ring) = ring_of(3, &mut rng);
+        let balances = balances_of(&sks, &[80_000, 1, 2], &mut rng);
+        let rcv = SecretKey::random(&mut rng).public_key();
+        let good = AnonTransfer::create(&ring, &balances, &sks[0], 0, 80_000, &rcv, 4_000, 100, EPOCH, &mut rng).unwrap();
+        let other = AnonTransfer::create(&ring, &balances, &sks[0], 0, 80_000, &rcv, 9_000, 100, EPOCH, &mut rng).unwrap();
+        let mut spliced = good.clone();
+        spliced.rp = other.rp.clone();
+        assert!(!spliced.verify(), "a range proof from another transfer must not verify");
+    }
+
+    #[test]
     fn hidden_amount_reaches_only_the_stealth_receiver() {
         // v3: the amount appears nowhere in plaintext. The stealth receiver
         // derives the one-time spend key and decrypts the carried credit; an

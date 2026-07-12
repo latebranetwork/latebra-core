@@ -2,7 +2,7 @@
 
 > Living document. Paste "continue from the latest checkpoint" in a new
 > conversation and work resumes from the **Current Task** below.
-> Last updated: 2026-07-12 (Checkpoint 19 — F2 closed: hidden-amount anonymous transfers, AnonTransfer v3).
+> Last updated: 2026-07-12 (Checkpoint 20 — Gap-1 pre-audit: CRYPTO_SPEC.md + adversarial regressions).
 
 ## 0. Mission
 
@@ -553,6 +553,20 @@ mine→apply→stealth-receive e2e and new tamper tests (shifted C_debit,
 inflated credit, shifted fee all rejected). THREAT_MODEL.md §2 +
 ANON_INTEGRATION.md updated. Anon path now hides sender, receiver, AND
 amount — only fee/ring-size/epoch/timing remain visible.
+
+**Gap-1 pre-audit hardening DONE (2026-07-12):** wrote `CRYPTO_SPEC.md` —
+the auditor-facing math of the whole privacy scheme (ElGamal balances,
+solvent transfer's 7 fused relations, AnonTransfer v3 full statement +
+verification, stealth, epoch nullifier, finality sig; assumptions + known
+limitations + code map) — linked from THREAT_MODEL.md and README as the
+review scoping doc. Added adversarial regressions: chain-level
+supply-conservation oracle (`anon_transfer_conserves_total_supply_no_inflation`,
+lat-state — decrypts every balance before/after, asserts ring_before ==
+ring_after + received + fee, so a hidden over-credit surfaces as minted
+supply); malleability sweep (`malleability_sweep_every_byte_flip_is_rejected`,
+~64 strided bit-flips, each mutant must decode-but-not-verify or not decode);
+insolvent-sender forgery refusal; and range-proof splicing rejection. All
+green; clippy gate clean.
 
 The remaining gates are NOT code tasks:
 

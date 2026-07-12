@@ -11,7 +11,7 @@ BSD) — it does not derive from, or carry the license of, any other project.
 > **Status: testnet-grade.** The cryptography, consensus, and node are implemented
 > and tested, and a daemon runs across machines. It has **not** been through a
 > professional security audit and must not hold real value until it has. See
-> [Status](#status), the [threat model](THREAT_MODEL.md) (what is and isn't
+> [Status](#status), the [threat model](THREAT_MODEL.md) + [crypto spec](CRYPTO_SPEC.md) (what is and isn't
 > guaranteed), and the [launch checklist](LAUNCH.md) for standing up a public
 > testnet.
 
