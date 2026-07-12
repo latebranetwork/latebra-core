@@ -736,7 +736,8 @@ mod tests {
             .collect();
         let receiver = SecretKey::random(&mut rng);
         let xfer = lat_crypto::AnonTransfer::create(
-            &ring, &balances, &sks[1], 1, 50_000, &receiver.public_key(), 1_000, 100, 3, &mut rng,
+            &ring, &balances, &sks[1], 1, 50_000, &receiver.public_key(), 0, 1_000, 100, 3,
+            &mut rng,
         )
         .expect("solvent");
 
@@ -752,7 +753,7 @@ mod tests {
         if let (Transaction::AnonTransfer { xfer: a, .. }, Transaction::AnonTransfer { xfer: b, .. }) =
             (&tx, &decoded)
         {
-            assert!(b.verify());
+            assert!(b.verify(0));
             assert_eq!(a.nullifier(), b.nullifier());
         } else {
             panic!("decoded to a different variant");

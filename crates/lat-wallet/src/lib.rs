@@ -517,7 +517,8 @@ impl Wallet {
         let (ring, balances): (Vec<PublicKey>, Vec<Ciphertext>) = pool.into_iter().unzip();
 
         let xfer = AnonTransfer::create(
-            &ring, &balances, &self.secret, sender_index, my_balance, &receiver.key, amount, fee, epoch, rng,
+            &ring, &balances, &self.secret, sender_index, my_balance, &receiver.key, token,
+            amount, fee, epoch, rng,
         )?;
         Some(Transaction::AnonTransfer { token, xfer })
     }

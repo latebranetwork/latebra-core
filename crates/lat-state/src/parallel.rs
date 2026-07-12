@@ -172,8 +172,8 @@ fn preverify_confidential(
                     for (i, job) in chunk {
                         match job {
                             Job::Anon(tx) => {
-                                if let Transaction::AnonTransfer { xfer, .. } = tx {
-                                    if xfer.verify() {
+                                if let Transaction::AnonTransfer { token, xfer } = tx {
+                                    if xfer.verify(*token) {
                                         out.push((*i, ProofPass::Anon));
                                     }
                                 }

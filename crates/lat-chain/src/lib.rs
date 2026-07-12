@@ -152,8 +152,9 @@ pub fn check_tx(tx: &Transaction) -> Result<(), ChainError> {
 }
 
 /// Consensus cap on an anonymous transfer's ring (anonymity-set) size. Wire
-/// decoding already enforces the minimum of 2.
-pub const MAX_RING_SIZE: usize = 16;
+/// decoding enforces both bounds (2..=MAX) before allocating, so this is the
+/// crypto crate's constant re-exported — the two can never diverge.
+pub const MAX_RING_SIZE: usize = lat_crypto::MAX_RING_SIZE;
 
 /// Initial block reward: 50 LAT (5 decimals → 5,000,000 base units).
 pub const INITIAL_BLOCK_REWARD: u64 = 5_000_000;
@@ -1558,7 +1559,7 @@ mod tests {
         let balances: Vec<_> = ids.iter().map(|id| chain.balance(id, lat).unwrap()).collect();
         let xfer = lat_crypto::AnonTransfer::create(
             &ring, &balances, &sks[2], 2, 1_000_000, &receiver_sk.public_key(),
-            40_000, MIN_TRANSFER_FEE, lat_state::epoch_of(1), &mut rng,
+            lat, 40_000, MIN_TRANSFER_FEE, lat_state::epoch_of(1), &mut rng,
         )
         .unwrap();
         let nullifier = xfer.nullifier();
@@ -1598,7 +1599,7 @@ mod tests {
         let bal0 = sks[0].decrypt(&balances2[0], 24).unwrap();
         let future = lat_crypto::AnonTransfer::create(
             &ring, &balances2, &sks[0], 0, bal0, &receiver_sk.public_key(),
-            1_000, MIN_TRANSFER_FEE, lat_state::epoch_of(2) + 1, &mut rng,
+            lat, 1_000, MIN_TRANSFER_FEE, lat_state::epoch_of(2) + 1, &mut rng,
         )
         .unwrap();
         let future_block = chain.mine(vec![Transaction::AnonTransfer { token: lat, xfer: future }]);

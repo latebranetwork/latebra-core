@@ -305,7 +305,7 @@ mod tests {
         let balances: Vec<_> = sks.iter().map(|s| s.public_key().encrypt(1_000_000, &mut rng)).collect();
         let receiver = SecretKey::random(&mut rng).public_key();
         let xfer = lat_crypto::AnonTransfer::create(
-            &ring, &balances, &sks[0], 0, 1_000_000, &receiver, 1_000, fee, epoch, &mut rng,
+            &ring, &balances, &sks[0], 0, 1_000_000, &receiver, 0, 1_000, fee, epoch, &mut rng,
         )
         .expect("solvent");
         Transaction::AnonTransfer { token: 0, xfer }

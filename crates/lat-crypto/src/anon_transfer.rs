@@ -67,6 +67,17 @@
 //! nullifier conflicts (`lat-chain`) are all wired in. Decoy selection is
 //! wallet-side and still open. See `ANON_INTEGRATION.md`. Do not ship with
 //! value before an audit.
+//!
+//! # Known liveness tradeoff (audit finding F-4)
+//! The proof binds every ring member's **current** balance ciphertext, and
+//! consensus rejects the transfer if any of them has changed by inclusion time
+//! (`StaleRingBalance`). So any transaction touching any ring member — including
+//! that member being picked as a *decoy* in someone else's transfer — invalidates
+//! a pending anonymous transfer. This is the Zether-family tradeoff of an
+//! account-model private chain: wallets should build anon transfers early in an
+//! epoch and be prepared to rebuild with a fresh ring on rejection; a targeted
+//! sender can be griefed into retrying, but never into losing funds (a rejected
+//! transfer pays no fee and its nullifier is not consumed).
 
 use bulletproofs::{BulletproofGens, PedersenGens, RangeProof};
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;
@@ -77,14 +88,30 @@ use merlin::Transcript as MerlinTranscript;
 use rand::{CryptoRng, RngCore};
 use sha2::{Digest, Sha512};
 
+use std::sync::OnceLock;
+
 use crate::{commit_delta, stealth_send, Ciphertext, PublicKey, SecretKey, StealthOutput};
 
 const RANGE_BITS: usize = 64;
+
+/// Consensus cap on the anonymity-set size, enforced at wire decoding too
+/// (`from_bytes` rejects larger rings before allocating for them — audit
+/// finding F-1: the length prefix is attacker-controlled network input).
+/// `lat-chain` re-exports this as its consensus constant so the two can
+/// never diverge.
+pub const MAX_RING_SIZE: usize = 16;
 
 /// The Pedersen blinding base `H` (independent of `G`), shared with the delta
 /// commitments and the Bulletproofs range-proof commitment.
 fn blinding_base() -> RistrettoPoint {
     PedersenGens::default().B_blinding
+}
+
+/// Cached Bulletproofs generators (audit finding F-5): building them is
+/// non-trivial and `verify` sits on the hot block-validation path.
+fn bp_gens() -> &'static BulletproofGens {
+    static GENS: OnceLock<BulletproofGens> = OnceLock::new();
+    GENS.get_or_init(|| BulletproofGens::new(RANGE_BITS, 2))
 }
 
 /// The per-epoch nullifier base `G_epoch = H_p("Latebra.Epoch" ‖ epoch)`. Independent
@@ -126,15 +153,20 @@ struct ZeroOrDebit {
     z1: Scalar,
 }
 
-/// Fiat–Shamir challenge for one [`ZeroOrDebit`] proof.
+/// Fiat–Shamir challenge for one [`ZeroOrDebit`] proof. `stmt` is the fused
+/// statement challenge (audit finding F-3): folding it in ties every
+/// sub-proof to THIS transfer's full public statement, so none can be spliced
+/// into another transfer even if the local inputs coincided.
 fn zod_challenge(
+    stmt: &Scalar,
     c: &RistrettoPoint,
     c_debit: &RistrettoPoint,
     a0: &RistrettoPoint,
     a1: &RistrettoPoint,
 ) -> Scalar {
     let mut h = Sha512::new();
-    h.update(b"Latebra.AnonTransfer.zod.v1");
+    h.update(b"Latebra.AnonTransfer.zod.v2");
+    h.update(stmt.as_bytes());
     for p in [c, c_debit, a0, a1] {
         h.update(p.compress().as_bytes());
     }
@@ -149,6 +181,7 @@ impl ZeroOrDebit {
     /// or to the debit committed by `C_debit = debit·G + s_d·H`
     /// (`debit_branch = true`, witness `s − s_d`).
     fn prove<R: RngCore + CryptoRng>(
+        stmt: &Scalar,
         c: &RistrettoPoint,
         c_debit: &RistrettoPoint,
         debit_branch: bool,
@@ -164,7 +197,7 @@ impl ZeroOrDebit {
             let z0 = Scalar::random(rng);
             let a0 = h * z0 - c * e0;
             let a1 = h * k;
-            let e = zod_challenge(c, c_debit, &a0, &a1);
+            let e = zod_challenge(stmt, c, c_debit, &a0, &a1);
             let e1 = e - e0;
             ZeroOrDebit { a0, a1, e0, z0, z1: k + e1 * witness }
         } else {
@@ -173,15 +206,15 @@ impl ZeroOrDebit {
             let z1 = Scalar::random(rng);
             let a1 = h * z1 - diff * e1;
             let a0 = h * k;
-            let e = zod_challenge(c, c_debit, &a0, &a1);
+            let e = zod_challenge(stmt, c, c_debit, &a0, &a1);
             let e0 = e - e1;
             ZeroOrDebit { a0, a1, e0, z0: k + e0 * witness, z1 }
         }
     }
 
-    fn verify(&self, c: &RistrettoPoint, c_debit: &RistrettoPoint) -> bool {
+    fn verify(&self, stmt: &Scalar, c: &RistrettoPoint, c_debit: &RistrettoPoint) -> bool {
         let h = blinding_base();
-        let e = zod_challenge(c, c_debit, &self.a0, &self.a1);
+        let e = zod_challenge(stmt, c, c_debit, &self.a0, &self.a1);
         let e1 = e - self.e0;
         h * self.z0 == self.a0 + c * self.e0 && h * self.z1 == self.a1 + (c - c_debit) * e1
     }
@@ -248,6 +281,7 @@ pub struct AnonTransfer {
 /// stealth receiver, and the nullifier — so nothing can be mauled after proving.
 #[allow(clippy::too_many_arguments)]
 fn fused_challenge(
+    token: u32,
     ring: &[PublicKey],
     balances: &[Ciphertext],
     deltas: &[RistrettoPoint],
@@ -265,7 +299,10 @@ fn fused_challenge(
     a4: &[RistrettoPoint],
 ) -> Scalar {
     let mut h = Sha512::new();
-    h.update(b"Latebra.AnonTransfer.v3");
+    h.update(b"Latebra.AnonTransfer.v3.1");
+    // Audit finding F-2: bind the token id the transfer moves, so a valid
+    // proof cannot be re-wrapped under a different token envelope.
+    h.update(token.to_le_bytes());
     h.update((ring.len() as u64).to_le_bytes());
     for pk in ring {
         h.update(pk.0.compress().as_bytes());
@@ -304,13 +341,15 @@ fn fused_challenge(
 /// Challenge for the conservation (sum-to-debit) Schnorr — the debit is hidden,
 /// so the challenge binds its commitment.
 fn sum_challenge(
+    stmt: &Scalar,
     deltas: &[RistrettoPoint],
     c_debit: &RistrettoPoint,
     agg_target: &RistrettoPoint,
     a: &RistrettoPoint,
 ) -> Scalar {
     let mut h = Sha512::new();
-    h.update(b"Latebra.AnonTransfer.sum.v3");
+    h.update(b"Latebra.AnonTransfer.sum.v3.1");
+    h.update(stmt.as_bytes());
     for c in deltas {
         h.update(c.compress().as_bytes());
     }
@@ -325,6 +364,7 @@ fn sum_challenge(
 
 /// Challenge for one brick-E value-movement link.
 fn link_challenge(
+    stmt: &Scalar,
     y: &PublicKey,
     c_delta: &RistrettoPoint,
     enc: &Ciphertext,
@@ -333,7 +373,8 @@ fn link_challenge(
     a3: &RistrettoPoint,
 ) -> Scalar {
     let mut h = Sha512::new();
-    h.update(b"Latebra.AnonTransfer.link.v1");
+    h.update(b"Latebra.AnonTransfer.link.v2");
+    h.update(stmt.as_bytes());
     for p in [&y.0, c_delta, &enc.c, &enc.d, a1, a2, a3] {
         h.update(p.compress().as_bytes());
     }
@@ -370,6 +411,7 @@ impl AnonTransfer {
         sender_index: usize,
         sender_balance: u64,
         receiver: &PublicKey,
+        token: u32,
         amount: u64,
         fee: u64,
         epoch: u64,
@@ -410,16 +452,15 @@ impl AnonTransfer {
         // V = b'·G + γ·H, and C_amt = amount·G + s_d·H (== C_debit − fee·G, so the
         // amount slot proves debit ≥ fee with no scalar wraparound).
         let pc = PedersenGens::default();
-        let bp = BulletproofGens::new(RANGE_BITS, 2);
         let gamma = Scalar::random(rng);
         let mut tr = MerlinTranscript::new(b"Latebra.AnonTransfer.range.v3");
         let (rp, comms) = RangeProof::prove_multiple(
-            &bp, &pc, &mut tr, &[remaining, amount], &[gamma, s_d], RANGE_BITS,
+            bp_gens(), &pc, &mut tr, &[remaining, amount], &[gamma, s_d], RANGE_BITS,
         )
         .ok()?;
         let v_comp = comms[0];
         let v = v_comp.decompress()?;
-        debug_assert_eq!(comms[1].decompress()?, c_debit - G * Scalar::from(fee));
+        debug_assert_eq!(comms[1].decompress(), Some(c_debit - G * Scalar::from(fee)));
 
         // --- epoch nullifier and stealth receiver ------------------------------
         let x = sender.0;
@@ -468,8 +509,8 @@ impl AnonTransfer {
         a4[l] = g_epoch * k_x;
 
         let c = fused_challenge(
-            ring, balances, &deltas, &enc, &c_debit, &credit, fee, epoch, &nullifier, &v, &output,
-            &a1, &a2, &a3, &a4,
+            token, ring, balances, &deltas, &enc, &c_debit, &credit, fee, epoch, &nullifier, &v,
+            &output, &a1, &a2, &a3, &a4,
         );
         e[l] = c - sum_decoy;
         z_x[l] = k_x + e[l] * x;
@@ -483,7 +524,7 @@ impl AnonTransfer {
         for i in 0..n {
             let (debit_branch, witness) =
                 if i == sender_index { (true, blinds[i] - s_d) } else { (false, blinds[i]) };
-            membership.push(ZeroOrDebit::prove(&deltas[i], &c_debit, debit_branch, &witness, rng));
+            membership.push(ZeroOrDebit::prove(&c, &deltas[i], &c_debit, debit_branch, &witness, rng));
         }
 
         // --- brick E: link each Enc_i to the same value as C_i -----------------
@@ -494,7 +535,7 @@ impl AnonTransfer {
             let a1l = G * k_d + h * k_s2;
             let a2l = G * k_d + ring[i].0 * k_y;
             let a3l = G * k_y;
-            let el = link_challenge(&ring[i], &deltas[i], &enc[i], &a1l, &a2l, &a3l);
+            let el = link_challenge(&c, &ring[i], &deltas[i], &enc[i], &a1l, &a2l, &a3l);
             links.push(DeltaLink {
                 a1: a1l,
                 a2: a2l,
@@ -515,7 +556,7 @@ impl AnonTransfer {
             let a1l = G * k_d + h * k_s2;
             let a2l = G * k_d + output.one_time.0 * k_y;
             let a3l = G * k_y;
-            let el = link_challenge(&output.one_time, &c_amt, &credit, &a1l, &a2l, &a3l);
+            let el = link_challenge(&c, &output.one_time, &c_amt, &credit, &a1l, &a2l, &a3l);
             DeltaLink {
                 a1: a1l,
                 a2: a2l,
@@ -532,7 +573,7 @@ impl AnonTransfer {
         let agg_target = agg - c_debit; // = σ'·H when Σδ = debit
         let k_sum = Scalar::random(rng);
         let sum_a = h * k_sum;
-        let e_sum = sum_challenge(&deltas, &c_debit, &agg_target, &sum_a);
+        let e_sum = sum_challenge(&c, &deltas, &c_debit, &agg_target, &sum_a);
         let sum_z = k_sum + e_sum * sigma;
 
         Some(AnonTransfer {
@@ -573,8 +614,10 @@ impl AnonTransfer {
     ///
     /// Note: this checks internal consistency for `self.epoch`; consensus must
     /// additionally verify `self.epoch` equals the containing block's epoch and that
-    /// `self.nullifier()` is unseen.
-    pub fn verify(&self) -> bool {
+    /// `self.nullifier()` is unseen. `token` is the id of the token the containing
+    /// transaction moves — it is bound into the Fiat–Shamir transcript (F-2), so a
+    /// proof built for one token cannot be re-wrapped under another.
+    pub fn verify(&self, token: u32) -> bool {
         let n = self.ring.len();
         if n < 2
             || self.balances.len() != n
@@ -593,11 +636,10 @@ impl AnonTransfer {
         //    amount (C_amt = C_debit − fee·G) are both in [0, 2^64).
         let c_amt = self.c_debit - G * Scalar::from(self.fee);
         let pc = PedersenGens::default();
-        let bp = BulletproofGens::new(RANGE_BITS, 2);
         let mut tr = MerlinTranscript::new(b"Latebra.AnonTransfer.range.v3");
         if self
             .rp
-            .verify_multiple(&bp, &pc, &mut tr, &[self.v, c_amt.compress()], RANGE_BITS)
+            .verify_multiple(bp_gens(), &pc, &mut tr, &[self.v, c_amt.compress()], RANGE_BITS)
             .is_err()
         {
             return false;
@@ -625,8 +667,9 @@ impl AnonTransfer {
             sum += self.e[i];
         }
         let c = fused_challenge(
-            &self.ring, &self.balances, &self.deltas, &self.enc, &self.c_debit, &self.credit,
-            self.fee, self.epoch, &self.nullifier, &v, &self.output, &a1, &a2, &a3, &a4,
+            token, &self.ring, &self.balances, &self.deltas, &self.enc, &self.c_debit,
+            &self.credit, self.fee, self.epoch, &self.nullifier, &v, &self.output, &a1, &a2, &a3,
+            &a4,
         );
         if c != sum {
             return false;
@@ -634,7 +677,7 @@ impl AnonTransfer {
 
         // 3) Brick B (hidden form): every delta opens to 0 or the hidden debit.
         for i in 0..n {
-            if !self.membership[i].verify(&self.deltas[i], &self.c_debit) {
+            if !self.membership[i].verify(&c, &self.deltas[i], &self.c_debit) {
                 return false;
             }
         }
@@ -642,7 +685,7 @@ impl AnonTransfer {
         // 4) Brick E: every Enc_i encrypts the same value as its delta commitment.
         for i in 0..n {
             let lk = &self.links[i];
-            let el = link_challenge(&self.ring[i], &self.deltas[i], &self.enc[i], &lk.a1, &lk.a2, &lk.a3);
+            let el = link_challenge(&c, &self.ring[i], &self.deltas[i], &self.enc[i], &lk.a1, &lk.a2, &lk.a3);
             let c1 = G * lk.z_d + h * lk.z_s == lk.a1 + self.deltas[i] * el;
             let c2 = G * lk.z_d + self.ring[i].0 * lk.z_y == lk.a2 + self.enc[i].c * el;
             let c3 = G * lk.z_y == lk.a3 + self.enc[i].d * el;
@@ -655,7 +698,7 @@ impl AnonTransfer {
         //    value C_amt commits to — so the ledger credits precisely debit − fee.
         {
             let lk = &self.credit_link;
-            let el = link_challenge(&self.output.one_time, &c_amt, &self.credit, &lk.a1, &lk.a2, &lk.a3);
+            let el = link_challenge(&c, &self.output.one_time, &c_amt, &self.credit, &lk.a1, &lk.a2, &lk.a3);
             let c1 = G * lk.z_d + h * lk.z_s == lk.a1 + c_amt * el;
             let c2 = G * lk.z_d + self.output.one_time.0 * lk.z_y == lk.a2 + self.credit.c * el;
             let c3 = G * lk.z_y == lk.a3 + self.credit.d * el;
@@ -667,7 +710,7 @@ impl AnonTransfer {
         // 6) Conservation: Σ deltas − C_debit ∈ ⟨H⟩ with the proven blinding sum.
         let agg: RistrettoPoint = self.deltas.iter().sum();
         let agg_target = agg - self.c_debit;
-        let e_sum = sum_challenge(&self.deltas, &self.c_debit, &agg_target, &self.sum_a);
+        let e_sum = sum_challenge(&c, &self.deltas, &self.c_debit, &agg_target, &self.sum_a);
         if h * self.sum_z != self.sum_a + agg_target * e_sum {
             return false;
         }
@@ -739,7 +782,11 @@ impl AnonTransfer {
     pub fn from_bytes(b: &[u8]) -> Option<AnonTransfer> {
         let mut r = Rd { b, off: 0 };
         let n = r.u32()? as usize;
-        if n < 2 {
+        // F-1: `n` is attacker-controlled network input and sizes every
+        // allocation below — reject out-of-consensus rings BEFORE reserving
+        // memory for them (a 2^32 length prefix would otherwise request
+        // ~100 GB of Vec capacity and abort the process).
+        if !(2..=MAX_RING_SIZE).contains(&n) {
             return None;
         }
         let fee = r.u64()?;
@@ -863,6 +910,7 @@ mod tests {
     use rand::rngs::OsRng;
 
     const EPOCH: u64 = 7;
+    const TOKEN: u32 = 0;
 
     /// An anonymity set of `n` fresh accounts.
     fn ring_of(n: usize, rng: &mut OsRng) -> (Vec<SecretKey>, Vec<PublicKey>) {
@@ -885,10 +933,10 @@ mod tests {
         let receiver = SecretKey::random(&mut rng);
 
         let tx = AnonTransfer::create(
-            &ring, &balances, &sks[3], 3, bals[3], &receiver.public_key(), 25_000, 100, EPOCH, &mut rng,
+            &ring, &balances, &sks[3], 3, bals[3], &receiver.public_key(), TOKEN, 25_000, 100, EPOCH, &mut rng,
         )
         .expect("solvent");
-        assert!(tx.verify(), "honest anonymous transfer must verify");
+        assert!(tx.verify(TOKEN), "honest anonymous transfer must verify");
     }
 
     #[test]
@@ -904,10 +952,10 @@ mod tests {
         let (amount, fee) = (1_000u64, 10u64);
 
         let tx = AnonTransfer::create(
-            &ring, &balances, &sks[0], 0, bals[0], &receiver.public_key(), amount, fee, EPOCH, &mut rng,
+            &ring, &balances, &sks[0], 0, bals[0], &receiver.public_key(), TOKEN, amount, fee, EPOCH, &mut rng,
         )
         .unwrap();
-        assert!(tx.verify());
+        assert!(tx.verify(TOKEN));
         assert_eq!(sks[0].decrypt(&tx.enc[0], 24), Some(amount + fee), "sender debit = amount+fee");
         for (sk, enc) in sks.iter().zip(tx.enc.iter()).skip(1) {
             assert_eq!(sk.decrypt(enc, 24), Some(0), "decoy debit = 0");
@@ -923,7 +971,7 @@ mod tests {
         let receiver = SecretKey::random(&mut rng);
 
         let tx = AnonTransfer::create(
-            &ring, &balances, &sks[0], 0, bals[0], &receiver.public_key(), 1_000, 10, EPOCH, &mut rng,
+            &ring, &balances, &sks[0], 0, bals[0], &receiver.public_key(), TOKEN, 1_000, 10, EPOCH, &mut rng,
         )
         .unwrap();
 
@@ -943,7 +991,7 @@ mod tests {
         let receiver = SecretKey::random(&mut rng);
 
         assert!(AnonTransfer::create(
-            &ring, &balances, &sks[1], 1, bals[1], &receiver.public_key(), 900, 100, EPOCH, &mut rng,
+            &ring, &balances, &sks[1], 1, bals[1], &receiver.public_key(), TOKEN, 900, 100, EPOCH, &mut rng,
         )
         .is_none());
     }
@@ -957,10 +1005,10 @@ mod tests {
         let receiver = SecretKey::random(&mut rng);
 
         let tx = AnonTransfer::create(
-            &ring, &balances, &sks[2], 2, 10_000, &receiver.public_key(), 900, 100, EPOCH, &mut rng,
+            &ring, &balances, &sks[2], 2, 10_000, &receiver.public_key(), TOKEN, 900, 100, EPOCH, &mut rng,
         )
         .expect("builds against the lie");
-        assert!(!tx.verify(), "must bind to the real balance ciphertext");
+        assert!(!tx.verify(TOKEN), "must bind to the real balance ciphertext");
     }
 
     #[test]
@@ -974,7 +1022,7 @@ mod tests {
         let balances1 = balances_of(&sks, &bals1, &mut rng);
         let rcv = SecretKey::random(&mut rng).public_key();
 
-        let a = AnonTransfer::create(&ring1, &balances1, &sks[0], 0, bals1[0], &rcv, 1_000, 10, EPOCH, &mut rng).unwrap();
+        let a = AnonTransfer::create(&ring1, &balances1, &sks[0], 0, bals1[0], &rcv, TOKEN, 1_000, 10, EPOCH, &mut rng).unwrap();
 
         let (mut sks2, mut ring2) = ring_of(5, &mut rng);
         sks2[2] = sks[0].clone();
@@ -982,15 +1030,15 @@ mod tests {
         let bals2 = [1, 1, 40_000, 1, 1];
         let balances2 = balances_of(&sks2, &bals2, &mut rng);
         let rcv2 = SecretKey::random(&mut rng).public_key();
-        let b = AnonTransfer::create(&ring2, &balances2, &sks2[2], 2, bals2[2], &rcv2, 500, 5, EPOCH, &mut rng).unwrap();
+        let b = AnonTransfer::create(&ring2, &balances2, &sks2[2], 2, bals2[2], &rcv2, TOKEN, 500, 5, EPOCH, &mut rng).unwrap();
         assert_eq!(a.nullifier(), b.nullifier(), "same spender + epoch → same nullifier");
 
         // Different epoch → different nullifier, so cross-epoch spends don't link.
-        let c = AnonTransfer::create(&ring1, &balances1, &sks[0], 0, bals1[0], &rcv, 1_000, 10, EPOCH + 1, &mut rng).unwrap();
+        let c = AnonTransfer::create(&ring1, &balances1, &sks[0], 0, bals1[0], &rcv, TOKEN, 1_000, 10, EPOCH + 1, &mut rng).unwrap();
         assert_ne!(a.nullifier(), c.nullifier(), "different epoch → different nullifier");
 
         // A different spender differs in the same epoch.
-        let other = AnonTransfer::create(&ring1, &balances1, &sks[1], 1, bals1[1], &rcv, 100, 1, EPOCH, &mut rng).unwrap();
+        let other = AnonTransfer::create(&ring1, &balances1, &sks[1], 1, bals1[1], &rcv, TOKEN, 100, 1, EPOCH, &mut rng).unwrap();
         assert_ne!(a.nullifier(), other.nullifier(), "different spender → different nullifier");
     }
 
@@ -1002,10 +1050,10 @@ mod tests {
         let balances = balances_of(&sks, &bals, &mut rng);
         let receiver = SecretKey::random(&mut rng).public_key();
 
-        let mut tx = AnonTransfer::create(&ring, &balances, &sks[2], 2, bals[2], &receiver, 1_500, 50, EPOCH, &mut rng).unwrap();
-        assert!(tx.verify());
+        let mut tx = AnonTransfer::create(&ring, &balances, &sks[2], 2, bals[2], &receiver, TOKEN, 1_500, 50, EPOCH, &mut rng).unwrap();
+        assert!(tx.verify(TOKEN));
         tx.deltas.swap(0, 2);
-        assert!(!tx.verify(), "moving the debit off the owned/solvent index must fail");
+        assert!(!tx.verify(TOKEN), "moving the debit off the owned/solvent index must fail");
     }
 
     #[test]
@@ -1016,28 +1064,28 @@ mod tests {
         let balances = balances_of(&sks, &bals, &mut rng);
         let receiver = SecretKey::random(&mut rng).public_key();
 
-        let base = AnonTransfer::create(&ring, &balances, &sks[0], 0, bals[0], &receiver, 5_000, 30, EPOCH, &mut rng).unwrap();
-        assert!(base.verify());
+        let base = AnonTransfer::create(&ring, &balances, &sks[0], 0, bals[0], &receiver, TOKEN, 5_000, 30, EPOCH, &mut rng).unwrap();
+        assert!(base.verify(TOKEN));
 
         // v3: the amount is hidden behind C_debit — shifting the commitment
         // (equivalent to claiming a different debit) must break every relation
         // proven against it.
         let mut bad_amt = base.clone();
         bad_amt.c_debit += G;
-        assert!(!bad_amt.verify(), "the debit commitment is bound into every sub-proof");
+        assert!(!bad_amt.verify(TOKEN), "the debit commitment is bound into every sub-proof");
 
         // Inflating the carried credit ciphertext must break the credit link.
         let mut bad_credit = base.clone();
         bad_credit.credit.c += G;
-        assert!(!bad_credit.verify(), "the credit ciphertext is bound to C_amt");
+        assert!(!bad_credit.verify(TOKEN), "the credit ciphertext is bound to C_amt");
 
         let mut bad_fee = base.clone();
         bad_fee.fee += 1;
-        assert!(!bad_fee.verify(), "fee shifts C_amt, breaking the range/credit proofs");
+        assert!(!bad_fee.verify(TOKEN), "fee shifts C_amt, breaking the range/credit proofs");
 
         let mut bad_epoch = base.clone();
         bad_epoch.epoch += 1;
-        assert!(!bad_epoch.verify(), "epoch is bound into the nullifier relation");
+        assert!(!bad_epoch.verify(TOKEN), "epoch is bound into the nullifier relation");
     }
 
     #[test]
@@ -1051,9 +1099,9 @@ mod tests {
         let bals = [50_000, 10, 20, 30];
         let balances = balances_of(&sks, &bals, &mut rng);
         let receiver = SecretKey::random(&mut rng).public_key();
-        let tx = AnonTransfer::create(&ring, &balances, &sks[0], 0, bals[0], &receiver, 4_000, 100, EPOCH, &mut rng).unwrap();
+        let tx = AnonTransfer::create(&ring, &balances, &sks[0], 0, bals[0], &receiver, TOKEN, 4_000, 100, EPOCH, &mut rng).unwrap();
         let bytes = tx.to_bytes();
-        assert!(AnonTransfer::from_bytes(&bytes).is_some_and(|t| t.verify()));
+        assert!(AnonTransfer::from_bytes(&bytes).is_some_and(|t| t.verify(TOKEN)));
 
         // Stride keeps the test fast while still hitting every field region
         // (each verify is a full multi-proof check, so we sample ~64 positions
@@ -1064,7 +1112,7 @@ mod tests {
             let mut m = bytes.clone();
             m[i] ^= 0x01;
             if let Some(t) = AnonTransfer::from_bytes(&m) {
-                assert!(!t.verify(), "byte {i} flipped but transfer still verified");
+                assert!(!t.verify(TOKEN), "byte {i} flipped but transfer still verified");
                 checked += 1;
             }
         }
@@ -1087,7 +1135,7 @@ mod tests {
         let receiver = SecretKey::random(&mut rng).public_key();
         // Sender holds 100 but tries to send 5_000 + fee: no witness exists.
         assert!(
-            AnonTransfer::create(&ring, &balances, &sks[0], 0, bals[0], &receiver, 5_000, 100, EPOCH, &mut rng)
+            AnonTransfer::create(&ring, &balances, &sks[0], 0, bals[0], &receiver, TOKEN, 5_000, 100, EPOCH, &mut rng)
                 .is_none(),
             "insolvent sender must not be able to build a transfer"
         );
@@ -1102,11 +1150,11 @@ mod tests {
         let (sks, ring) = ring_of(3, &mut rng);
         let balances = balances_of(&sks, &[80_000, 1, 2], &mut rng);
         let rcv = SecretKey::random(&mut rng).public_key();
-        let good = AnonTransfer::create(&ring, &balances, &sks[0], 0, 80_000, &rcv, 4_000, 100, EPOCH, &mut rng).unwrap();
-        let other = AnonTransfer::create(&ring, &balances, &sks[0], 0, 80_000, &rcv, 9_000, 100, EPOCH, &mut rng).unwrap();
+        let good = AnonTransfer::create(&ring, &balances, &sks[0], 0, 80_000, &rcv, TOKEN, 4_000, 100, EPOCH, &mut rng).unwrap();
+        let other = AnonTransfer::create(&ring, &balances, &sks[0], 0, 80_000, &rcv, TOKEN, 9_000, 100, EPOCH, &mut rng).unwrap();
         let mut spliced = good.clone();
         spliced.rp = other.rp.clone();
-        assert!(!spliced.verify(), "a range proof from another transfer must not verify");
+        assert!(!spliced.verify(TOKEN), "a range proof from another transfer must not verify");
     }
 
     #[test]
@@ -1122,10 +1170,10 @@ mod tests {
 
         let amount = 7_777;
         let tx = AnonTransfer::create(
-            &ring, &balances, &sks[0], 0, bals[0], &receiver.public_key(), amount, 10, EPOCH, &mut rng,
+            &ring, &balances, &sks[0], 0, bals[0], &receiver.public_key(), TOKEN, amount, 10, EPOCH, &mut rng,
         )
         .unwrap();
-        assert!(tx.verify());
+        assert!(tx.verify(TOKEN));
 
         let spend = crate::stealth_receive(&receiver, &tx.output.ephemeral, &tx.output.one_time)
             .expect("receiver recognizes the output");
@@ -1143,10 +1191,10 @@ mod tests {
         let balances = balances_of(&sks, &bals, &mut rng);
         let receiver = SecretKey::random(&mut rng).public_key();
 
-        let mut tx = AnonTransfer::create(&ring, &balances, &sks[0], 0, bals[0], &receiver, 1_000, 10, EPOCH, &mut rng).unwrap();
-        assert!(tx.verify());
+        let mut tx = AnonTransfer::create(&ring, &balances, &sks[0], 0, bals[0], &receiver, TOKEN, 1_000, 10, EPOCH, &mut rng).unwrap();
+        assert!(tx.verify(TOKEN));
         tx.enc[0] = ring[0].encrypt(999, &mut rng); // forge a different debit
-        assert!(!tx.verify(), "a debit ciphertext not matching its delta must fail");
+        assert!(!tx.verify(TOKEN), "a debit ciphertext not matching its delta must fail");
     }
 
     #[test]
@@ -1157,10 +1205,10 @@ mod tests {
         let balances = balances_of(&sks, &bals, &mut rng);
         let receiver = SecretKey::random(&mut rng).public_key();
 
-        let mut tx = AnonTransfer::create(&ring, &balances, &sks[0], 0, bals[0], &receiver, 1_000, 10, EPOCH, &mut rng).unwrap();
-        assert!(tx.verify());
+        let mut tx = AnonTransfer::create(&ring, &balances, &sks[0], 0, bals[0], &receiver, TOKEN, 1_000, 10, EPOCH, &mut rng).unwrap();
+        assert!(tx.verify(TOKEN));
         tx.output = stealth_send(&SecretKey::random(&mut rng).public_key(), &mut rng);
-        assert!(!tx.verify(), "the receiver output is bound into the proof");
+        assert!(!tx.verify(TOKEN), "the receiver output is bound into the proof");
     }
 
     #[test]
@@ -1171,7 +1219,7 @@ mod tests {
         let balances = balances_of(&sks, &bals, &mut rng);
         let receiver = SecretKey::random(&mut rng).public_key();
 
-        let base = AnonTransfer::create(&ring, &balances, &sks[0], 0, bals[0], &receiver, 5_000, 30, EPOCH, &mut rng).unwrap();
+        let base = AnonTransfer::create(&ring, &balances, &sks[0], 0, bals[0], &receiver, TOKEN, 5_000, 30, EPOCH, &mut rng).unwrap();
         for mutate in [0, 1, 2, 3, 4] {
             let mut t = base.clone();
             match mutate {
@@ -1181,7 +1229,7 @@ mod tests {
                 3 => t.sum_z += Scalar::ONE,
                 _ => t.links[1].z_d += Scalar::ONE,
             }
-            assert!(!t.verify(), "tampered response {mutate} must fail");
+            assert!(!t.verify(TOKEN), "tampered response {mutate} must fail");
         }
     }
 
@@ -1194,15 +1242,42 @@ mod tests {
         let receiver = SecretKey::random(&mut rng);
 
         let tx = AnonTransfer::create(
-            &ring, &balances, &sks[3], 3, bals[3], &receiver.public_key(), 25_000, 100, EPOCH, &mut rng,
+            &ring, &balances, &sks[3], 3, bals[3], &receiver.public_key(), TOKEN, 25_000, 100, EPOCH, &mut rng,
         )
         .unwrap();
         let bytes = tx.to_bytes();
         let decoded = AnonTransfer::from_bytes(&bytes).expect("decodes");
         assert_eq!(decoded.to_bytes(), bytes, "canonical roundtrip");
-        assert!(decoded.verify(), "decoded anonymous transfer still verifies");
+        assert!(decoded.verify(TOKEN), "decoded anonymous transfer still verifies");
         assert_eq!(decoded.nullifier(), tx.nullifier());
         assert_eq!(decoded.epoch, tx.epoch);
+    }
+
+    #[test]
+    fn rewrapping_under_a_different_token_fails() {
+        // F-2: the token id is bound into the Fiat–Shamir transcript, so a
+        // proof built for one token cannot be verified under another.
+        let mut rng = OsRng;
+        let (sks, ring) = ring_of(3, &mut rng);
+        let bals = [40_000, 1, 2];
+        let balances = balances_of(&sks, &bals, &mut rng);
+        let receiver = SecretKey::random(&mut rng).public_key();
+
+        let tx = AnonTransfer::create(&ring, &balances, &sks[0], 0, bals[0], &receiver, TOKEN, 1_000, 10, EPOCH, &mut rng).unwrap();
+        assert!(tx.verify(TOKEN));
+        assert!(!tx.verify(TOKEN + 1), "a different token envelope must not verify");
+    }
+
+    #[test]
+    fn wire_rejects_oversized_ring_length_prefix() {
+        // F-1: the length prefix is attacker-controlled and sizes allocations;
+        // out-of-consensus values must be rejected before any Vec is reserved.
+        for n in [0u32, 1, MAX_RING_SIZE as u32 + 1, u32::MAX] {
+            let mut b = Vec::new();
+            b.extend_from_slice(&n.to_le_bytes());
+            b.extend_from_slice(&[0u8; 64]); // fee + epoch + padding
+            assert!(AnonTransfer::from_bytes(&b).is_none(), "ring length {n} must be rejected");
+        }
     }
 
     #[test]
@@ -1213,7 +1288,7 @@ mod tests {
         let balances = balances_of(&sks, &bals, &mut rng);
         let receiver = SecretKey::random(&mut rng).public_key();
 
-        let tx = AnonTransfer::create(&ring, &balances, &sks[0], 0, bals[0], &receiver, 1_000, 10, EPOCH, &mut rng).unwrap();
+        let tx = AnonTransfer::create(&ring, &balances, &sks[0], 0, bals[0], &receiver, TOKEN, 1_000, 10, EPOCH, &mut rng).unwrap();
         let bytes = tx.to_bytes();
 
         let mut extra = bytes.clone();
@@ -1231,9 +1306,9 @@ mod tests {
         let balances = balances_of(&sks, &bals, &mut rng);
         let real_receiver = SecretKey::random(&mut rng);
 
-        let t2 = AnonTransfer::create(&ring, &balances, &sks[2], 2, bals[2], &real_receiver.public_key(), 1_000, 10, EPOCH, &mut rng).unwrap();
-        let t4 = AnonTransfer::create(&ring, &balances, &sks[4], 4, bals[4], &real_receiver.public_key(), 1_000, 10, EPOCH, &mut rng).unwrap();
-        assert!(t2.verify() && t4.verify());
+        let t2 = AnonTransfer::create(&ring, &balances, &sks[2], 2, bals[2], &real_receiver.public_key(), TOKEN, 1_000, 10, EPOCH, &mut rng).unwrap();
+        let t4 = AnonTransfer::create(&ring, &balances, &sks[4], 4, bals[4], &real_receiver.public_key(), TOKEN, 1_000, 10, EPOCH, &mut rng).unwrap();
+        assert!(t2.verify(TOKEN) && t4.verify(TOKEN));
 
         // (1) No distinguished sender: structurally identical regardless of who spent.
         assert_eq!(t2.ring.len(), 6);

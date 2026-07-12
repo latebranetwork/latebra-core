@@ -41,7 +41,7 @@ mod ring;
 mod schnorr;
 mod solvent;
 mod stealth;
-pub use anon_transfer::AnonTransfer;
+pub use anon_transfer::{AnonTransfer, MAX_RING_SIZE};
 pub use conservation::ConservedDeltas;
 pub use hidden_solvency::HiddenSolventSpend;
 pub use index_binding::{commit_delta, IndexBindingProof};

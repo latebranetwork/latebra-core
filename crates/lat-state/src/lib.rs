@@ -1279,7 +1279,7 @@ impl Ledger {
                 // The ring proof is a pure function of the transfer (it binds
                 // the CLAIMED balances checked just above), so a passing T12
                 // pre-verification is unconditionally reusable.
-                if !matches!(pre, Some(ProofPass::Anon)) && !xfer.verify() {
+                if !matches!(pre, Some(ProofPass::Anon)) && !xfer.verify(*token) {
                     return Err(LedgerError::InvalidProof);
                 }
 
@@ -2013,8 +2013,8 @@ mod tests {
         let ring: Vec<_> = sks.iter().map(|s| s.public_key()).collect();
         let balances: Vec<_> = ids.iter().map(|id| ledger.balance(id, LAT_TOKEN).unwrap()).collect();
         let xfer = lat_crypto::AnonTransfer::create(
-            &ring, &balances, &sks[sender], sender, sender_balance, receiver, amount, fee,
-            epoch_of(height), rng,
+            &ring, &balances, &sks[sender], sender, sender_balance, receiver, LAT_TOKEN, amount,
+            fee, epoch_of(height), rng,
         )
         .expect("solvent");
         Transaction::AnonTransfer { token: LAT_TOKEN, xfer }
@@ -2132,7 +2132,8 @@ mod tests {
         bals[2] = ghost.public_key().encrypt(50_000, &mut rng);
         let sender_bal = sks[1].decrypt(&bals[1], 24).unwrap();
         let xfer = lat_crypto::AnonTransfer::create(
-            &ring, &bals, &sks[1], 1, sender_bal, &receiver, 1_000, 1_000, epoch_of(45), &mut rng,
+            &ring, &bals, &sks[1], 1, sender_bal, &receiver, LAT_TOKEN, 1_000, 1_000,
+            epoch_of(45), &mut rng,
         )
         .unwrap();
         assert_eq!(

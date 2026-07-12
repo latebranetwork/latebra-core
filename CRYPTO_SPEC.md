@@ -97,6 +97,14 @@ credit ciphertext `credit`, public `fee`, `epoch`, nullifier `u`, remaining-
 balance commitment `V`, and the aggregated range proof. Here
 `debit = amount + fee`, and the real sender sits at hidden index `l`.
 
+**Transcript binding (v3.1, post internal audit):** the fused Fiat–Shamir
+challenge additionally binds the **token id** the containing transaction moves
+(so a proof cannot be re-wrapped under a different token envelope), and every
+sub-proof challenge (zero-or-debit, value-movement links, credit link,
+conservation) folds in the fused statement challenge — tying each sub-proof to
+this transfer's full public statement, not just its local inputs. Wire decoding
+rejects ring lengths outside `[2, MAX_RING_SIZE]` before allocating.
+
 ### 2.2 What is proven
 
 1. **Zero-or-debit bounds (brick B).** For every `i`, a CDS OR proof that
