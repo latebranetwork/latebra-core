@@ -803,7 +803,7 @@ fn feed_amount(tx: &Transaction) -> String {
         Transaction::Stake { amount, .. } | Transaction::Unstake { amount, .. } => {
             format!("<span class='tamt'>{} LAT</span>", fmt_lat(*amount))
         }
-        Transaction::SlashEvidence { .. } => "<span class='tamt muted'>burned</span>".to_string(),
+        Transaction::SlashEvidence { .. } => "<span class='tamt muted'>slashed</span>".to_string(),
     }
 }
 

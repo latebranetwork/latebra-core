@@ -169,9 +169,19 @@ secret `H_s(x_r·E)` and the one-time secret `p = H_s(x_r·E) + x_r` (so
 A validator's vote over `(block_id, height)` is a domain-separated Schnorr
 signature under its staking key. A certificate is a set of such votes from
 distinct staked validators whose combined stake is strictly greater than 2/3
-of the stake recorded by the voted block. Equivocation (two votes at one
-height) is self-authenticating slashing evidence. No pairing / BLS
-aggregation — signatures are verified individually (parallelised).
+of the stake recorded by the voted block. No pairing / BLS aggregation —
+signatures are verified individually (parallelised).
+
+**Slashing (Gap-6).** Equivocation — two votes at one height for different
+blocks — is self-authenticating evidence (`Transaction::SlashEvidence`): both
+signatures verify against the offender's key, so the tx needs no signature of
+its own and anyone may submit it. The penalty is *partial*
+(`SLASH_FRACTION_BPS` of the offender's bonded + unbonding stake), a fraction
+of which (`SLASH_REWARD_BPS`) is paid to the submitting whistleblower and the
+rest burned. The offender is then **tombstoned**: permanently barred from the
+validator set and immune to a second slash (the tombstone, not a zeroed
+balance, is the replay guard now that slashing leaves residual stake). This is
+the Cosmos-style "one equivocation and you're out" model.
 
 ---
 

@@ -245,16 +245,20 @@ pub enum Transaction {
         /// Schnorr signature by `validator` over the signing bytes.
         sig: [u8; 64],
     },
-    /// **Slash evidence** (T16): proof that `validator` equivocated — signed
-    /// finality votes for TWO different blocks at the same height. The
-    /// evidence is self-authenticating (both signatures verify against
-    /// [`finality_vote_signing_bytes`]), so the transaction itself needs no
-    /// signature or nonce: anyone may submit it, and it burns the offender's
-    /// entire bonded stake AND unbonding entries (the unbonding window exists
-    /// exactly so misbehavior stays punishable). Replays find nothing left to
-    /// slash and are rejected.
+    /// **Slash evidence** (T16, partial slashing since Gap-6): proof that
+    /// `validator` equivocated — signed finality votes for TWO different blocks
+    /// at the same height. The evidence is self-authenticating (both signatures
+    /// verify against [`finality_vote_signing_bytes`]), so the transaction
+    /// itself needs no signature or nonce: anyone may submit it. The penalty
+    /// slashes a fraction of the offender's bonded + unbonding stake; a portion
+    /// of the slashed amount is paid to `beneficiary` (the whistleblower's
+    /// public account) as a reward, the rest is burned. Because the reward
+    /// makes the tx no longer idempotent in whose favor it lands, the
+    /// beneficiary is bound into the encoding (and thus the tx id). Replays
+    /// find nothing left to slash and are rejected.
     SlashEvidence {
         validator: [u8; 32],
+        beneficiary: [u8; 32],
         height: u64,
         block_a: [u8; 32],
         sig_a: [u8; 64],
@@ -401,10 +405,11 @@ impl Transaction {
                 v.extend_from_slice(sig);
                 v
             }
-            Transaction::SlashEvidence { validator, height, block_a, sig_a, block_b, sig_b } => {
-                let mut v = Vec::with_capacity(1 + 32 + 8 + 32 + 64 + 32 + 64);
+            Transaction::SlashEvidence { validator, beneficiary, height, block_a, sig_a, block_b, sig_b } => {
+                let mut v = Vec::with_capacity(1 + 32 + 32 + 8 + 32 + 64 + 32 + 64);
                 v.push(0x0E);
                 v.extend_from_slice(validator);
+                v.extend_from_slice(beneficiary);
                 v.extend_from_slice(&height.to_le_bytes());
                 v.extend_from_slice(block_a);
                 v.extend_from_slice(sig_a);
@@ -576,16 +581,17 @@ impl Transaction {
                 })
             }
             0x0E => {
-                if rest.len() != 32 + 8 + 32 + 64 + 32 + 64 {
+                if rest.len() != 32 + 32 + 8 + 32 + 64 + 32 + 64 {
                     return None;
                 }
                 Some(Transaction::SlashEvidence {
                     validator: rest.get(0..32)?.try_into().ok()?,
-                    height: u64::from_le_bytes(rest.get(32..40)?.try_into().ok()?),
-                    block_a: rest.get(40..72)?.try_into().ok()?,
-                    sig_a: rest.get(72..136)?.try_into().ok()?,
-                    block_b: rest.get(136..168)?.try_into().ok()?,
-                    sig_b: rest.get(168..232)?.try_into().ok()?,
+                    beneficiary: rest.get(32..64)?.try_into().ok()?,
+                    height: u64::from_le_bytes(rest.get(64..72)?.try_into().ok()?),
+                    block_a: rest.get(72..104)?.try_into().ok()?,
+                    sig_a: rest.get(104..168)?.try_into().ok()?,
+                    block_b: rest.get(168..200)?.try_into().ok()?,
+                    sig_b: rest.get(200..264)?.try_into().ok()?,
                 })
             }
             _ => None,

@@ -2,7 +2,7 @@
 
 > Living document. Paste "continue from the latest checkpoint" in a new
 > conversation and work resumes from the **Current Task** below.
-> Last updated: 2026-07-12 (Checkpoint 20 — Gap-1 pre-audit: CRYPTO_SPEC.md + adversarial regressions).
+> Last updated: 2026-07-12 (Checkpoint 21 — Gap-6 consensus economics: partial slashing + whistleblower reward + tombstone + configurable validator cap).
 
 ## 0. Mission
 
@@ -567,6 +567,23 @@ supply); malleability sweep (`malleability_sweep_every_byte_flip_is_rejected`,
 ~64 strided bit-flips, each mutant must decode-but-not-verify or not decode);
 insolvent-sender forgery refusal; and range-proof splicing rejection. All
 green; clippy gate clean.
+
+**Gap-6 consensus economics DONE (2026-07-12):** replaced full-burn slashing
+with the Cosmos-style model. `SlashEvidence` gained a `beneficiary` field
+(wire tag 0x0E now 264-byte body). On valid equivocation evidence: slash
+`SLASH_FRACTION_BPS` (10%) of the offender's bonded + unbonding stake, pay
+`SLASH_REWARD_BPS` (5% of the slash) to the whistleblower's public balance,
+burn the rest, and **tombstone** the validator (`Validator.tombstoned` — new
+field, encode/decode + snapshot magic LATLEDG3→LATLEDG4; barred from
+`validator_set`, and the tombstone is the replay guard against double-slash
+now that residual stake remains). Validator cap parameterized:
+`DEFAULT_MAX_VALIDATORS` + `Ledger::{max_validators, set_max_validators}` (a
+consensus param a chain re-applies at boot like premine/difficulty).
+LAUNCH.md mainnet table + CRYPTO_SPEC §4 updated. Tests rewritten
+(`slash_evidence_partial_slash_reward_and_tombstone`, `validator_cap_is_configurable`).
+NB: one PRE-EXISTING flaky test (`prune_window_bounds…`, timestamp-dependent
+reorg under parallel load — passes in isolation) flagged as a separate task,
+not caused by this change.
 
 The remaining gates are NOT code tasks:
 

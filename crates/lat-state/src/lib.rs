@@ -58,8 +58,28 @@ pub const MIN_VALIDATOR_STAKE: u64 = 1_000 * 100_000;
 /// (T16) — stake can't vanish the moment it equivocates.
 pub const UNBONDING_BLOCKS: u64 = 240;
 
-/// Upper bound on the validator set (top-N by stake).
-pub const MAX_VALIDATORS: usize = 64;
+/// Default upper bound on the validator set (top-N by stake). This is the
+/// genesis default; a chain may override it via [`Ledger::set_max_validators`]
+/// (a consensus parameter, so every node must agree — set it identically at
+/// genesis). LAUNCH.md's mainnet table flags it.
+pub const DEFAULT_MAX_VALIDATORS: usize = 64;
+
+/// Slashing penalty as a fraction of the offender's total (bonded + unbonding)
+/// stake, expressed in basis points (1000 = 10%). Partial slashing (Gap-6):
+/// equivocation is punished proportionally rather than by full confiscation,
+/// which is the modern PoS norm (e.g. Cosmos ~5%). Mainnet-tunable.
+pub const SLASH_FRACTION_BPS: u64 = 1000;
+
+/// Fraction of the *slashed* amount paid to the evidence submitter
+/// (whistleblower), in basis points (500 = 5% of the slash). The remainder is
+/// burned. Incentivizes nodes to actually submit equivocation proofs.
+pub const SLASH_REWARD_BPS: u64 = 500;
+
+/// Upper bound on the validator set — legacy alias of
+/// [`DEFAULT_MAX_VALIDATORS`] kept for callers/tests that read the constant
+/// directly. Prefer [`Ledger::max_validators`] for the effective (possibly
+/// overridden) value.
+pub const MAX_VALIDATORS: usize = DEFAULT_MAX_VALIDATORS;
 
 /// A validator's staking state (T13): the bonded weight the BFT-PoS validator
 /// set is derived from, plus any unbonding entries still in their delay window.
@@ -71,6 +91,12 @@ pub struct Validator {
     /// entries sweep back into the public balance on the account's next
     /// `Stake`/`Unstake` (deterministic: driven by that tx's block height).
     pub unbonding: Vec<(u64, u64)>,
+    /// Tombstoned (Gap-6): the validator was slashed for equivocation. Partial
+    /// slashing leaves residual stake, so a permanent tombstone is what stops a
+    /// second slash for the same offense (replay) and bars re-entry to the
+    /// validator set — the Cosmos-style "one equivocation and you're out"
+    /// model. The residual stake can still be unbonded and withdrawn.
+    pub tombstoned: bool,
 }
 
 /// Drain every unbonding entry whose release height has passed, returning the
@@ -199,6 +225,11 @@ pub struct Ledger {
     /// Bounded: wholesale-cleared at [`ACCOUNT_CACHE_CAP`], never a correctness
     /// layer — every entry mirrors what the store holds. Clones start empty.
     cache: RefCell<HashMap<[u8; 32], Account>>,
+    /// Effective validator-set cap (Gap-6). A consensus parameter, not derived
+    /// from committed records, so a chain overriding the default must re-apply
+    /// it after a boot (snapshot/records/replay) the same way it re-applies
+    /// premine/difficulty. Defaults to [`DEFAULT_MAX_VALIDATORS`].
+    max_validators: usize,
 }
 
 /// Upper bound on cached account records (~a few hundred bytes each). Reaching
@@ -216,6 +247,7 @@ impl Clone for Ledger {
             store: self.store.clone(),
             commitment: RefCell::new(self.commitment.borrow().clone()),
             cache: RefCell::new(HashMap::new()),
+            max_validators: self.max_validators,
         }
     }
 }
@@ -349,6 +381,7 @@ impl Ledger {
             store,
             commitment: RefCell::new(commitment),
             cache: RefCell::new(HashMap::new()),
+            max_validators: DEFAULT_MAX_VALIDATORS,
         }
     }
 
@@ -641,10 +674,11 @@ impl Ledger {
     }
 
     /// The deterministic validator set at the current state (T13): every
-    /// account with at least [`MIN_VALIDATOR_STAKE`] bonded, ordered by stake
-    /// descending then id ascending, capped at [`MAX_VALIDATORS`]. Derived
-    /// purely from committed records, so every node computes the identical
-    /// set — the input BFT-PoS finality (T14) selects proposers/voters from.
+    /// non-tombstoned account with at least [`MIN_VALIDATOR_STAKE`] bonded,
+    /// ordered by stake descending then id ascending, capped at the effective
+    /// [`max_validators`](Self::max_validators). Derived purely from committed
+    /// records, so every node computes the identical set — the input BFT-PoS
+    /// finality (T14) selects proposers/voters from.
     pub fn validator_set(&self) -> Vec<([u8; 32], u64)> {
         let mut set: Vec<([u8; 32], u64)> = self
             .store
@@ -653,12 +687,30 @@ impl Ledger {
             .filter_map(|(key, body)| {
                 let id: [u8; 32] = key.get(1..)?.try_into().ok()?;
                 let v = decode_validator(&body)?;
-                (v.staked >= MIN_VALIDATOR_STAKE).then_some((id, v.staked))
+                // Tombstoned validators (slashed for equivocation) are barred.
+                (!v.tombstoned && v.staked >= MIN_VALIDATOR_STAKE).then_some((id, v.staked))
             })
             .collect();
         set.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        set.truncate(MAX_VALIDATORS);
+        set.truncate(self.max_validators());
         set
+    }
+
+    /// The effective cap on the validator set. Defaults to
+    /// [`DEFAULT_MAX_VALIDATORS`]; a chain may override it at genesis via
+    /// [`set_max_validators`](Self::set_max_validators). This is a consensus
+    /// parameter — every node MUST use the same value or their validator sets
+    /// (and thus finality) diverge.
+    pub fn max_validators(&self) -> usize {
+        self.max_validators
+    }
+
+    /// Override the validator-set cap (consensus parameter — set identically on
+    /// every node, at genesis). Panics if `n == 0` (an empty set can never
+    /// finalize).
+    pub fn set_max_validators(&mut self, n: usize) {
+        assert!(n > 0, "validator cap must be positive");
+        self.max_validators = n;
     }
 
     /// Flag one state entry for re-commitment on the next `state_root`. Cheap:
@@ -1311,15 +1363,17 @@ impl Ledger {
                 Ok(())
             }
 
-            Transaction::SlashEvidence { validator, height: vote_height, block_a, sig_a, block_b, sig_b } => {
+            Transaction::SlashEvidence { validator, beneficiary, height: vote_height, block_a, sig_a, block_b, sig_b } => {
                 // Equivocation proof (T16): the same validator signed finality
                 // votes for two DIFFERENT blocks at one height. The evidence
                 // authenticates itself — both signatures must verify — so the
                 // transaction carries no signature or nonce of its own; anyone
-                // may submit it. The penalty burns the offender's entire
-                // bonded stake and every unbonding entry: the unbonding delay
-                // (T13) exists precisely so this can still bite after the
-                // validator heads for the exit.
+                // may submit it. Partial slashing (Gap-6): the penalty takes
+                // SLASH_FRACTION_BPS of the offender's total (bonded +
+                // unbonding) stake — the unbonding delay (T13) exists precisely
+                // so this can still bite after the validator heads for the
+                // exit. SLASH_REWARD_BPS of the slashed amount is paid to the
+                // whistleblower `beneficiary`; the rest is burned.
                 if block_a == block_b {
                     return Err(LedgerError::BadEvidence);
                 }
@@ -1332,13 +1386,52 @@ impl Ledger {
                         return Err(LedgerError::BadEvidence);
                     }
                 }
-                let val = self.validator(validator).unwrap_or_default();
-                if val.staked == 0 && val.unbonding.is_empty() {
-                    return Err(LedgerError::NothingToSlash); // replay or never bonded
+                let mut val = self.validator(validator).unwrap_or_default();
+                // Tombstoned = already slashed for equivocation: partial
+                // slashing leaves residual stake, so the tombstone (not a
+                // zero balance) is the replay guard against double-slashing.
+                if val.tombstoned {
+                    return Err(LedgerError::NothingToSlash);
                 }
-                // Burn: write the drained record (put_validator deletes it),
-                // removing the offender from every future validator set.
-                self.put_validator(validator, &Validator::default());
+                let total: u64 =
+                    val.staked.saturating_add(val.unbonding.iter().map(|(a, _)| *a).sum());
+                if total == 0 {
+                    return Err(LedgerError::NothingToSlash); // never bonded
+                }
+                // Slashed amount, floored at 1 unit so any equivocation with a
+                // non-empty stake always has an effect (no free equivocation on
+                // dust) and the replay guard below always trips.
+                let slashed = ((total as u128 * SLASH_FRACTION_BPS as u128 / 10_000) as u64).max(1);
+                // Take it proportionally from bonded first, then unbonding, so
+                // the derived validator-set weight drops immediately.
+                let mut remaining = slashed;
+                let from_bonded = remaining.min(val.staked);
+                val.staked -= from_bonded;
+                remaining -= from_bonded;
+                let mut i = 0;
+                while remaining > 0 && i < val.unbonding.len() {
+                    let take = remaining.min(val.unbonding[i].0);
+                    val.unbonding[i].0 -= take;
+                    remaining -= take;
+                    i += 1;
+                }
+                val.unbonding.retain(|(a, _)| *a > 0);
+                // Tombstone: bars re-entry to the validator set and any future
+                // slash for this (or any later) equivocation by this key.
+                val.tombstoned = true;
+                self.put_validator(validator, &val);
+
+                // Whistleblower reward: pay SLASH_REWARD_BPS of the slash to the
+                // submitter's PUBLIC balance (only if it is a registered
+                // account); the rest is burned by simply not re-crediting it.
+                let reward = (slashed as u128 * SLASH_REWARD_BPS as u128 / 10_000) as u64;
+                if reward > 0 {
+                    if let Some(mut acct) = self.account(beneficiary) {
+                        let bal = acct.public(LAT_TOKEN).saturating_add(reward);
+                        acct.set_public(LAT_TOKEN, bal);
+                        self.put_account(beneficiary, acct);
+                    }
+                }
                 Ok(())
             }
         }
@@ -1610,13 +1703,14 @@ fn encode_contract(c: &Contract) -> Vec<u8> {
 /// Validator record body: staked + unbonding entries (the snapshot validator
 /// entry minus the leading id).
 fn encode_validator(v: &Validator) -> Vec<u8> {
-    let mut b = Vec::with_capacity(8 + 4 + v.unbonding.len() * 16);
+    let mut b = Vec::with_capacity(8 + 4 + v.unbonding.len() * 16 + 1);
     b.extend_from_slice(&v.staked.to_le_bytes());
     b.extend_from_slice(&(v.unbonding.len() as u32).to_le_bytes());
     for (amount, release) in &v.unbonding {
         b.extend_from_slice(&amount.to_le_bytes());
         b.extend_from_slice(&release.to_le_bytes());
     }
+    b.push(v.tombstoned as u8);
     b
 }
 
@@ -1630,7 +1724,8 @@ fn decode_validator(b: &[u8]) -> Option<Validator> {
         let release = r.u64()?;
         unbonding.push((amount, release));
     }
-    (r.off == b.len()).then_some(Validator { staked, unbonding })
+    let tombstoned = r.take(1)?[0] != 0;
+    (r.off == b.len()).then_some(Validator { staked, unbonding, tombstoned })
 }
 
 fn decode_contract(b: &[u8]) -> Option<Contract> {
@@ -1689,7 +1784,7 @@ pub fn verify_account_proof(root: &[u8; 32], proof: &AccountProof) -> bool {
 /// anonymous-spend nullifier set joined the encoding, and to 3 when validator
 /// staking records (T13) did; an old snapshot no longer decodes, which simply
 /// costs one full replay on the next boot.
-const LEDGER_MAGIC: &[u8; 8] = b"LATLEDG3";
+const LEDGER_MAGIC: &[u8; 8] = b"LATLEDG4";
 
 impl Ledger {
     /// Canonical snapshot encoding of the full ledger (see the section note).
@@ -1803,7 +1898,8 @@ impl Ledger {
                 let release = r.u64()?;
                 unbonding.push((amount, release));
             }
-            ledger.put_validator(&id, &Validator { staked, unbonding });
+            let tombstoned = r.take(1)?[0] != 0;
+            ledger.put_validator(&id, &Validator { staked, unbonding, tombstoned });
             ledger.mark(DirtyKey::Validator(id));
         }
 
@@ -2977,17 +3073,22 @@ mod tests {
     }
 
     #[test]
-    fn slash_evidence_burns_stake_and_rejects_fabrications() {
+    fn slash_evidence_partial_slash_reward_and_tombstone() {
         let mut rng = OsRng;
         let sk = SecretKey::random(&mut rng);
         let id = sk.public_key().to_bytes();
+        // A separate whistleblower who submits the evidence and earns the reward.
+        let wb = SecretKey::random(&mut rng).public_key().to_bytes();
         let mut l = Ledger::new();
         l.register(id).unwrap();
+        l.register(wb).unwrap();
         l.credit_public(&id, LAT_TOKEN, 4 * MIN_VALIDATOR_STAKE);
         l.apply_at(&stake_tx(&sk, 2 * MIN_VALIDATOR_STAKE, 0), 5).unwrap();
         l.apply_at(&unstake_tx(&sk, MIN_VALIDATOR_STAKE, 1), 6).unwrap();
         assert_eq!(l.staked(&id), MIN_VALIDATOR_STAKE);
         assert_eq!(l.unbonding(&id).len(), 1);
+        // Total at-risk stake = bonded + unbonding = 2 * MIN_VALIDATOR_STAKE.
+        let total = 2 * MIN_VALIDATOR_STAKE;
 
         // Equivocation: two finality votes at one height for different blocks.
         let vote = |block: [u8; 32]| {
@@ -2995,6 +3096,7 @@ mod tests {
         };
         let evidence = Transaction::SlashEvidence {
             validator: id,
+            beneficiary: wb,
             height: 9,
             block_a: [1u8; 32],
             sig_a: vote([1u8; 32]),
@@ -3002,7 +3104,7 @@ mod tests {
             sig_b: vote([2u8; 32]),
         };
 
-        // Fabrications are rejected before anything burns.
+        // Fabrications are rejected before anything is slashed.
         let mut same_block = evidence.clone();
         if let Transaction::SlashEvidence { block_b, sig_b, .. } = &mut same_block {
             *block_b = [1u8; 32];
@@ -3015,25 +3117,28 @@ mod tests {
         }
         assert_eq!(l.apply_at(&bad_sig, 10), Err(LedgerError::BadEvidence));
 
-        // Real evidence burns bonded stake AND unbonding entries; the public
-        // balance is untouched (the bond is what's at risk).
+        // Real evidence slashes SLASH_FRACTION_BPS of the total at-risk stake,
+        // pays SLASH_REWARD_BPS of that to the whistleblower, and tombstones
+        // the offender (removed from the set, residual stake kept).
+        let slashed = total * SLASH_FRACTION_BPS / 10_000;
+        let reward = slashed * SLASH_REWARD_BPS / 10_000;
         let root_before = l.state_root();
         l.apply_at(&evidence, 10).unwrap();
-        assert_eq!(l.staked(&id), 0);
-        assert!(l.unbonding(&id).is_empty());
-        assert!(l.validator_set().is_empty());
-        assert_eq!(l.public_balance(&id, LAT_TOKEN), Some(2 * MIN_VALIDATOR_STAKE));
+        assert_eq!(l.staked(&id) + l.unbonding(&id).iter().map(|(a, _)| *a).sum::<u64>(), total - slashed);
+        assert!(l.validator_set().is_empty(), "tombstoned validator is out of the set");
+        assert_eq!(l.public_balance(&wb, LAT_TOKEN), Some(reward), "whistleblower rewarded");
         assert_ne!(l.state_root(), root_before, "slashing is committed state");
 
-        // Replaying the same evidence finds nothing to slash.
+        // Even though residual stake remains, the tombstone blocks a re-slash.
         assert_eq!(l.apply_at(&evidence, 11), Err(LedgerError::NothingToSlash));
-        // And an unbonded bystander can't be slashed by valid-looking votes.
+        // A never-bonded bystander can't be slashed by valid-looking votes.
         let other = SecretKey::random(&mut rng);
         let ovote = |block: [u8; 32]| {
             other.sign(&lat_types::finality_vote_signing_bytes(&block, 9)).to_bytes()
         };
         let bystander = Transaction::SlashEvidence {
             validator: other.public_key().to_bytes(),
+            beneficiary: wb,
             height: 9,
             block_a: [1u8; 32],
             sig_a: ovote([1u8; 32]),
@@ -3041,6 +3146,25 @@ mod tests {
             sig_b: ovote([2u8; 32]),
         };
         assert_eq!(l.apply_at(&bystander, 11), Err(LedgerError::NothingToSlash));
+    }
+
+    #[test]
+    fn validator_cap_is_configurable() {
+        let mut rng = OsRng;
+        let sks: Vec<SecretKey> = (0..3).map(|_| SecretKey::random(&mut rng)).collect();
+        let ids: Vec<[u8; 32]> = sks.iter().map(|s| s.public_key().to_bytes()).collect();
+        let mut l = Ledger::new();
+        l.set_max_validators(2);
+        for (i, (sk, id)) in sks.iter().zip(&ids).enumerate() {
+            l.register(*id).unwrap();
+            l.credit_public(id, LAT_TOKEN, 10 * MIN_VALIDATOR_STAKE);
+            // Distinct stakes so ordering is unambiguous.
+            l.apply_at(&stake_tx(sk, (i as u64 + 1) * MIN_VALIDATOR_STAKE, 0), 5).unwrap();
+        }
+        let set = l.validator_set();
+        assert_eq!(set.len(), 2, "cap of 2 keeps only the top two by stake");
+        assert_eq!(set[0].1, 3 * MIN_VALIDATOR_STAKE);
+        assert_eq!(set[1].1, 2 * MIN_VALIDATOR_STAKE);
     }
 
     #[test]

@@ -154,8 +154,13 @@ falling back to full block sync if anything mismatches.
 - [ ] **Fresh genesis + faucet secrets** — the shipped `0x2a…`/`0x2b…` seeds are
       public. Generate new ones; do not reuse testnet seeds.
 - [ ] **Reviewed tokenomics** — premine, emission, halving, fees.
+- [ ] **Reviewed consensus economics** — validator cap
+      (`DEFAULT_MAX_VALIDATORS`, or a genesis override via
+      `Ledger::set_max_validators`, applied identically on every node), slash
+      fraction (`SLASH_FRACTION_BPS`), whistleblower reward
+      (`SLASH_REWARD_BPS`), min stake, and unbonding window. All are testnet
+      defaults in `lat-state`.
 - [ ] **Deterministic finality** (BFT-PoS, roadmap M3) and **hardened networking**
       (transport encryption, discovery) if the threat model demands it.
 - [ ] **Legal review** of the launchpad/token model (bonding-curve launchpads can
       be regulated securities/MSB activity — see the launchpad README).
-- [ ] Hide the amount on anonymous transfers if full-privacy is a launch claim.
