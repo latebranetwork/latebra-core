@@ -151,6 +151,7 @@ fn print_usage() {
     println!("  --validator           vote for finality with the miner wallet's key");
     println!("                        (the account must be staked via a Stake tx)");
     println!("  --metrics <addr|off>  HTTP /status (JSON) + /metrics (Prometheus)");
+    println!("                        + /rpc (POST, JSON-RPC 2.0; see RPC.md)");
     println!("                        (default 127.0.0.1:4090)");
 }
 
@@ -254,6 +255,7 @@ fn main() {
         match TcpListener::bind(&cfg.metrics) {
             Ok(l) => {
                 println!("  metrics     : http://{}/status", cfg.metrics);
+                println!("  json-rpc    : http://{}/rpc (POST, JSON-RPC 2.0 — see RPC.md)", cfg.metrics);
                 serve_metrics(l, Arc::clone(&node));
             }
             Err(e) => eprintln!("warning: metrics disabled ({}: {e})", cfg.metrics),
@@ -386,11 +388,44 @@ fn handle_metrics(
     node: &SharedNode,
     started: std::time::Instant,
 ) -> std::io::Result<()> {
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     reader.read_line(&mut line)?;
+    let verb = line.split_whitespace().next().unwrap_or("").to_string();
     let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
+
+    // T20: JSON-RPC 2.0 over POST /rpc — read headers for the body length,
+    // then dispatch. Everything else falls through to the GET endpoints.
+    if verb == "POST" && path == "/rpc" {
+        let mut content_length = 0usize;
+        loop {
+            let mut h = String::new();
+            reader.read_line(&mut h)?;
+            let h = h.trim();
+            if h.is_empty() {
+                break;
+            }
+            if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                content_length = v.trim().parse().unwrap_or(0);
+            }
+        }
+        // Bound the body so a hostile client can't OOM the node.
+        if content_length > 1024 * 1024 {
+            let mut s = stream;
+            s.write_all(b"HTTP/1.1 413 Payload Too Large\r\ncontent-length: 0\r\n\r\n")?;
+            return Ok(());
+        }
+        let mut body = vec![0u8; content_length];
+        reader.read_exact(&mut body)?;
+        let reply = rpc_handle(node, &body).to_string();
+        let mut s = stream;
+        return write!(
+            s,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+            reply.len()
+        );
+    }
 
     // One snapshot of everything under a single brief lock.
     let (height, tip, difficulty, peers, mempool, finalized, boot) = {
@@ -465,6 +500,154 @@ fn handle_metrics(
     )
 }
 
+/// T20: handle one JSON-RPC 2.0 request body and produce the response object.
+/// Split from the HTTP plumbing so tests can call it directly.
+fn rpc_handle(node: &SharedNode, body: &[u8]) -> serde_json::Value {
+    use serde_json::{json, Value};
+    let req: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => {
+            return json!({"jsonrpc": "2.0", "id": null,
+                "error": {"code": -32700, "message": "parse error"}})
+        }
+    };
+    let id = req.get("id").cloned().unwrap_or(Value::Null);
+    let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+    let params = req.get("params").and_then(Value::as_array).cloned().unwrap_or_default();
+
+    // Param helpers: positional params only, hex for ids/bytes.
+    let p_str = |i: usize| params.get(i).and_then(Value::as_str);
+    let p_u64 = |i: usize| params.get(i).and_then(Value::as_u64);
+    let p_id = |i: usize| -> Option<[u8; 32]> {
+        hex::decode(p_str(i)?).ok()?.try_into().ok()
+    };
+
+    let result: Result<Value, (i64, &str)> = match method {
+        // -- chain info ------------------------------------------------------
+        "lat_status" => {
+            let n = lock_node(node);
+            Ok(json!({
+                "height": n.chain.height(),
+                "tip": hex::encode(n.chain.tip()),
+                "difficulty": n.chain.difficulty(),
+                "genesis": hex::encode(n.chain.genesis_id()),
+                "peers": n.peers().len(),
+                "mempool": n.mempool.len(),
+                "finalized": n.chain.finalized().map(|(h, id)| json!({"height": h, "id": hex::encode(id)})),
+            }))
+        }
+        // -- blocks / transactions -------------------------------------------
+        "lat_blockByHeight" => match p_u64(0) {
+            Some(h) => {
+                let n = lock_node(node);
+                match n.chain.block_bytes(h) {
+                    Some(b) => Ok(json!({"height": h, "bytes": hex::encode(b)})),
+                    None => Ok(Value::Null),
+                }
+            }
+            None => Err((-32602, "params: [height]")),
+        },
+        "lat_txByHash" => match p_id(0) {
+            Some(hash) => {
+                let n = lock_node(node);
+                match n.chain.tx_location(&hash) {
+                    Some((block_id, index)) => Ok(json!({
+                        "block": hex::encode(block_id),
+                        "index": index,
+                    })),
+                    None => Ok(Value::Null),
+                }
+            }
+            None => Err((-32602, "params: [tx_hash_hex]")),
+        },
+        // -- account reads ---------------------------------------------------
+        "lat_publicBalance" => match (p_id(0), p_u64(1)) {
+            (Some(acct), Some(token)) => {
+                let b = lock_node(node).chain.public_balance(&acct, token as u32);
+                Ok(json!(b))
+            }
+            _ => Err((-32602, "params: [account_hex, token]")),
+        },
+        "lat_encryptedBalance" => match (p_id(0), p_u64(1)) {
+            (Some(acct), Some(token)) => {
+                let b = lock_node(node).chain.balance(&acct, token as u32);
+                Ok(json!(b.map(|ct| hex::encode(ct.to_bytes()))))
+            }
+            _ => Err((-32602, "params: [account_hex, token]")),
+        },
+        "lat_pending" => match (p_id(0), p_u64(1)) {
+            (Some(acct), Some(token)) => {
+                let b = lock_node(node).chain.pending(&acct, token as u32);
+                Ok(json!(b.map(|ct| hex::encode(ct.to_bytes()))))
+            }
+            _ => Err((-32602, "params: [account_hex, token]")),
+        },
+        "lat_nonce" => match p_id(0) {
+            Some(acct) => Ok(json!(lock_node(node).chain.nonce(&acct))),
+            None => Err((-32602, "params: [account_hex]")),
+        },
+        "lat_stake" => match p_id(0) {
+            Some(acct) => {
+                let n = lock_node(node);
+                Ok(json!({
+                    "staked": n.chain.staked(&acct),
+                    "unbonding": n.chain.unbonding(&acct)
+                        .iter().map(|(a, r)| json!({"amount": a, "release_height": r})).collect::<Vec<_>>(),
+                }))
+            }
+            None => Err((-32602, "params: [account_hex]")),
+        },
+        // -- contracts / privacy helpers --------------------------------------
+        "lat_contractStorage" => match (p_id(0), p_u64(1)) {
+            (Some(contract), Some(key)) => {
+                Ok(json!(lock_node(node).chain.contract_storage(&contract, key)))
+            }
+            _ => Err((-32602, "params: [contract_hex, key]")),
+        },
+        "lat_ringCandidates" => match p_u64(0) {
+            Some(token) => {
+                let all = lock_node(node).chain.ring_candidates(token as u32);
+                let max = p_u64(1).unwrap_or(lat_p2p::MAX_RING_CANDIDATES as u64) as usize;
+                Ok(json!(all
+                    .iter()
+                    .take(max.min(lat_p2p::MAX_RING_CANDIDATES))
+                    .map(|(id, ct)| json!({"account": hex::encode(id), "balance": hex::encode(ct.to_bytes())}))
+                    .collect::<Vec<_>>()))
+            }
+            None => Err((-32602, "params: [token, max?]")),
+        },
+        // -- writes ------------------------------------------------------------
+        "lat_submitTx" => match p_str(0).and_then(|s| hex::decode(s).ok()) {
+            Some(bytes) => match lat_types::Transaction::decode(&bytes) {
+                Some(tx) => {
+                    let accepted = lock_node(node).submit_tx(tx);
+                    if accepted {
+                        // Same forwarding a binary SubmitTx gets (T17): gossip
+                        // so every miner's mempool sees it, not just ours.
+                        let peers = lock_node(node).peers();
+                        thread::spawn(move || {
+                            for p in peers {
+                                let _ = lat_p2p::announce_tx(p.as_str(), &bytes);
+                            }
+                        });
+                    }
+                    Ok(json!(accepted))
+                }
+                None => Err((-32602, "undecodable transaction")),
+            },
+            None => Err((-32602, "params: [tx_hex]")),
+        },
+        _ => Err((-32601, "method not found")),
+    };
+
+    match result {
+        Ok(value) => json!({"jsonrpc": "2.0", "id": id, "result": value}),
+        Err((code, message)) => {
+            json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+        }
+    }
+}
+
 /// Mine one block from the mempool, apply it, and gossip it to every known peer
 /// (they re-gossip it onward, so the whole network hears about it).
 fn mine_one(node: &SharedNode) {
@@ -504,5 +687,83 @@ fn cast_and_announce_vote(node: &SharedNode) {
         for p in &peers {
             let _ = lat_p2p::announce_cert(p.as_str(), &cert);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lat_chain::{Blockchain, DEFAULT_DIFFICULTY};
+    use lat_p2p::NodeState;
+    use serde_json::{json, Value};
+
+    fn test_node() -> SharedNode {
+        let genesis = Wallet::from_seed(Network::Testnet, [9u8; 32]);
+        let chain = Blockchain::genesis_with_public(
+            &[(genesis.id(), 1_000_000)],
+            &[(genesis.id(), 500_000)],
+            DEFAULT_DIFFICULTY,
+        );
+        Arc::new(Mutex::new(NodeState::new(chain)))
+    }
+
+    fn call(node: &SharedNode, method: &str, params: Value) -> Value {
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+        rpc_handle(node, body.to_string().as_bytes())
+    }
+
+    #[test]
+    fn rpc_status_reads_and_errors() {
+        let node = test_node();
+        let genesis_id = {
+            let w = Wallet::from_seed(Network::Testnet, [9u8; 32]);
+            hex::encode(w.id())
+        };
+
+        // Status carries the chain fingerprint.
+        let r = call(&node, "lat_status", json!([]));
+        assert_eq!(r["result"]["height"], 0);
+        assert!(r["result"]["genesis"].is_string());
+
+        // Reads: public balance from the transparent premine; nonce; stake.
+        let r = call(&node, "lat_publicBalance", json!([genesis_id, 0]));
+        assert_eq!(r["result"], 500_000);
+        let r = call(&node, "lat_encryptedBalance", json!([genesis_id, 0]));
+        assert!(r["result"].is_string(), "confidential premine is a hex ciphertext");
+        let r = call(&node, "lat_nonce", json!([genesis_id]));
+        assert_eq!(r["result"], 0);
+        let r = call(&node, "lat_stake", json!([genesis_id]));
+        assert_eq!(r["result"]["staked"], 0);
+
+        // Block 0 (genesis) is servable; beyond the tip is null.
+        let r = call(&node, "lat_blockByHeight", json!([0]));
+        assert!(r["result"]["bytes"].is_string());
+        let r = call(&node, "lat_blockByHeight", json!([99]));
+        assert!(r["result"].is_null());
+
+        // Unknown accounts read as null, not errors.
+        let r = call(&node, "lat_publicBalance", json!([hex::encode([7u8; 32]), 0]));
+        assert!(r["result"].is_null());
+
+        // Error paths: bad method, bad params, unparseable body.
+        let r = call(&node, "lat_noSuchMethod", json!([]));
+        assert_eq!(r["error"]["code"], -32601);
+        let r = call(&node, "lat_publicBalance", json!(["nothex", 0]));
+        assert_eq!(r["error"]["code"], -32602);
+        let r = rpc_handle(&node, b"{not json");
+        assert_eq!(r["error"]["code"], -32700);
+    }
+
+    #[test]
+    fn rpc_submit_tx_accepts_a_valid_registration() {
+        let node = test_node();
+        let tx = lat_chain::mine_registration([5u8; 32]);
+        let r = call(&node, "lat_submitTx", json!([hex::encode(tx.encode())]));
+        assert_eq!(r["result"], true, "valid registration enters the mempool");
+        assert_eq!(lock_node(&node).mempool.len(), 1);
+
+        // Garbage bytes are rejected as an error, not a panic.
+        let r = call(&node, "lat_submitTx", json!(["deadbeef"]));
+        assert_eq!(r["error"]["code"], -32602);
     }
 }

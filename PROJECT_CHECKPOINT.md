@@ -2,7 +2,7 @@
 
 > Living document. Paste "continue from the latest checkpoint" in a new
 > conversation and work resumes from the **Current Task** below.
-> Last updated: 2026-07-12 (Checkpoint 21 — Gap-6 consensus economics: partial slashing + whistleblower reward + tombstone + configurable validator cap).
+> Last updated: 2026-07-12 (Checkpoint 22 — Gap-5/T20: JSON-RPC 2.0 surface on latebrad).
 
 ## 0. Mission
 
@@ -357,7 +357,16 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
   wrong-network + non-fresh reject) + 1 lat-p2p TCP end-to-end.  ← T7, T14
 
 ### M5 — Ecosystem & APIs
-- [ ] T20 RPC / REST / WS / gRPC surface.  ← T3
+- [x] **T20 JSON-RPC surface** (2026-07-12, Gap-5). JSON-RPC 2.0 over
+  `POST /rpc` on latebrad's metrics port (loopback by default; 1 MiB body
+  cap): `lat_status`, `lat_blockByHeight`, `lat_txByHash`,
+  `lat_publicBalance`, `lat_encryptedBalance`, `lat_pending`, `lat_nonce`,
+  `lat_stake`, `lat_contractStorage`, `lat_ringCandidates`, `lat_submitTx`
+  (accepted txs gossip on, same as binary SubmitTx). Positional params,
+  hex ids, `null` for missing entities. `rpc_handle` split from HTTP
+  plumbing for direct unit testing; verified live via curl against a
+  mining node. Reference: RPC.md. Deferred: REST/WS/gRPC variants,
+  subscriptions.  ← T3
 - [ ] T21 SDKs, contract stdlib, tooling, debugger.  ← T11
 
 ### M6 — Ops, QA, security (continuous)
@@ -530,7 +539,7 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
 ## 9. Current Task
 
 **PROGRAM CODE-COMPLETE for the testnet→audit→mainnet path.** M0–M4 + M6
-done; M5 (T20 RPC surface, T21 SDKs) is post-launch polish, T18 is an hour
+done; M5 T20 JSON-RPC now DONE (T21 SDKs remain post-launch polish), T18 is an hour
 of work once real seed hosts exist.
 
 **F2 CLOSED (2026-07-12): hidden-amount anonymous transfers (v3).** The

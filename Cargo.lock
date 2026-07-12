@@ -427,10 +427,12 @@ dependencies = [
 name = "latebrad"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "lat-chain",
  "lat-p2p",
  "lat-types",
  "lat-wallet",
+ "serde_json",
 ]
 
 [[package]]
