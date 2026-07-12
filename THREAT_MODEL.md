@@ -49,10 +49,14 @@ Ranked by how much they matter for holding value.
    anonymous transfer constructions are clean-room implementations that have had
    **no external cryptographic audit.** This alone makes the chain unsuitable for
    real value. An audit is a multi-week engagement and a prerequisite for mainnet.
-2. **Anonymous transfers leak the amount.** `anon-send` hides *who pays whom*
-   (sender in a ring, receiver behind a one-time stealth address) but the
-   **amount is still public** in this phase. Ordinary `send` hides the amount but
-   not the parties. Hiding both at once is future work.
+2. **Anonymous transfers now hide the amount too (v3 — unaudited).** `anon-send`
+   hides *who pays whom* (sender in a ring, receiver behind a one-time stealth
+   address) **and the amount** (a Pedersen debit commitment + aggregated range
+   proof + receiver-credit link replaced the old public field). Only the fee is
+   public, as on Zcash/Monero. Residual leaks: ring size, fee, epoch, and
+   transfer *timing* remain visible, and sender anonymity is bounded by the
+   ring size. Per limitation 1, none of this construction has been externally
+   audited.
 3. **Finality is probabilistic.** Consensus is Nakamoto proof-of-work with
    heaviest-cumulative-work fork choice. There is **no deterministic finality** —
    deep reorgs are possible with enough hashpower (BFT-PoS is roadmap M3). Wait

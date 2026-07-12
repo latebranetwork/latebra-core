@@ -316,16 +316,19 @@ impl Wallet {
                     }
                 }
                 // An anonymous transfer's receiver leg is the same stealth
-                // mechanism; its amount is public in this phase.
+                // mechanism. v3: the amount is HIDDEN on the wire — only the
+                // derived one-time spend key can decrypt the carried credit
+                // ciphertext (bounded discrete log, same range as balances).
                 Transaction::AnonTransfer { token, xfer } => {
                     if let Some(secret) =
                         lat_crypto::stealth_receive(&self.secret, &xfer.output.ephemeral, &xfer.output.one_time)
                     {
+                        let amount = secret.decrypt(&xfer.credit, BALANCE_BITS).unwrap_or(0);
                         found.push(StealthReceipt {
                             one_time: xfer.output.one_time.to_bytes(),
                             secret,
                             token: *token,
-                            amount: xfer.amount,
+                            amount,
                         });
                     }
                 }

@@ -19,9 +19,14 @@
 the cleartext `SolventTransfer.sender` / `.receiver`).
 
 **Explicit non-goals (this phase).**
-- **Amount privacy (F2).** The primitive takes `amount`/`fee` as *public*
-  parameters (the `{0, amount}` membership set is public). This phase closes the
-  graph leak, not the amount leak. Committed-amount hiding is a later phase.
+- ~~**Amount privacy (F2).**~~ **CLOSED (v3, 2026-07-12).** The amount is now
+  hidden behind a Pedersen debit commitment `C_debit`; the membership set
+  `{0, debit}` is proven per member as a CDS OR against the commitment (no
+  public set), the aggregated Bulletproof range-proves both the remaining
+  balance and the hidden amount (`C_amt = C_debit − fee·G`, so `debit ≥ fee`),
+  and the receiver credit rides as an ElGamal ciphertext under the one-time
+  key, linked to `C_amt` by a two-base Schnorr. Only the fee is public. See
+  the `lat-crypto::anon_transfer` module docs for the full v3 statement.
 - **Network-level privacy.** Tx-origin IP / timing correlation is a separate
   transport concern (Dandelion++ etc.), out of scope here.
 
@@ -122,14 +127,16 @@ hidden):
 balance_i  ←  balance_i  −  Enc_i          // δ_sender = amount, δ_decoy = 0
 ```
 
-The receiver leg is the **stealth** credit: because `amount` is public, credit
-`Ciphertext::mint(amount)` to the one-time account `P`'s `pending` — exactly the
-mechanism `ShieldStealth` already uses. The miner fee is credited in the clear at the
-block level, as all fee paths already do.
+The receiver leg is the **stealth** credit. v3 (hidden amounts): the transfer
+*carries* the credit as a real ElGamal ciphertext under the one-time key — the
+ledger adds `xfer.credit` to `P`'s `pending` (the old `Ciphertext::mint(amount)`
+plaintext credit is gone with the public field). The miner fee is credited in
+the clear at the block level, as all fee paths already do.
 
-Conservation across the whole tx: `Σ_i δ_i (debited) = amount (credited to P)`, which
-the primitive's sum-proof already pins on the debit side; the receiver credit equals
-that same public `amount`.
+Conservation across the whole tx: `Σ_i δ_i (debited) = debit`, the aggregated
+range proof pins `amount = debit − fee ≥ 0`, and the credit-link Schnorr proves
+`credit` encrypts exactly that `amount` — so debits = credit + fee with no
+plaintext number anywhere.
 
 > **Primitive change — DONE.** The `AnonTransfer` struct now carries `enc: Vec<Ciphertext>`
 > (the per-member ElGamal debits) and a per-member brick-E link proving each `Enc_i`

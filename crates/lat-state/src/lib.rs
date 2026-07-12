@@ -1244,15 +1244,17 @@ impl Ledger {
                         self.put_account(&member_id, a);
                     }
                 }
-                // Credit the public amount to the one-time stealth account's
-                // pending pool, auto-registering it (the spend paid a fee, so no
-                // separate anti-spam PoW) — the same mechanism as ShieldStealth.
-                // The fee is credited to the miner at the block level. Read AFTER
-                // the ring debits are written back, in case `one_time` aliases a
+                // Credit the carried ciphertext (v3: the amount is HIDDEN — the
+                // proof guarantees it encrypts exactly debit − fee under the
+                // one-time key) to the stealth account's pending pool,
+                // auto-registering it (the spend paid a fee, so no separate
+                // anti-spam PoW) — the same mechanism as ShieldStealth. The fee
+                // is credited to the miner at the block level. Read AFTER the
+                // ring debits are written back, in case `one_time` aliases a
                 // ring member.
                 let one_time = xfer.output.one_time.to_bytes();
                 let mut r = self.account(&one_time).unwrap_or_default();
-                let new = r.pending(*token).add(&Ciphertext::mint(xfer.amount));
+                let new = r.pending(*token).add(&xfer.credit);
                 r.set_pending(*token, new);
                 self.put_account(&one_time, r);
 

@@ -237,8 +237,8 @@ fn main() {
     hr("[A1] WHAT THE ATTACKER SEES PER ANONYMOUS TRANSFER");
     for s in &dark.report.anon {
         println!(
-            "  blk{:<2} ring of {}  → one-time {}   amount {} (public), fee {}",
-            s.height, s.ring.len(), short(&s.one_time), s.amount, s.fee
+            "  blk{:<2} ring of {}  → one-time {}   amount HIDDEN (commitment), fee {}",
+            s.height, s.ring.len(), short(&s.one_time), s.fee
         );
         println!("        sender ∈ {{{}}}", s.ring.iter().map(short).collect::<Vec<_>>().join(", "));
     }
@@ -391,13 +391,13 @@ struct Edge {
 }
 
 /// What a passive observer can extract from ONE anonymous transfer: the ring
-/// (the sender is *somewhere* in it), a one-time receiver key, the public
-/// amount/fee, and the epoch nullifier. Nothing here names anyone.
+/// (the sender is *somewhere* in it), a one-time receiver key, the public fee,
+/// and the epoch nullifier. v3: the amount is a Pedersen commitment — there is
+/// no amount field left to harvest. Nothing here names anyone.
 struct AnonSighting {
     height: u64,
     ring: Vec<[u8; 32]>,
     one_time: [u8; 32],
-    amount: u64,
     fee: u64,
     nullifier: [u8; 32],
 }
@@ -462,14 +462,14 @@ fn analyze(block_log: &[Vec<u8>]) -> AttackReport {
                     intel.edges.push(Edge { height: h, kind: "CONFIDENTIAL", from, to, amount: None, fee: xfer.fee });
                 }
                 Transaction::AnonTransfer { xfer, .. } => {
-                    // The whole harvest: a ring, a one-time key, public numbers.
+                    // The whole harvest: a ring, a one-time key, the public fee.
                     // No debit is attributable — every ring member's encrypted
-                    // balance changed by an indistinguishable ciphertext.
+                    // balance changed by an indistinguishable ciphertext — and
+                    // (v3) the amount is a commitment, not a number.
                     intel.anon.push(AnonSighting {
                         height: h,
                         ring: xfer.ring.iter().map(|p| p.to_bytes()).collect(),
                         one_time: xfer.output.one_time.to_bytes(),
-                        amount: xfer.amount,
                         fee: xfer.fee,
                         nullifier: xfer.nullifier(),
                     });

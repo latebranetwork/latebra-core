@@ -609,10 +609,10 @@ fn tx_detail(tx: &Transaction) -> (String, String) {
             format!("<span class='pill-amt'>{}</span> shield · token {token}", commafy(*amount)),
         ),
         // Anonymous transfer: sender hidden in a ring, receiver behind a
-        // one-time stealth key. The amount is public (by design, this phase).
+        // one-time stealth key, amount hidden behind a commitment (v3).
         Transaction::AnonTransfer { token, xfer } => (
             format!("(ring of {}) → (stealth)", xfer.ring.len()),
-            format!("<span class='pill-amt'>{}</span> anonymous · token {token}", commafy(xfer.amount)),
+            format!("<span class='pill-amt'>hidden</span> anonymous · token {token}"),
         ),
         // Staking (T13): bond / begin unbonding validator stake, in the clear.
         Transaction::Stake { validator, amount, .. } => (

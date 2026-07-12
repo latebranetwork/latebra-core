@@ -2,7 +2,7 @@
 
 > Living document. Paste "continue from the latest checkpoint" in a new
 > conversation and work resumes from the **Current Task** below.
-> Last updated: 2026-07-11 (Checkpoint 18 — T23 decoder fuzzing + chaos soak; program CODE-COMPLETE for testnet→audit→mainnet).
+> Last updated: 2026-07-12 (Checkpoint 19 — F2 closed: hidden-amount anonymous transfers, AnonTransfer v3).
 
 ## 0. Mission
 
@@ -531,7 +531,30 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
 
 **PROGRAM CODE-COMPLETE for the testnet→audit→mainnet path.** M0–M4 + M6
 done; M5 (T20 RPC surface, T21 SDKs) is post-launch polish, T18 is an hour
-of work once real seed hosts exist. The remaining gates are NOT code tasks:
+of work once real seed hosts exist.
+
+**F2 CLOSED (2026-07-12): hidden-amount anonymous transfers (v3).** The
+pre-audit gap-closing pass (chosen after a chain-comparison review) hid the
+`AnonTransfer` amount: public `amount` field replaced by a Pedersen debit
+commitment `C_debit`; brick B is now a per-member CDS OR (`C_i ∈ ⟨H⟩` OR
+`C_i − C_debit ∈ ⟨H⟩`) needing no public set; the fused relations (b)/(c)
+and conservation run against `C_debit` (blindings fold into existing
+witnesses); ONE aggregated Bulletproof range-proves the remaining balance
+AND the amount via `C_amt = C_debit − fee·G` (rules out `debit < fee`
+wraparound); the receiver credit rides as an ElGamal ciphertext under the
+stealth one-time key, linked to `C_amt` by a two-base Schnorr, and the
+ledger credits `xfer.credit` (plaintext `Ciphertext::mint` gone). Fee stays
+public (fee-floor enforcement + miner credit). Domain tags bumped v2→v3;
+wire format changed (testnet-only break, rebuild all binaries). Wallet
+scan_stealth decrypts the credit with the derived one-time key
+(BALANCE_BITS); explorer shows "hidden"; lat-attack's AnonSighting has no
+amount field left to harvest. All ~256 tests green incl. the full
+mine→apply→stealth-receive e2e and new tamper tests (shifted C_debit,
+inflated credit, shifted fee all rejected). THREAT_MODEL.md §2 +
+ANON_INTEGRATION.md updated. Anon path now hides sender, receiver, AND
+amount — only fee/ring-size/epoch/timing remain visible.
+
+The remaining gates are NOT code tasks:
 
 1. **User deploys the public testnet** (LAUNCH.md §3–4: VPS seeds + miner +
    explorer + launchpad, or `docker compose up`), pushes the repo to GitHub

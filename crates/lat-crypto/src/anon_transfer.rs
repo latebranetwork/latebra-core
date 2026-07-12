@@ -10,34 +10,47 @@
 //! # What it hides — and what it does not
 //! * **Sender:** hidden inside a public anonymity set (ring) of `N` members.
 //! * **Receiver:** hidden via a one-time **stealth** address ([`crate::stealth_send`]).
-//! * **Amount / fee:** **PUBLIC.** The bricks take them as public parameters. This
-//!   closes the *transaction-graph* leak (finding F1) — who-paid-whom — but **not**
-//!   the amount leak (F2). Hiding amounts is a deferred upgrade.
+//! * **Amount:** **HIDDEN** (v3, closing finding F2). The transfer publishes only a
+//!   Pedersen commitment `C_debit` to the total debit and an ElGamal `credit`
+//!   ciphertext for the receiver; every relation that previously took the public
+//!   amount is proven against the commitment instead.
+//! * **Fee:** **PUBLIC** — the miner must credit it in plaintext, and a public fee
+//!   is what lets consensus enforce the fee floor. (Zcash/Monero also expose fees.)
 //!
 //! # Debit accounting (fee folded in)
 //! Because the sender is hidden, the fee cannot be subtracted from it separately (that
 //! would reveal which account paid). So the value that leaves the sender is the whole
-//! **`debit = amount + fee`**: the delta commitments, membership bounds, solvency, and
-//! conservation are all over `debit`. Consensus then splits the public total — crediting
-//! `amount` to the stealth receiver and `fee` to the miner.
+//! **`debit = amount + fee`**, committed as `C_debit = debit·G + s_d·H`: the delta
+//! commitments, zero-or-debit bounds, solvency, and conservation are all against
+//! `C_debit`. Consensus credits the carried `credit` ciphertext to the stealth
+//! receiver's pending pool and the public `fee` to the miner.
 //!
 //! # What `verify` proves (soundness)
 //! For a public ring `{Y_i}`, on-chain balance ciphertexts `{(C_i^bal,D_i^bal)}`,
 //! per-member Pedersen delta commitments `{C_i = δ_i·G + s_i·H}`, per-member ElGamal
-//! debit ciphertexts `{Enc_i}`, public `amount`/`fee`/`epoch`, and a published
-//! nullifier `u`:
+//! debit ciphertexts `{Enc_i}`, debit commitment `C_debit`, receiver credit ciphertext
+//! `credit`, public `fee`/`epoch`, and a published nullifier `u`:
 //!
-//! 1. **Bounds (brick B):** every `δ_i ∈ {0, debit}` — no decoy carries a secret value.
-//! 2. **Conservation:** `Σ δ_i = debit` — so, with (1), *exactly one* member carries
-//!    `debit` and the rest carry `0`.
+//! 1. **Bounds (brick B, hidden form):** every `δ_i ∈ {0, debit}` — proven per member
+//!    as `C_i ∈ ⟨H⟩ OR (C_i − C_debit) ∈ ⟨H⟩` (a CDS OR of two Schnorr-on-H proofs),
+//!    which needs no public amount.
+//! 2. **Conservation:** `Σ C_i − C_debit ∈ ⟨H⟩` — so `Σ δ_i = debit`, and with (1)
+//!    *exactly one* member carries `debit` and the rest carry `0` (for `debit ≠ 0`;
+//!    consensus's fee floor keeps `debit ≥ fee > 0`).
 //! 3. **Owned = debited = solvent = nullified (fused bricks A+C+D):** one CDS
 //!    OR-composition proves a hidden index `l` at which the prover simultaneously
-//!    (a) owns `Y_l = x·G`, (b) `C_l` commits to `debit`, (c) `balance_l − debit ≥ 0`
-//!    (a Bulletproofs range proof), and (d) the **epoch nullifier** `u = x·G_epoch`
-//!    uses that same `x`. All four share the branch challenge `e_l` and witness `x`.
+//!    (a) owns `Y_l = x·G`, (b) `C_l − C_debit ∈ ⟨H⟩` (commits to `debit`),
+//!    (c) `balance_l − debit ≥ 0` (Bulletproofs, via `T_i = V − C_i^bal + C_debit`),
+//!    and (d) the **epoch nullifier** `u = x·G_epoch` uses that same `x`. All four
+//!    share the branch challenge `e_l` and witness `x`.
 //! 4. **Value-movement link (brick E):** every `Enc_i` provably encrypts the *same*
 //!    `δ_i` committed in `C_i` (a per-member two-base Schnorr), so the ciphertext the
 //!    ledger subtracts from `balance_i` matches the proven-correct delta.
+//! 5. **Amount well-formedness + credit link (v3):** the aggregated Bulletproof also
+//!    range-proves the hidden `amount` via `C_amt = C_debit − fee·G` (so
+//!    `debit ≥ fee`, no scalar wraparound), and a two-base Schnorr proves the carried
+//!    `credit` ciphertext encrypts, under the stealth one-time key, exactly the value
+//!    `C_amt` commits to — the receiver is credited precisely `debit − fee`.
 //!
 //! # Epoch nullifier (anti-replay for an account model)
 //! The nullifier is `u = x·G_epoch`, where `G_epoch = H_p("Latebra.Epoch" ‖ epoch)`.
@@ -64,7 +77,7 @@ use merlin::Transcript as MerlinTranscript;
 use rand::{CryptoRng, RngCore};
 use sha2::{Digest, Sha512};
 
-use crate::{commit_delta, stealth_send, Ciphertext, PublicKey, SecretKey, StealthOutput, ValueInSetProof};
+use crate::{commit_delta, stealth_send, Ciphertext, PublicKey, SecretKey, StealthOutput};
 
 const RANGE_BITS: usize = 64;
 
@@ -88,7 +101,8 @@ fn epoch_base(epoch: u64) -> RistrettoPoint {
 /// Brick E: a per-member proof that ElGamal `Enc_i` encrypts the same value that the
 /// Pedersen commitment `C_i` commits to (without revealing it). Two-base Schnorr over
 /// witnesses `(δ_i, s_i, y_i)` for the three relations `C_i = δ·G + s·H`,
-/// `Enc_i.c = δ·G + y·Y_i`, `Enc_i.d = y·G`.
+/// `Enc_i.c = δ·G + y·Y_i`, `Enc_i.d = y·G`. Also reused (v3) to link the receiver
+/// `credit` ciphertext to the hidden-amount commitment `C_amt`.
 #[derive(Clone, Debug)]
 struct DeltaLink {
     a1: RistrettoPoint,
@@ -97,6 +111,80 @@ struct DeltaLink {
     z_d: Scalar,
     z_s: Scalar,
     z_y: Scalar,
+}
+
+/// Brick B, hidden-amount form (v3): a CDS OR-proof that a delta commitment `C`
+/// opens to `0` **or** to the (hidden) debit committed by `C_debit` — i.e.
+/// `C = s·H` OR `C − C_debit = s'·H`, both plain Schnorrs on base `H`. Replaces
+/// the old `ValueInSetProof` over the public set `{0, debit}`.
+#[derive(Clone, Debug)]
+struct ZeroOrDebit {
+    a0: RistrettoPoint,
+    a1: RistrettoPoint,
+    e0: Scalar,
+    z0: Scalar,
+    z1: Scalar,
+}
+
+/// Fiat–Shamir challenge for one [`ZeroOrDebit`] proof.
+fn zod_challenge(
+    c: &RistrettoPoint,
+    c_debit: &RistrettoPoint,
+    a0: &RistrettoPoint,
+    a1: &RistrettoPoint,
+) -> Scalar {
+    let mut h = Sha512::new();
+    h.update(b"Latebra.AnonTransfer.zod.v1");
+    for p in [c, c_debit, a0, a1] {
+        h.update(p.compress().as_bytes());
+    }
+    let digest = h.finalize();
+    let mut wide = [0u8; 64];
+    wide.copy_from_slice(&digest);
+    Scalar::from_bytes_mod_order_wide(&wide)
+}
+
+impl ZeroOrDebit {
+    /// Prove `C = value·G + s·H` opens to 0 (`debit_branch = false`, witness `s`)
+    /// or to the debit committed by `C_debit = debit·G + s_d·H`
+    /// (`debit_branch = true`, witness `s − s_d`).
+    fn prove<R: RngCore + CryptoRng>(
+        c: &RistrettoPoint,
+        c_debit: &RistrettoPoint,
+        debit_branch: bool,
+        witness: &Scalar, // `s` for the 0 branch, `s − s_d` for the debit branch
+        rng: &mut R,
+    ) -> ZeroOrDebit {
+        let h = blinding_base();
+        let diff = c - c_debit;
+        let k = Scalar::random(rng);
+        if debit_branch {
+            // Simulate branch 0 (C = s·H), prove branch 1 (C − C_debit = s'·H).
+            let e0 = Scalar::random(rng);
+            let z0 = Scalar::random(rng);
+            let a0 = h * z0 - c * e0;
+            let a1 = h * k;
+            let e = zod_challenge(c, c_debit, &a0, &a1);
+            let e1 = e - e0;
+            ZeroOrDebit { a0, a1, e0, z0, z1: k + e1 * witness }
+        } else {
+            // Simulate branch 1, prove branch 0.
+            let e1 = Scalar::random(rng);
+            let z1 = Scalar::random(rng);
+            let a1 = h * z1 - diff * e1;
+            let a0 = h * k;
+            let e = zod_challenge(c, c_debit, &a0, &a1);
+            let e0 = e - e1;
+            ZeroOrDebit { a0, a1, e0, z0: k + e0 * witness, z1 }
+        }
+    }
+
+    fn verify(&self, c: &RistrettoPoint, c_debit: &RistrettoPoint) -> bool {
+        let h = blinding_base();
+        let e = zod_challenge(c, c_debit, &self.a0, &self.a1);
+        let e1 = e - self.e0;
+        h * self.z0 == self.a0 + c * self.e0 && h * self.z1 == self.a1 + (c - c_debit) * e1
+    }
 }
 
 /// A composed anonymous transfer: the public statement plus its bundled proofs.
@@ -111,9 +199,14 @@ pub struct AnonTransfer {
     /// Per-member ElGamal debit ciphertexts under `ring[i]` — what the ledger
     /// subtracts from `balances[i]` (`δ_sender = debit`, decoys `0`).
     pub enc: Vec<Ciphertext>,
-    /// Public transfer amount credited to the receiver (this construction does NOT
-    /// hide it).
-    pub amount: u64,
+    /// Pedersen commitment `C_debit = (amount + fee)·G + s_d·H` to the HIDDEN
+    /// total debit (v3 — the amount never appears in plaintext).
+    pub c_debit: RistrettoPoint,
+    /// ElGamal encryption of the hidden `amount` under the stealth one-time
+    /// key — what the ledger adds to the receiver's pending pool. Proven (via
+    /// `credit_link` + the aggregated range proof) to encrypt exactly
+    /// `debit − fee`.
+    pub credit: Ciphertext,
     /// Public fee paid to the miner.
     pub fee: u64,
     /// The epoch this spend is valid in (its nullifier base). Consensus must check
@@ -126,7 +219,9 @@ pub struct AnonTransfer {
     nullifier: RistrettoPoint,
     /// Bulletproofs commitment `V = b'·G + γ·H` to the remaining balance `b'`.
     v: CompressedRistretto,
-    /// Range proof that `V` commits to a value in `[0, 2^64)`.
+    /// Aggregated range proof over TWO values: the remaining balance (in `V`)
+    /// and the hidden amount (in `C_amt = C_debit − fee·G`) — the latter is what
+    /// rules out `debit < fee` scalar wraparound.
     rp: RangeProof,
 
     // Fused OR-composition (relations a–d), one entry per ring member.
@@ -135,10 +230,13 @@ pub struct AnonTransfer {
     z_s: Vec<Scalar>,
     z_g: Vec<Scalar>,
 
-    /// Brick B: proof that each `deltas[i]` opens to `{0, debit}`.
-    membership: Vec<ValueInSetProof>,
+    /// Brick B (hidden form): proof that each `deltas[i]` opens to 0 or the debit.
+    membership: Vec<ZeroOrDebit>,
     /// Brick E: per-member link that `enc[i]` encrypts the same `δ_i` as `deltas[i]`.
     links: Vec<DeltaLink>,
+    /// v3: link that `credit` encrypts (under the one-time key) the value committed
+    /// by `C_amt = C_debit − fee·G`.
+    credit_link: DeltaLink,
 
     // Conservation: Schnorr that `Σ deltas − debit·G = σ·H` (so `Σ δ_i = debit`).
     sum_a: RistrettoPoint,
@@ -154,7 +252,8 @@ fn fused_challenge(
     balances: &[Ciphertext],
     deltas: &[RistrettoPoint],
     enc: &[Ciphertext],
-    amount: u64,
+    c_debit: &RistrettoPoint,
+    credit: &Ciphertext,
     fee: u64,
     epoch: u64,
     nullifier: &RistrettoPoint,
@@ -166,7 +265,7 @@ fn fused_challenge(
     a4: &[RistrettoPoint],
 ) -> Scalar {
     let mut h = Sha512::new();
-    h.update(b"Latebra.AnonTransfer.v2");
+    h.update(b"Latebra.AnonTransfer.v3");
     h.update((ring.len() as u64).to_le_bytes());
     for pk in ring {
         h.update(pk.0.compress().as_bytes());
@@ -182,7 +281,9 @@ fn fused_challenge(
         h.update(ct.c.compress().as_bytes());
         h.update(ct.d.compress().as_bytes());
     }
-    h.update(amount.to_le_bytes());
+    h.update(c_debit.compress().as_bytes());
+    h.update(credit.c.compress().as_bytes());
+    h.update(credit.d.compress().as_bytes());
     h.update(fee.to_le_bytes());
     h.update(epoch.to_le_bytes());
     h.update(nullifier.compress().as_bytes());
@@ -200,14 +301,20 @@ fn fused_challenge(
     Scalar::from_bytes_mod_order_wide(&wide)
 }
 
-/// Challenge for the conservation (sum-to-debit) Schnorr.
-fn sum_challenge(deltas: &[RistrettoPoint], debit: u64, agg_target: &RistrettoPoint, a: &RistrettoPoint) -> Scalar {
+/// Challenge for the conservation (sum-to-debit) Schnorr — the debit is hidden,
+/// so the challenge binds its commitment.
+fn sum_challenge(
+    deltas: &[RistrettoPoint],
+    c_debit: &RistrettoPoint,
+    agg_target: &RistrettoPoint,
+    a: &RistrettoPoint,
+) -> Scalar {
     let mut h = Sha512::new();
-    h.update(b"Latebra.AnonTransfer.sum.v2");
+    h.update(b"Latebra.AnonTransfer.sum.v3");
     for c in deltas {
         h.update(c.compress().as_bytes());
     }
-    h.update(debit.to_le_bytes());
+    h.update(c_debit.compress().as_bytes());
     h.update(agg_target.compress().as_bytes());
     h.update(a.compress().as_bytes());
     let digest = h.finalize();
@@ -237,9 +344,11 @@ fn link_challenge(
 }
 
 /// The per-branch target of the solvency relation (c):
-/// `T_i = V − C_i^bal + debit·G`. At the real index this equals `γ·H − x·D_i^bal`.
-fn solvency_target(v: &RistrettoPoint, bal: &Ciphertext, debit_g: &RistrettoPoint) -> RistrettoPoint {
-    v - bal.c + debit_g
+/// `T_i = V − C_i^bal + C_debit`. At the real index this equals
+/// `(γ + s_d)·H − x·D_i^bal` (the debit commitment's blinding folds into the
+/// range-proof blinding — both are on base `H`).
+fn solvency_target(v: &RistrettoPoint, bal: &Ciphertext, c_debit: &RistrettoPoint) -> RistrettoPoint {
+    v - bal.c + c_debit
 }
 
 impl AnonTransfer {
@@ -277,8 +386,10 @@ impl AnonTransfer {
         let remaining = sender_balance.checked_sub(debit)?;
 
         let h = blinding_base();
-        let debit_g = G * Scalar::from(debit);
-        let allowed = [0i64, debit as i64];
+
+        // --- hidden-debit commitment (v3): C_debit = debit·G + s_d·H -----------
+        let s_d = Scalar::random(rng);
+        let c_debit = G * Scalar::from(debit) + h * s_d;
 
         // --- delta commitments + ElGamal debits: sender carries `debit`, decoys 0 --
         let mut deltas = Vec::with_capacity(n);
@@ -295,13 +406,20 @@ impl AnonTransfer {
             encs_rand.push(y);
         }
 
-        // --- range proof on the remaining balance (V = b'·G + γ·H) --------------
+        // --- aggregated range proof: remaining balance AND hidden amount -------
+        // V = b'·G + γ·H, and C_amt = amount·G + s_d·H (== C_debit − fee·G, so the
+        // amount slot proves debit ≥ fee with no scalar wraparound).
         let pc = PedersenGens::default();
-        let bp = BulletproofGens::new(RANGE_BITS, 1);
+        let bp = BulletproofGens::new(RANGE_BITS, 2);
         let gamma = Scalar::random(rng);
-        let mut tr = MerlinTranscript::new(b"Latebra.AnonTransfer.range");
-        let (rp, v_comp) = RangeProof::prove_single(&bp, &pc, &mut tr, remaining, &gamma, RANGE_BITS).ok()?;
+        let mut tr = MerlinTranscript::new(b"Latebra.AnonTransfer.range.v3");
+        let (rp, comms) = RangeProof::prove_multiple(
+            &bp, &pc, &mut tr, &[remaining, amount], &[gamma, s_d], RANGE_BITS,
+        )
+        .ok()?;
+        let v_comp = comms[0];
         let v = v_comp.decompress()?;
+        debug_assert_eq!(comms[1].decompress()?, c_debit - G * Scalar::from(fee));
 
         // --- epoch nullifier and stealth receiver ------------------------------
         let x = sender.0;
@@ -309,14 +427,18 @@ impl AnonTransfer {
         let nullifier = g_epoch * x;
         let output = stealth_send(receiver, rng);
 
+        // --- receiver credit: Enc_onetime(amount), linked to C_amt below -------
+        let y_c = Scalar::random(rng);
+        let credit = output.one_time.encrypt_with_randomness(amount, &y_c);
+
         // --- fused OR-composition (relations a–d) ------------------------------
         let mut e = vec![Scalar::ZERO; n];
         let mut z_x = vec![Scalar::ZERO; n];
         let mut z_s = vec![Scalar::ZERO; n];
         let mut z_g = vec![Scalar::ZERO; n];
         let mut a1 = vec![RistrettoPoint::identity(); n]; // ownership   Y_i = x·G
-        let mut a2 = vec![RistrettoPoint::identity(); n]; // delta       C_i − debit·G = s·H
-        let mut a3 = vec![RistrettoPoint::identity(); n]; // solvency    T_i = γ·H − x·D_i^bal
+        let mut a2 = vec![RistrettoPoint::identity(); n]; // delta       C_i − C_debit = s·H
+        let mut a3 = vec![RistrettoPoint::identity(); n]; // solvency    T_i = γ'·H − x·D_i^bal
         let mut a4 = vec![RistrettoPoint::identity(); n]; // nullifier   u = x·G_epoch
 
         let mut sum_decoy = Scalar::ZERO;
@@ -328,9 +450,9 @@ impl AnonTransfer {
             z_x[i] = Scalar::random(rng);
             z_s[i] = Scalar::random(rng);
             z_g[i] = Scalar::random(rng);
-            let t_i = solvency_target(&v, &balances[i], &debit_g);
+            let t_i = solvency_target(&v, &balances[i], &c_debit);
             a1[i] = G * z_x[i] - ring[i].0 * e[i];
-            a2[i] = h * z_s[i] - (deltas[i] - debit_g) * e[i];
+            a2[i] = h * z_s[i] - (deltas[i] - c_debit) * e[i];
             a3[i] = h * z_g[i] - balances[i].d * z_x[i] - t_i * e[i];
             a4[i] = g_epoch * z_x[i] - nullifier * e[i];
             sum_decoy += e[i];
@@ -346,20 +468,22 @@ impl AnonTransfer {
         a4[l] = g_epoch * k_x;
 
         let c = fused_challenge(
-            ring, balances, &deltas, &enc, amount, fee, epoch, &nullifier, &v, &output, &a1, &a2, &a3, &a4,
+            ring, balances, &deltas, &enc, &c_debit, &credit, fee, epoch, &nullifier, &v, &output,
+            &a1, &a2, &a3, &a4,
         );
         e[l] = c - sum_decoy;
         z_x[l] = k_x + e[l] * x;
-        z_s[l] = k_s + e[l] * blinds[l];
-        z_g[l] = k_g + e[l] * gamma;
+        // Relation (b) witness: C_l − C_debit = (s_l − s_d)·H.
+        z_s[l] = k_s + e[l] * (blinds[l] - s_d);
+        // Relation (c) witness: T_l = (γ + s_d)·H − x·D_l^bal.
+        z_g[l] = k_g + e[l] * (gamma + s_d);
 
-        // --- brick B: each delta opens to {0, debit} ---------------------------
+        // --- brick B (hidden form): each delta opens to 0 or the hidden debit --
         let mut membership = Vec::with_capacity(n);
         for i in 0..n {
-            let value = if i == sender_index { debit as i64 } else { 0 };
-            let (commitment, proof) = ValueInSetProof::prove(value, &blinds[i], &allowed, rng)?;
-            debug_assert_eq!(commitment, deltas[i]);
-            membership.push(proof);
+            let (debit_branch, witness) =
+                if i == sender_index { (true, blinds[i] - s_d) } else { (false, blinds[i]) };
+            membership.push(ZeroOrDebit::prove(&deltas[i], &c_debit, debit_branch, &witness, rng));
         }
 
         // --- brick E: link each Enc_i to the same value as C_i -----------------
@@ -381,13 +505,34 @@ impl AnonTransfer {
             });
         }
 
-        // --- conservation: Σ deltas − debit·G = σ·H ----------------------------
-        let sigma: Scalar = blinds.iter().sum();
+        // --- v3: link the receiver credit to C_amt = C_debit − fee·G -----------
+        // Same three-relation two-base Schnorr as brick E, with the one-time key
+        // in the ElGamal slot: C_amt = a·G + s_d·H, credit.c = a·G + y_c·OT,
+        // credit.d = y_c·G.
+        let c_amt = c_debit - G * Scalar::from(fee);
+        let credit_link = {
+            let (k_d, k_s2, k_y) = (Scalar::random(rng), Scalar::random(rng), Scalar::random(rng));
+            let a1l = G * k_d + h * k_s2;
+            let a2l = G * k_d + output.one_time.0 * k_y;
+            let a3l = G * k_y;
+            let el = link_challenge(&output.one_time, &c_amt, &credit, &a1l, &a2l, &a3l);
+            DeltaLink {
+                a1: a1l,
+                a2: a2l,
+                a3: a3l,
+                z_d: k_d + el * Scalar::from(amount),
+                z_s: k_s2 + el * s_d,
+                z_y: k_y + el * y_c,
+            }
+        };
+
+        // --- conservation: Σ deltas − C_debit = σ'·H ---------------------------
+        let sigma: Scalar = blinds.iter().sum::<Scalar>() - s_d;
         let agg: RistrettoPoint = deltas.iter().sum();
-        let agg_target = agg - debit_g; // = σ·H when Σδ = debit
+        let agg_target = agg - c_debit; // = σ'·H when Σδ = debit
         let k_sum = Scalar::random(rng);
         let sum_a = h * k_sum;
-        let e_sum = sum_challenge(&deltas, debit, &agg_target, &sum_a);
+        let e_sum = sum_challenge(&deltas, &c_debit, &agg_target, &sum_a);
         let sum_z = k_sum + e_sum * sigma;
 
         Some(AnonTransfer {
@@ -395,7 +540,8 @@ impl AnonTransfer {
             balances: balances.to_vec(),
             deltas,
             enc,
-            amount,
+            c_debit,
+            credit,
             fee,
             epoch,
             output,
@@ -408,6 +554,7 @@ impl AnonTransfer {
             z_g,
             membership,
             links,
+            credit_link,
             sum_a,
             sum_z,
         })
@@ -442,16 +589,17 @@ impl AnonTransfer {
         {
             return false;
         }
-        let debit = match self.amount.checked_add(self.fee) {
-            Some(s) => s,
-            None => return false,
-        };
-
-        // 1) Bulletproofs range proof on the remaining-balance commitment V.
+        // 1) Aggregated Bulletproof: the remaining balance (V) AND the hidden
+        //    amount (C_amt = C_debit − fee·G) are both in [0, 2^64).
+        let c_amt = self.c_debit - G * Scalar::from(self.fee);
         let pc = PedersenGens::default();
-        let bp = BulletproofGens::new(RANGE_BITS, 1);
-        let mut tr = MerlinTranscript::new(b"Latebra.AnonTransfer.range");
-        if self.rp.verify_single(&bp, &pc, &mut tr, &self.v, RANGE_BITS).is_err() {
+        let bp = BulletproofGens::new(RANGE_BITS, 2);
+        let mut tr = MerlinTranscript::new(b"Latebra.AnonTransfer.range.v3");
+        if self
+            .rp
+            .verify_multiple(&bp, &pc, &mut tr, &[self.v, c_amt.compress()], RANGE_BITS)
+            .is_err()
+        {
             return false;
         }
         let v = match self.v.decompress() {
@@ -460,8 +608,6 @@ impl AnonTransfer {
         };
 
         let h = blinding_base();
-        let debit_g = G * Scalar::from(debit);
-        let allowed = [0i64, debit as i64];
         let g_epoch = epoch_base(self.epoch);
 
         // 2) Fused OR-composition: reconstruct all four announcements per branch.
@@ -471,24 +617,24 @@ impl AnonTransfer {
         let mut a4 = vec![RistrettoPoint::identity(); n];
         let mut sum = Scalar::ZERO;
         for i in 0..n {
-            let t_i = solvency_target(&v, &self.balances[i], &debit_g);
+            let t_i = solvency_target(&v, &self.balances[i], &self.c_debit);
             a1[i] = G * self.z_x[i] - self.ring[i].0 * self.e[i];
-            a2[i] = h * self.z_s[i] - (self.deltas[i] - debit_g) * self.e[i];
+            a2[i] = h * self.z_s[i] - (self.deltas[i] - self.c_debit) * self.e[i];
             a3[i] = h * self.z_g[i] - self.balances[i].d * self.z_x[i] - t_i * self.e[i];
             a4[i] = g_epoch * self.z_x[i] - self.nullifier * self.e[i];
             sum += self.e[i];
         }
         let c = fused_challenge(
-            &self.ring, &self.balances, &self.deltas, &self.enc, self.amount, self.fee, self.epoch,
-            &self.nullifier, &v, &self.output, &a1, &a2, &a3, &a4,
+            &self.ring, &self.balances, &self.deltas, &self.enc, &self.c_debit, &self.credit,
+            self.fee, self.epoch, &self.nullifier, &v, &self.output, &a1, &a2, &a3, &a4,
         );
         if c != sum {
             return false;
         }
 
-        // 3) Brick B: every delta opens to {0, debit}.
+        // 3) Brick B (hidden form): every delta opens to 0 or the hidden debit.
         for i in 0..n {
-            if !self.membership[i].verify(&self.deltas[i], &allowed) {
+            if !self.membership[i].verify(&self.deltas[i], &self.c_debit) {
                 return false;
             }
         }
@@ -505,10 +651,23 @@ impl AnonTransfer {
             }
         }
 
-        // 5) Conservation: Σ deltas − debit·G ∈ ⟨H⟩ with the proven blinding sum.
+        // 5) v3 credit link: `credit` encrypts (under the one-time key) exactly the
+        //    value C_amt commits to — so the ledger credits precisely debit − fee.
+        {
+            let lk = &self.credit_link;
+            let el = link_challenge(&self.output.one_time, &c_amt, &self.credit, &lk.a1, &lk.a2, &lk.a3);
+            let c1 = G * lk.z_d + h * lk.z_s == lk.a1 + c_amt * el;
+            let c2 = G * lk.z_d + self.output.one_time.0 * lk.z_y == lk.a2 + self.credit.c * el;
+            let c3 = G * lk.z_y == lk.a3 + self.credit.d * el;
+            if !(c1 && c2 && c3) {
+                return false;
+            }
+        }
+
+        // 6) Conservation: Σ deltas − C_debit ∈ ⟨H⟩ with the proven blinding sum.
         let agg: RistrettoPoint = self.deltas.iter().sum();
-        let agg_target = agg - debit_g;
-        let e_sum = sum_challenge(&self.deltas, debit, &agg_target, &self.sum_a);
+        let agg_target = agg - self.c_debit;
+        let e_sum = sum_challenge(&self.deltas, &self.c_debit, &agg_target, &self.sum_a);
         if h * self.sum_z != self.sum_a + agg_target * e_sum {
             return false;
         }
@@ -516,16 +675,16 @@ impl AnonTransfer {
         true
     }
 
-    /// Canonical byte encoding. Layout: `n`, `amount`, `fee`, `epoch`, then the
-    /// `n`-sized vectors (ring, balances, deltas, enc), the stealth output, nullifier,
-    /// remaining-balance commitment, the length-prefixed range proof, the four response
-    /// vectors, the length-prefixed membership proofs, the value-movement links, and
-    /// the conservation proof.
+    /// Canonical byte encoding (v3). Layout: `n`, `fee`, `epoch`, then the
+    /// `n`-sized vectors (ring, balances, deltas, enc), the debit commitment and
+    /// receiver credit, the stealth output, nullifier, remaining-balance commitment,
+    /// the length-prefixed range proof, the four response vectors, the fixed-size
+    /// membership proofs, the value-movement links, the credit link, and the
+    /// conservation proof.
     pub fn to_bytes(&self) -> Vec<u8> {
         let n = self.ring.len();
-        let mut v = Vec::with_capacity(32 + n * 480);
+        let mut v = Vec::with_capacity(32 + n * 520);
         v.extend_from_slice(&(n as u32).to_le_bytes());
-        v.extend_from_slice(&self.amount.to_le_bytes());
         v.extend_from_slice(&self.fee.to_le_bytes());
         v.extend_from_slice(&self.epoch.to_le_bytes());
         for pk in &self.ring {
@@ -540,6 +699,8 @@ impl AnonTransfer {
         for ct in &self.enc {
             v.extend_from_slice(&ct.to_bytes());
         }
+        v.extend_from_slice(self.c_debit.compress().as_bytes());
+        v.extend_from_slice(&self.credit.to_bytes());
         v.extend_from_slice(&self.output.ephemeral.to_bytes());
         v.extend_from_slice(&self.output.one_time.to_bytes());
         v.extend_from_slice(self.nullifier.compress().as_bytes());
@@ -553,11 +714,13 @@ impl AnonTransfer {
             }
         }
         for m in &self.membership {
-            let blob = m.to_bytes();
-            v.extend_from_slice(&(blob.len() as u32).to_le_bytes());
-            v.extend_from_slice(&blob);
+            v.extend_from_slice(m.a0.compress().as_bytes());
+            v.extend_from_slice(m.a1.compress().as_bytes());
+            for s in [&m.e0, &m.z0, &m.z1] {
+                v.extend_from_slice(s.as_bytes());
+            }
         }
-        for lk in &self.links {
+        for lk in self.links.iter().chain(std::iter::once(&self.credit_link)) {
             for p in [&lk.a1, &lk.a2, &lk.a3] {
                 v.extend_from_slice(p.compress().as_bytes());
             }
@@ -579,7 +742,6 @@ impl AnonTransfer {
         if n < 2 {
             return None;
         }
-        let amount = r.u64()?;
         let fee = r.u64()?;
         let epoch = r.u64()?;
 
@@ -599,6 +761,8 @@ impl AnonTransfer {
         for _ in 0..n {
             enc.push(Ciphertext::from_bytes(&r.arr64()?)?);
         }
+        let c_debit = r.point()?;
+        let credit = Ciphertext::from_bytes(&r.arr64()?)?;
         let output = StealthOutput {
             ephemeral: PublicKey::from_bytes(&r.arr32()?)?,
             one_time: PublicKey::from_bytes(&r.arr32()?)?,
@@ -622,20 +786,29 @@ impl AnonTransfer {
 
         let mut membership = Vec::with_capacity(n);
         for _ in 0..n {
-            let blob_len = r.u32()? as usize;
-            membership.push(ValueInSetProof::from_bytes(r.take(blob_len)?)?);
+            membership.push(ZeroOrDebit {
+                a0: r.point()?,
+                a1: r.point()?,
+                e0: r.scalar()?,
+                z0: r.scalar()?,
+                z1: r.scalar()?,
+            });
         }
-        let mut links = Vec::with_capacity(n);
-        for _ in 0..n {
-            links.push(DeltaLink {
+        let read_link = |r: &mut Rd| -> Option<DeltaLink> {
+            Some(DeltaLink {
                 a1: r.point()?,
                 a2: r.point()?,
                 a3: r.point()?,
                 z_d: r.scalar()?,
                 z_s: r.scalar()?,
                 z_y: r.scalar()?,
-            });
+            })
+        };
+        let mut links = Vec::with_capacity(n);
+        for _ in 0..n {
+            links.push(read_link(&mut r)?);
         }
+        let credit_link = read_link(&mut r)?;
         let sum_a = r.point()?;
         let sum_z = r.scalar()?;
 
@@ -643,8 +816,8 @@ impl AnonTransfer {
             return None; // no trailing garbage
         }
         Some(AnonTransfer {
-            ring, balances, deltas, enc, amount, fee, epoch, output, nullifier, v, rp, e, z_x, z_s, z_g,
-            membership, links, sum_a, sum_z,
+            ring, balances, deltas, enc, c_debit, credit, fee, epoch, output, nullifier, v, rp,
+            e, z_x, z_s, z_g, membership, links, credit_link, sum_a, sum_z,
         })
     }
 }
@@ -846,17 +1019,50 @@ mod tests {
         let base = AnonTransfer::create(&ring, &balances, &sks[0], 0, bals[0], &receiver, 5_000, 30, EPOCH, &mut rng).unwrap();
         assert!(base.verify());
 
+        // v3: the amount is hidden behind C_debit — shifting the commitment
+        // (equivalent to claiming a different debit) must break every relation
+        // proven against it.
         let mut bad_amt = base.clone();
-        bad_amt.amount += 1;
-        assert!(!bad_amt.verify(), "amount (via debit) is bound into every sub-proof");
+        bad_amt.c_debit += G;
+        assert!(!bad_amt.verify(), "the debit commitment is bound into every sub-proof");
+
+        // Inflating the carried credit ciphertext must break the credit link.
+        let mut bad_credit = base.clone();
+        bad_credit.credit.c += G;
+        assert!(!bad_credit.verify(), "the credit ciphertext is bound to C_amt");
 
         let mut bad_fee = base.clone();
         bad_fee.fee += 1;
-        assert!(!bad_fee.verify(), "fee (via debit) is bound in");
+        assert!(!bad_fee.verify(), "fee shifts C_amt, breaking the range/credit proofs");
 
         let mut bad_epoch = base.clone();
         bad_epoch.epoch += 1;
         assert!(!bad_epoch.verify(), "epoch is bound into the nullifier relation");
+    }
+
+    #[test]
+    fn hidden_amount_reaches_only_the_stealth_receiver() {
+        // v3: the amount appears nowhere in plaintext. The stealth receiver
+        // derives the one-time spend key and decrypts the carried credit; an
+        // observer holding only public data has no field to read.
+        let mut rng = OsRng;
+        let (sks, ring) = ring_of(3, &mut rng);
+        let bals = [40_000, 1, 2];
+        let balances = balances_of(&sks, &bals, &mut rng);
+        let receiver = SecretKey::random(&mut rng);
+
+        let amount = 7_777;
+        let tx = AnonTransfer::create(
+            &ring, &balances, &sks[0], 0, bals[0], &receiver.public_key(), amount, 10, EPOCH, &mut rng,
+        )
+        .unwrap();
+        assert!(tx.verify());
+
+        let spend = crate::stealth_receive(&receiver, &tx.output.ephemeral, &tx.output.one_time)
+            .expect("receiver recognizes the output");
+        assert_eq!(spend.decrypt(&tx.credit, 24), Some(amount), "receiver reads the amount");
+        // A ring member (non-receiver) cannot read it.
+        assert_eq!(sks[1].decrypt(&tx.credit, 24), None, "credit is opaque to non-receivers");
     }
 
     #[test]
