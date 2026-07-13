@@ -712,7 +712,7 @@ mod tests {
         let sk = SecretKey::random(&mut rng);
         let bal = sk.public_key().encrypt(1_000, &mut rng);
         let xfer = lat_crypto::SolventTransfer::create(
-            &sk, &lat_crypto::unshield_view_key(), 400, 100, 1_000, &bal, 0, &mut rng,
+            &sk, &lat_crypto::unshield_view_key(), 0, 400, 100, 1_000, &bal, 0, &mut rng,
         )
         .unwrap();
         let unshield = Transaction::Unshield { token: 0, to: [5u8; 32], amount: 400, xfer, sig: [9u8; 64] };

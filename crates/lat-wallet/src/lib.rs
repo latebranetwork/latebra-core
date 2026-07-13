@@ -191,6 +191,7 @@ impl Wallet {
         let xfer = SolventTransfer::create(
             &self.secret,
             &receiver.key,
+            token,
             amount,
             fee,
             current,
@@ -418,6 +419,7 @@ impl Wallet {
         let xfer = SolventTransfer::create(
             &self.secret,
             &lat_crypto::unshield_view_key(),
+            token,
             amount,
             fee,
             current,
@@ -560,7 +562,7 @@ impl Wallet {
         rng: &mut R,
     ) -> Option<Transaction> {
         let current = self.secret.decrypt(balance_ct, BALANCE_BITS)?;
-        let xfer = SolventTransfer::create(&self.secret, &receiver.key, amount, fee, current, balance_ct, nonce, rng)?;
+        let xfer = SolventTransfer::create(&self.secret, &receiver.key, token, amount, fee, current, balance_ct, nonce, rng)?;
         Some(Transaction::SolventTransfer { token, xfer })
     }
 

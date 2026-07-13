@@ -35,6 +35,16 @@ pub use parallel::apply_block_parallel;
 /// The native coin LAT is token id 0.
 pub const LAT_TOKEN: u32 = 0;
 
+/// Flat fee (in base LAT units) charged for the non-transfer transaction types
+/// that create or mutate persistent state but carry no fee field of their own —
+/// `CreateToken`, `DeployContract`, `CallContract` (audit finding C-1). Without
+/// a cost these are free chain-bloat / free-compute spam for any single
+/// PoW-registered account. The fee is debited from the signer's public LAT
+/// balance and paid to the block's miner, so it is not attacker-controllable
+/// (there is no field to lower). Equals `lat_chain::MIN_TRANSFER_FEE`; the two
+/// live in different crates but must stay in lock-step (asserted in tests).
+pub const FLAT_TX_FEE: u64 = 1_000;
+
 /// Blocks per anonymity **epoch** (consensus parameter). An `AnonTransfer`'s
 /// nullifier is scoped to one epoch: an account can make at most one anonymous
 /// spend per epoch (the Zether anti-replay tradeoff — see `ANON_INTEGRATION.md`
@@ -953,6 +963,12 @@ impl Ledger {
                     return Err(LedgerError::TickerTaken);
                 }
                 let mut acct = self.account(creator).ok_or(LedgerError::CreatorNotRegistered)?;
+                // Flat anti-spam fee from the creator's public LAT (C-1): token
+                // creation writes a permanent record, so it can't be free.
+                if acct.public(LAT_TOKEN) < FLAT_TX_FEE {
+                    return Err(LedgerError::InsufficientPublicBalance);
+                }
+                acct.set_public(LAT_TOKEN, acct.public(LAT_TOKEN) - FLAT_TX_FEE);
                 let id = self.next_token_id;
                 self.next_token_id += 1;
                 self.put_token(&TokenMeta {
@@ -985,7 +1001,7 @@ impl Ledger {
                 // only if it verified against this exact ciphertext.
                 let preverified =
                     matches!(pre, Some(ProofPass::AgainstBalance(b)) if *b == sender_bal);
-                if !preverified && !xfer.verify(&sender_bal) {
+                if !preverified && !xfer.verify(*token, &sender_bal) {
                     return Err(LedgerError::InvalidProof);
                 }
                 if !self.is_registered(&receiver_id) {
@@ -1038,15 +1054,20 @@ impl Ledger {
 
             Transaction::DeployContract { deployer, code, sig } => {
                 check_sig(deployer, tx, sig)?;
-                // Deployment requires a registered account — registration is
-                // PoW-gated, which is the anti-spam cost for (fee-less) deploys.
-                if !self.is_registered(deployer) {
-                    return Err(LedgerError::SenderNotRegistered);
+                // Deployment requires a registered account (registration is
+                // PoW-gated) AND a flat fee (C-1): storing bytecode is permanent
+                // state, so a one-time PoW must not buy unlimited free deploys.
+                let mut acct =
+                    self.account(deployer).ok_or(LedgerError::SenderNotRegistered)?;
+                if acct.public(LAT_TOKEN) < FLAT_TX_FEE {
+                    return Err(LedgerError::InsufficientPublicBalance);
                 }
                 let id = lat_vm::contract_id(deployer, code);
                 if self.has_contract(&id) {
                     return Err(LedgerError::ContractExists);
                 }
+                acct.set_public(LAT_TOKEN, acct.public(LAT_TOKEN) - FLAT_TX_FEE);
+                self.put_account(deployer, acct);
                 self.put_contract(&id, &Contract { code: code.clone(), storage: lat_vm::Storage::new() });
                 Ok(())
             }
@@ -1056,19 +1077,25 @@ impl Ledger {
                 // caller identity must be unforgeable — and nonce-bound, or a
                 // signed call could be replayed to re-run the contract.
                 check_sig(caller, tx, sig)?;
-                let acct_nonce = self
-                    .account(caller)
-                    .ok_or(LedgerError::SenderNotRegistered)?
-                    .nonce;
-                if *nonce != acct_nonce {
+                let caller_acct =
+                    self.account(caller).ok_or(LedgerError::SenderNotRegistered)?;
+                if *nonce != caller_acct.nonce {
                     return Err(LedgerError::BadNonce);
                 }
                 let mut c = self.contract(contract).ok_or(LedgerError::NoSuchContract)?;
+                // Flat fee (C-1): a call runs VM work and may write storage, so
+                // it must cost the caller — checked (after confirming there's a
+                // real contract to run) before we do any of that work.
+                if caller_acct.public(LAT_TOKEN) < FLAT_TX_FEE {
+                    return Err(LedgerError::InsufficientPublicBalance);
+                }
                 // Run on our decoded copy of storage; write back only on success.
                 lat_vm::execute(&c.code, &mut c.storage, caller, *input, lat_vm::DEFAULT_GAS)
                     .map_err(|_| LedgerError::ContractFailed)?;
                 self.put_contract(contract, &c);
+                // Charge the fee and bump the nonce (the call succeeded).
                 if let Some(mut a) = self.account(caller) {
+                    a.set_public(LAT_TOKEN, a.public(LAT_TOKEN) - FLAT_TX_FEE);
                     a.nonce += 1;
                     self.put_account(caller, a);
                 }
@@ -1179,7 +1206,7 @@ impl Ledger {
                 // rule as SolventTransfer: identical ciphertext or re-verify.
                 let preverified =
                     matches!(pre, Some(ProofPass::AgainstBalance(b)) if *b == sender_bal);
-                if !preverified && !xfer.verify(&sender_bal) {
+                if !preverified && !xfer.verify(*token, &sender_bal) {
                     return Err(LedgerError::InvalidProof);
                 }
                 // Reveal: the hidden amount must equal the declared public amount.
@@ -1374,6 +1401,15 @@ impl Ledger {
                 // so this can still bite after the validator heads for the
                 // exit. SLASH_REWARD_BPS of the slashed amount is paid to the
                 // whistleblower `beneficiary`; the rest is burned.
+                //
+                // Audit note (accepted): because the evidence carries no
+                // signature of its own, a miner can copy a pending SlashEvidence
+                // from the mempool and rewrite `beneficiary` to itself, stealing
+                // the whistleblower reward. This is inherent to self-authenticating
+                // evidence and harmless to consensus safety — the offender is
+                // slashed and tombstoned either way; only the reward recipient
+                // changes. A submitter who wants the reward guaranteed must mine
+                // the evidence itself. Not mitigated here by design.
                 if block_a == block_b {
                     return Err(LedgerError::BadEvidence);
                 }
@@ -2248,7 +2284,7 @@ mod tests {
 
         let bal = ledger.balance(&user, LAT_TOKEN).unwrap();
         let xfer = lat_crypto::SolventTransfer::create(
-            &user_sk, &lat_crypto::unshield_view_key(), 400, 10, 1_000, &bal, 0, &mut rng,
+            &user_sk, &lat_crypto::unshield_view_key(), LAT_TOKEN, 400, 10, 1_000, &bal, 0, &mut rng,
         )
         .unwrap();
         let tx = signed(
@@ -2280,7 +2316,7 @@ mod tests {
         // Honest confidential spend of 400, but the tx DECLARES 401 → mismatch.
         let bal = ledger.balance(&user, LAT_TOKEN).unwrap();
         let xfer = lat_crypto::SolventTransfer::create(
-            &user_sk, &lat_crypto::unshield_view_key(), 400, 10, 1_000, &bal, 0, &mut rng,
+            &user_sk, &lat_crypto::unshield_view_key(), LAT_TOKEN, 400, 10, 1_000, &bal, 0, &mut rng,
         )
         .unwrap();
         let bad_amt = signed(
@@ -2291,7 +2327,7 @@ mod tests {
 
         // Confidential receiver is NOT the view key → can't be soundly revealed.
         let wrong = lat_crypto::SolventTransfer::create(
-            &user_sk, &dest_sk.public_key(), 400, 10, 1_000, &bal, 0, &mut rng,
+            &user_sk, &dest_sk.public_key(), LAT_TOKEN, 400, 10, 1_000, &bal, 0, &mut rng,
         )
         .unwrap();
         let bad_recv = signed(
@@ -2324,7 +2360,7 @@ mod tests {
 
         let bal = ledger.balance(&user, LAT_TOKEN).unwrap();
         let xfer = lat_crypto::SolventTransfer::create(
-            &user_sk, &lat_crypto::unshield_view_key(), 400, 10, 1_000, &bal, 0, &mut rng,
+            &user_sk, &lat_crypto::unshield_view_key(), LAT_TOKEN, 400, 10, 1_000, &bal, 0, &mut rng,
         )
         .unwrap();
         let mut tx = signed(
@@ -2480,6 +2516,8 @@ mod tests {
         let mut ledger = Ledger::new();
         ledger.register(alice).unwrap();
         ledger.register(bob).unwrap();
+        // Public LAT to pay the flat token-creation fee (C-1).
+        ledger.credit_public(&alice, LAT_TOKEN, 1_000_000);
 
         // Alice creates $DOGE.
         ledger
@@ -2613,7 +2651,7 @@ mod tests {
         // Sender is NOT registered — rejected before the proof is even checked.
         let bal = sender_sk.public_key().encrypt(1_000, &mut rng);
         let xfer =
-            SolventTransfer::create(&sender_sk, &receiver_sk.public_key(), 1, 0, 1_000, &bal, 0, &mut rng).unwrap();
+            SolventTransfer::create(&sender_sk, &receiver_sk.public_key(), LAT_TOKEN, 1, 0, 1_000, &bal, 0, &mut rng).unwrap();
         assert_eq!(
             ledger.apply(&Transaction::SolventTransfer { token: LAT_TOKEN, xfer }),
             Err(LedgerError::SenderNotRegistered)
@@ -2636,7 +2674,7 @@ mod tests {
 
         // Honest solvent transfer at nonce 0.
         let bal = ledger.balance(&sender_id, LAT_TOKEN).unwrap();
-        let xfer = SolventTransfer::create(&sender_sk, &receiver_sk.public_key(), 400, 0, 1_000, &bal, 0, &mut rng).unwrap();
+        let xfer = SolventTransfer::create(&sender_sk, &receiver_sk.public_key(), LAT_TOKEN, 400, 0, 1_000, &bal, 0, &mut rng).unwrap();
         let tx = Transaction::SolventTransfer { token: LAT_TOKEN, xfer };
         let tx_bytes = tx.encode();
         ledger.apply(&tx).unwrap();
@@ -2681,7 +2719,7 @@ mod tests {
         // (0) matches, so it clears the nonce gate and is caught by the solvency
         // check against the real balance.
         let fake = sender_sk.public_key().encrypt(1_000_000, &mut rng);
-        let cheat = SolventTransfer::create(&sender_sk, &receiver_sk.public_key(), 900, 0, 1_000_000, &fake, 0, &mut rng).unwrap();
+        let cheat = SolventTransfer::create(&sender_sk, &receiver_sk.public_key(), LAT_TOKEN, 900, 0, 1_000_000, &fake, 0, &mut rng).unwrap();
         assert_eq!(
             ledger.apply(&Transaction::SolventTransfer { token: LAT_TOKEN, xfer: cheat }),
             Err(LedgerError::InvalidProof)
@@ -2706,6 +2744,8 @@ mod tests {
 
         let mut ledger = Ledger::new();
         ledger.register(deployer).unwrap();
+        // Public LAT to pay the flat deploy + call fees (C-1).
+        ledger.credit_public(&deployer, LAT_TOKEN, 1_000_000);
         ledger
             .apply(&signed(
                 Transaction::DeployContract { deployer, code, sig: [0u8; 64] },
@@ -2732,6 +2772,57 @@ mod tests {
                 &deployer_sk,
             )),
             Err(LedgerError::BadNonce)
+        );
+    }
+
+    #[test]
+    fn fee_less_types_require_public_lat_for_the_flat_fee() {
+        // C-1: CreateToken / DeployContract / CallContract are not free — a
+        // registered but unfunded account cannot spam them.
+        let sk = SecretKey::random(&mut OsRng);
+        let id = sk.public_key().to_bytes();
+        let mut ledger = Ledger::new();
+        ledger.register(id).unwrap();
+
+        // Unfunded: token creation and deploy are both refused for want of the fee.
+        assert_eq!(
+            ledger.apply(&signed(
+                Transaction::CreateToken { ticker: "AAA".into(), creator: id, supply: 1, sig: [0u8; 64] },
+                &sk,
+            )),
+            Err(LedgerError::InsufficientPublicBalance),
+        );
+        let code = vec![lat_vm::asm::STOP];
+        assert_eq!(
+            ledger.apply(&signed(
+                Transaction::DeployContract { deployer: id, code: code.clone(), sig: [0u8; 64] },
+                &sk,
+            )),
+            Err(LedgerError::InsufficientPublicBalance),
+        );
+
+        // Fund exactly two fees; now a deploy and one call both go through, and
+        // the balance lands at zero — each cost exactly FLAT_TX_FEE.
+        ledger.credit_public(&id, LAT_TOKEN, 2 * FLAT_TX_FEE);
+        ledger
+            .apply(&signed(Transaction::DeployContract { deployer: id, code: code.clone(), sig: [0u8; 64] }, &sk))
+            .unwrap();
+        let cid = lat_vm::contract_id(&id, &code);
+        ledger
+            .apply(&signed(
+                Transaction::CallContract { contract: cid, caller: id, input: 0, nonce: 0, sig: [0u8; 64] },
+                &sk,
+            ))
+            .unwrap();
+        assert_eq!(ledger.public_balance(&id, LAT_TOKEN), Some(0), "both fees were charged");
+
+        // A third fee-less-type tx is now unaffordable again.
+        assert_eq!(
+            ledger.apply(&signed(
+                Transaction::CallContract { contract: cid, caller: id, input: 0, nonce: 1, sig: [0u8; 64] },
+                &sk,
+            )),
+            Err(LedgerError::InsufficientPublicBalance),
         );
     }
 
@@ -2814,6 +2905,8 @@ mod tests {
         ledger.register(bob).unwrap();
         ledger.credit_genesis(&alice, 1_000_000).unwrap();
         ledger.credit_public(&alice, LAT_TOKEN, 5_000);
+        // Public LAT for bob to pay the flat deploy fee (C-1).
+        ledger.credit_public(&bob, LAT_TOKEN, 5_000);
         ledger
             .apply(&signed(
                 Transaction::CreateToken { ticker: "DOGE".into(), creator: alice, supply: 42, sig: [0u8; 64] },
@@ -2823,7 +2916,7 @@ mod tests {
         // A solvent transfer, so bob holds PENDING value and alice's nonce is 1.
         let bal = ledger.balance(&alice, LAT_TOKEN).unwrap();
         let xfer = lat_crypto::SolventTransfer::create(
-            &alice_sk, &bob_sk.public_key(), 400, 0, 1_000_000, &bal, 0, &mut rng,
+            &alice_sk, &bob_sk.public_key(), LAT_TOKEN, 400, 0, 1_000_000, &bal, 0, &mut rng,
         )
         .unwrap();
         ledger.apply(&Transaction::SolventTransfer { token: LAT_TOKEN, xfer }).unwrap();
@@ -2843,7 +2936,8 @@ mod tests {
         assert_eq!(decoded.encode(), bytes);
         // Spot-check live state through the decoded copy.
         assert_eq!(decoded.nonce(&alice), Some(1));
-        assert_eq!(decoded.public_balance(&alice, LAT_TOKEN), Some(5_000));
+        // 5_000 funded minus the flat CreateToken fee (C-1).
+        assert_eq!(decoded.public_balance(&alice, LAT_TOKEN), Some(5_000 - FLAT_TX_FEE));
         assert_eq!(bob_sk.decrypt(&decoded.pending(&bob, LAT_TOKEN).unwrap(), 24), Some(400));
         assert_eq!(decoded.token("DOGE").unwrap().supply, 42);
     }

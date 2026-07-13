@@ -101,9 +101,12 @@ pub struct SolventTransfer {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn challenge(nonce: u64, fee: u64, points: &[&RistrettoPoint]) -> Scalar {
+fn challenge(token: u32, nonce: u64, fee: u64, points: &[&RistrettoPoint]) -> Scalar {
     let mut h = Sha512::new();
-    h.update(b"Latebra.SolventTransfer.v1");
+    h.update(b"Latebra.SolventTransfer.v2");
+    // Audit finding S-1: bind the token id the transfer moves, so a valid proof
+    // cannot be re-wrapped under a different token envelope.
+    h.update(token.to_le_bytes());
     h.update(nonce.to_le_bytes());
     h.update(fee.to_le_bytes());
     for p in points {
@@ -125,6 +128,7 @@ impl SolventTransfer {
     pub fn create<R: RngCore + CryptoRng>(
         sender_sk: &SecretKey,
         receiver_pk: &PublicKey,
+        token: u32,
         amount: u64,
         fee: u64,
         current_balance: u64,
@@ -184,7 +188,7 @@ impl SolventTransfer {
         let a6 = G * k_b + d_rem * k_x;
         let a7 = G * k_b + h * k_sb;
 
-        let e = challenge(nonce, fee, &[
+        let e = challenge(token, nonce, fee, &[
             &sender.0, &receiver_pk.0, &c_sender, &c_receiver, &d, &c_rem, &d_rem, &big_vt,
             &big_vb, &a1, &a2, &a3, &a4, &a5, &a6, &a7,
         ]);
@@ -308,7 +312,7 @@ impl SolventTransfer {
     /// `(C_s, D_s)`. Returns `true` iff value is conserved, the sender owns the
     /// account, the amount is non-negative, AND the sender's remaining balance is
     /// non-negative (solvency).
-    pub fn verify(&self, current_balance_ct: &Ciphertext) -> bool {
+    pub fn verify(&self, token: u32, current_balance_ct: &Ciphertext) -> bool {
         let c_rem = current_balance_ct.c - self.c_sender - G * Scalar::from(self.fee);
         let d_rem = current_balance_ct.d - self.d;
 
@@ -331,7 +335,7 @@ impl SolventTransfer {
             _ => return false,
         };
 
-        let e = challenge(self.nonce, self.fee, &[
+        let e = challenge(token, self.nonce, self.fee, &[
             &self.sender.0, &self.receiver.0, &self.c_sender, &self.c_receiver, &self.d, &c_rem,
             &d_rem, &big_vt, &big_vb, &self.a1, &self.a2, &self.a3, &self.a4, &self.a5, &self.a6,
             &self.a7,
@@ -367,9 +371,9 @@ mod tests {
         let receiver = SecretKey::random(&mut rng);
         let bal = balance_ct(&sender, 1_000, &mut rng);
 
-        let xfer = SolventTransfer::create(&sender, &receiver.public_key(), 300, 0, 1_000, &bal, 0, &mut rng)
+        let xfer = SolventTransfer::create(&sender, &receiver.public_key(), 0, 300, 0, 1_000, &bal, 0, &mut rng)
             .expect("solvent");
-        assert!(xfer.verify(&bal), "honest solvent transfer must verify");
+        assert!(xfer.verify(0, &bal), "honest solvent transfer must verify");
 
         // Receiver can recover the hidden amount.
         let got = receiver.decrypt(&xfer.receiver_ciphertext(), 20);
@@ -384,13 +388,13 @@ mod tests {
         let bal = balance_ct(&sender, 1_000, &mut rng);
 
         // amount 700 + fee 250 = 950 <= 1000: OK, remaining 50 proven >= 0.
-        let xfer = SolventTransfer::create(&sender, &receiver.public_key(), 700, 250, 1_000, &bal, 0, &mut rng)
+        let xfer = SolventTransfer::create(&sender, &receiver.public_key(), 0, 700, 250, 1_000, &bal, 0, &mut rng)
             .expect("affordable with fee");
         assert_eq!(xfer.fee, 250);
-        assert!(xfer.verify(&bal));
+        assert!(xfer.verify(0, &bal));
 
         // amount 800 + fee 300 = 1100 > 1000: unprovable.
-        assert!(SolventTransfer::create(&sender, &receiver.public_key(), 800, 300, 1_000, &bal, 0, &mut rng).is_none());
+        assert!(SolventTransfer::create(&sender, &receiver.public_key(), 0, 800, 300, 1_000, &bal, 0, &mut rng).is_none());
     }
 
     #[test]
@@ -399,10 +403,10 @@ mod tests {
         let sender = SecretKey::random(&mut rng);
         let receiver = SecretKey::random(&mut rng);
         let bal = balance_ct(&sender, 1_000, &mut rng);
-        let mut xfer = SolventTransfer::create(&sender, &receiver.public_key(), 300, 10, 1_000, &bal, 0, &mut rng).unwrap();
-        assert!(xfer.verify(&bal));
+        let mut xfer = SolventTransfer::create(&sender, &receiver.public_key(), 0, 300, 10, 1_000, &bal, 0, &mut rng).unwrap();
+        assert!(xfer.verify(0, &bal));
         xfer.fee = 0; // try to dodge the fee
-        assert!(!xfer.verify(&bal), "the fee is bound into the proof");
+        assert!(!xfer.verify(0, &bal), "the fee is bound into the proof");
     }
 
     #[test]
@@ -413,7 +417,7 @@ mod tests {
         let bal = balance_ct(&sender, 100, &mut rng);
 
         // Trying to send more than you hold yields no proof at all.
-        assert!(SolventTransfer::create(&sender, &receiver.public_key(), 500, 0, 100, &bal, 0, &mut rng).is_none());
+        assert!(SolventTransfer::create(&sender, &receiver.public_key(), 0, 500, 0, 100, &bal, 0, &mut rng).is_none());
     }
 
     #[test]
@@ -424,13 +428,13 @@ mod tests {
 
         // Build an honest-looking proof claiming a balance of 1000...
         let claimed = balance_ct(&sender, 1_000, &mut rng);
-        let xfer = SolventTransfer::create(&sender, &receiver.public_key(), 900, 0, 1_000, &claimed, 0, &mut rng)
+        let xfer = SolventTransfer::create(&sender, &receiver.public_key(), 0, 900, 0, 1_000, &claimed, 0, &mut rng)
             .expect("builds");
 
         // ...but the sender's ACTUAL on-chain balance is only 100. Verification
         // against the real balance must fail (the solvency relation won't hold).
         let actual = balance_ct(&sender, 100, &mut rng);
-        assert!(!xfer.verify(&actual), "proof must bind to the real balance");
+        assert!(!xfer.verify(0, &actual), "proof must bind to the real balance");
     }
 
     #[test]
@@ -440,12 +444,12 @@ mod tests {
         let receiver = SecretKey::random(&mut rng);
         let bal = balance_ct(&sender, 1_000, &mut rng);
 
-        let xfer = SolventTransfer::create(&sender, &receiver.public_key(), 300, 0, 1_000, &bal, 0, &mut rng)
+        let xfer = SolventTransfer::create(&sender, &receiver.public_key(), 0, 300, 0, 1_000, &bal, 0, &mut rng)
             .unwrap();
         let bytes = xfer.to_bytes();
         let decoded = SolventTransfer::from_bytes(&bytes).expect("decodes");
         assert_eq!(decoded.to_bytes(), bytes);
-        assert!(decoded.verify(&bal), "decoded solvent transfer still verifies");
+        assert!(decoded.verify(0, &bal), "decoded solvent transfer still verifies");
     }
 
     #[test]
@@ -455,10 +459,25 @@ mod tests {
         let receiver = SecretKey::random(&mut rng);
         let bal = balance_ct(&sender, 1_000, &mut rng);
 
-        let mut xfer = SolventTransfer::create(&sender, &receiver.public_key(), 300, 0, 1_000, &bal, 0, &mut rng)
+        let mut xfer = SolventTransfer::create(&sender, &receiver.public_key(), 0, 300, 0, 1_000, &bal, 0, &mut rng)
             .unwrap();
         xfer.z_b += Scalar::from(1u64);
-        assert!(!xfer.verify(&bal));
+        assert!(!xfer.verify(0, &bal));
+    }
+
+    #[test]
+    fn rewrapping_under_a_different_token_fails() {
+        // S-1: the token id is bound into the Fiat–Shamir challenge, so a proof
+        // built for one token cannot be verified under another.
+        let mut rng = OsRng;
+        let sender = SecretKey::random(&mut rng);
+        let receiver = SecretKey::random(&mut rng);
+        let bal = balance_ct(&sender, 1_000, &mut rng);
+
+        let xfer = SolventTransfer::create(&sender, &receiver.public_key(), 0, 300, 0, 1_000, &bal, 0, &mut rng)
+            .unwrap();
+        assert!(xfer.verify(0, &bal), "the token it was built for verifies");
+        assert!(!xfer.verify(1, &bal), "a different token envelope must not verify");
     }
 
     #[test]
@@ -470,10 +489,10 @@ mod tests {
         let receiver = SecretKey::random(&mut rng);
         let bal = balance_ct(&sender, 1_000, &mut rng);
 
-        let mut xfer = SolventTransfer::create(&sender, &receiver.public_key(), 300, 0, 1_000, &bal, 7, &mut rng)
+        let mut xfer = SolventTransfer::create(&sender, &receiver.public_key(), 0, 300, 0, 1_000, &bal, 7, &mut rng)
             .unwrap();
-        assert!(xfer.verify(&bal));
+        assert!(xfer.verify(0, &bal));
         xfer.nonce = 8;
-        assert!(!xfer.verify(&bal), "tampering the nonce must invalidate the proof");
+        assert!(!xfer.verify(0, &bal), "tampering the nonce must invalidate the proof");
     }
 }

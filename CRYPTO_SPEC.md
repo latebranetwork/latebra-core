@@ -73,7 +73,9 @@ every `G`-multiple lives in `⟨G⟩`). `H ⟂ G` prevents shifting the committe
 values.
 
 The 7 relations are one merged Σ-protocol with a single Fiat–Shamir challenge
-`e = H_s(statement ‖ announcements)`; responses `z_• = k_• + e·w_•`.
+`e = H_s(token ‖ nonce ‖ fee ‖ statement ‖ announcements)`; responses
+`z_• = k_• + e·w_•`. (The `token` id is bound as of v2 / internal-audit finding
+S-1, so a proof cannot be re-wrapped under a different token envelope.)
 
 **Unshield** (private → public) is the same proof with `Y_r` fixed to a
 published *view key* whose secret is public, so consensus recomputes the

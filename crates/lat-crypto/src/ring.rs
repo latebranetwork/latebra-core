@@ -20,6 +20,15 @@
 //! can't be double-spent; and (3) a log-size proof for efficiency. Those build on
 //! top of this primitive and must be audited before real value. Proof size here is
 //! O(N).
+//!
+//! ## Status (audit note)
+//! These two types (`RingSignature`, `LinkableRingSignature`) are **foundational
+//! primitives that the live consensus path does not use**. The shipped anonymous
+//! transfer (`anon_transfer::AnonTransfer`) is a self-contained fused
+//! OR-composition with an epoch nullifier — it does not call into this module.
+//! This code is retained as a reference/building block and is exercised only by
+//! its own unit tests. It is deliberately kept out of the trusted surface; do not
+//! wire it into a transaction type without a fresh review.
 
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT as G;
 use curve25519_dalek::ristretto::RistrettoPoint;

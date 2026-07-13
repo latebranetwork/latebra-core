@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -44,6 +45,17 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// 4 MiB comfortably fits the largest legitimate message (a full block).
 pub const MAX_MSG_BYTES: usize = 4 * 1024 * 1024;
 
+/// Max simultaneous **inbound** connections a served node handles (audit
+/// finding P-1). Beyond this, a new connection is closed immediately, so a
+/// flood of sockets can't spawn unbounded threads or exhaust file descriptors.
+pub const MAX_INBOUND_CONNS: usize = 128;
+
+/// Idle/stall timeout on a served connection's socket reads and writes (P-1).
+/// A peer that connects — or sends a length prefix — then goes silent is
+/// dropped instead of pinning a thread and its read buffer forever (slowloris).
+/// Generous enough for any inter-message gap during active sync.
+pub const CONN_IO_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Lock the shared node, recovering from a poisoned lock. A worker thread that
 /// panicked while holding the lock must not take the whole node down with it —
 /// state transitions are applied atomically (validated on a clone, then
@@ -59,6 +71,9 @@ pub const MAX_PEERS: usize = 64;
 pub const MAX_PEER_ADDR_LEN: usize = 128;
 /// Most locator ids accepted in a `FindCommon` request.
 pub const MAX_LOCATOR_IDS: usize = 64;
+/// Most unbonding entries accepted in a `StakeReply` — a sane bound so a peer
+/// can't make us loop over a huge (frame-bounded, but still nonsense) count.
+pub const MAX_UNBONDING_ENTRIES: usize = 1024;
 
 /// A node's mutable state: its chain, mempool, the address its mined blocks pay
 /// coinbase rewards to (`[0; 32]` = don't claim rewards), and the peer
@@ -795,6 +810,11 @@ impl Msg {
             31 => {
                 let staked = u64::from_le_bytes(rest.get(0..8)?.try_into().ok()?);
                 let count = u32::from_le_bytes(rest.get(8..12)?.try_into().ok()?) as usize;
+                // Cap the record count before looping, like the other arms —
+                // the frame cap already bounds it, but reject nonsense early.
+                if count > MAX_UNBONDING_ENTRIES {
+                    return None;
+                }
                 let mut unbonding = Vec::new();
                 let mut off = 12;
                 for _ in 0..count {
@@ -877,16 +897,32 @@ fn read_msg(s: &mut impl Read) -> io::Result<Msg> {
 /// `127.0.0.1:0`) so you can read the assigned address before serving.
 pub fn serve(listener: TcpListener, node: SharedNode) -> JoinHandle<()> {
     thread::spawn(move || {
+        // Bound concurrent inbound connections (P-1): a flood of sockets must
+        // not spawn unbounded threads. The counter is decremented when each
+        // handler returns.
+        let conns = Arc::new(AtomicUsize::new(0));
         for stream in listener.incoming().flatten() {
+            if conns.fetch_add(1, Ordering::AcqRel) >= MAX_INBOUND_CONNS {
+                conns.fetch_sub(1, Ordering::AcqRel);
+                continue; // at capacity — drop the stream (closes it)
+            }
             let node = Arc::clone(&node);
+            let conns = Arc::clone(&conns);
             thread::spawn(move || {
                 let _ = handle_conn(stream, node);
+                conns.fetch_sub(1, Ordering::AcqRel);
             });
         }
     })
 }
 
 fn handle_conn(mut stream: TcpStream, node: SharedNode) -> io::Result<()> {
+    // Slowloris / idle-open guard (P-1): a peer that stalls mid-message or holds
+    // the socket open without sending is dropped rather than pinning this thread
+    // and its buffer indefinitely. Best-effort — a platform that rejects the
+    // sockopt just keeps the prior blocking behaviour.
+    let _ = stream.set_read_timeout(Some(CONN_IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(CONN_IO_TIMEOUT));
     // T19: state-sync manifest captured for THIS connection — anchor plus the
     // record set pre-split into reply-sized chunks. Kept out of the node lock
     // so serving chunks never blocks mining/RPC, and immune to the tip moving
@@ -1885,9 +1921,11 @@ mod tests {
         code.push(asm::SSTORE);
         code.push(asm::STOP);
 
-        // A node whose chain premines (and thus registers) the deployer.
+        // A node whose chain premines (and thus registers) the deployer with
+        // PUBLIC LAT to cover the flat deploy + call fees (C-1 — gas is paid in
+        // transparent LAT).
         let w = Wallet::generate(Network::Testnet, &mut OsRng);
-        let a = shared(Blockchain::genesis(&[(w.id(), 1_000)], DEFAULT_DIFFICULTY));
+        let a = shared(Blockchain::genesis_with_public(&[], &[(w.id(), 1_000_000)], DEFAULT_DIFFICULTY));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         serve(listener, Arc::clone(&a));

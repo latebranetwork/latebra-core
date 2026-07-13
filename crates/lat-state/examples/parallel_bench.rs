@@ -106,6 +106,7 @@ fn main() {
             xfer: lat_crypto::SolventTransfer::create(
                 &csks[i],
                 &csks[n_conf + i].public_key(),
+                LAT_TOKEN,
                 1_000,
                 10,
                 1_000_000,

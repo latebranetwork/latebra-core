@@ -21,9 +21,29 @@
 
 use std::collections::HashMap;
 
-/// Default execution budget (VM steps) for one contract call.
+/// Default execution budget (gas) for one contract call.
 pub const DEFAULT_GAS: u64 = 100_000;
 const MAX_STACK: usize = 1024;
+
+/// Gas charged for `SSTORE` (audit finding V-1). A store creates *permanent*
+/// state that every node keeps forever, so it must cost far more than an
+/// arithmetic step — otherwise one call can write tens of thousands of entries
+/// and bloat the chain. At this price a single [`DEFAULT_GAS`] call can make at
+/// most ~500 stores. (EVM prices SSTORE similarly high for the same reason.)
+const SSTORE_GAS: u64 = 200;
+/// Gas charged for `SLOAD` — a persistent read, dearer than arithmetic but far
+/// cheaper than a write.
+const SLOAD_GAS: u64 = 50;
+
+/// Per-opcode gas cost. Everything is one step except the storage opcodes,
+/// which are priced for their permanent footprint (V-1).
+fn gas_cost(op: u8) -> u64 {
+    match op {
+        0x12 => SSTORE_GAS,
+        0x11 => SLOAD_GAS,
+        _ => 1,
+    }
+}
 
 /// Persistent contract storage.
 pub type Storage = HashMap<u64, u64>;
@@ -74,12 +94,15 @@ pub fn execute(
     let mut gas = gas_limit;
 
     while pc < code.len() {
-        if gas == 0 {
+        let op = code[pc];
+        // Charge this opcode's gas up front, so an expensive store can't slip
+        // through on the last unit of budget (V-1).
+        let cost = gas_cost(op);
+        if gas < cost {
             return Err(VmError::OutOfGas);
         }
-        gas -= 1;
+        gas -= cost;
 
-        let op = code[pc];
         pc += 1;
         match op {
             0x00 => break, // STOP
@@ -426,6 +449,33 @@ mod tests {
     #[test]
     fn bad_opcode_errors() {
         assert_eq!(run(&[0xFF]).0, Err(VmError::BadOpcode(0xFF)));
+    }
+
+    #[test]
+    fn sstore_is_gas_metered_to_bound_state_growth() {
+        // V-1: a store costs SSTORE_GAS, so a fixed budget permits only a
+        // bounded number of writes — one SSTORE must not fit in a budget
+        // smaller than its price.
+        // Program: PUSH key(0) PUSH val(1) SSTORE STOP.
+        let mut code = asm::push(0);
+        code.extend(asm::push(1));
+        code.push(asm::SSTORE);
+        code.push(asm::STOP);
+
+        // Costs: push(1) + push(1) + SSTORE(SSTORE_GAS) + STOP(1). One unit shy
+        // of reaching the store leaves the budget exhausted right at it.
+        let mut s = Storage::new();
+        assert_eq!(
+            execute(&code, &mut s, &NOBODY, 0, 2 + SSTORE_GAS - 1),
+            Err(VmError::OutOfGas),
+            "a store must not execute below its gas price"
+        );
+        assert!(s.get(&0).is_none(), "the failed store leaves no state");
+
+        // With exactly the full program cost (2 pushes + store + STOP) it succeeds.
+        let mut s = Storage::new();
+        assert_eq!(execute(&code, &mut s, &NOBODY, 0, 3 + SSTORE_GAS), Ok(()));
+        assert_eq!(s.get(&0), Some(&1));
     }
 
     #[test]

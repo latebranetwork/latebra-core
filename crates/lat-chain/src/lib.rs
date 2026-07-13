@@ -80,12 +80,18 @@ pub fn tx_fee(tx: &Transaction) -> u64 {
         Transaction::PublicTransfer { fee, .. }
         | Transaction::Shield { fee, .. }
         | Transaction::ShieldStealth { fee, .. } => *fee,
+        // Flat-fee types (C-1): no fee field, a fixed cost charged in apply.
+        Transaction::CreateToken { .. }
+        | Transaction::DeployContract { .. }
+        | Transaction::CallContract { .. } => lat_state::FLAT_TX_FEE,
         _ => 0,
     }
 }
 
-/// Consensus cap on deployed contract bytecode. Deploys are fee-less (gated by
-/// the deployer's PoW registration), so without a cap they'd be free chain bloat.
+/// Consensus cap on deployed contract bytecode. A deploy pays a flat fee
+/// (`lat_state::FLAT_TX_FEE`, C-1) and is gated by the deployer's PoW
+/// registration, but a per-tx cap still bounds how much a single paid deploy
+/// can bloat the chain.
 pub const MAX_CONTRACT_CODE_BYTES: usize = 24 * 1024;
 
 /// Blocks between ledger snapshots (L8). Every time the active chain reaches a
@@ -1473,6 +1479,14 @@ fn apply_txs_and_reward(
             Transaction::ShieldStealth { token, fee, .. } if *fee > 0 => {
                 public_fees.push((*token, *fee));
             }
+            // Flat-fee, fee-less-field types (C-1): the ledger debited
+            // `FLAT_TX_FEE` in LAT from the signer's public balance, so the
+            // miner is credited the same into its public balance.
+            Transaction::CreateToken { .. }
+            | Transaction::DeployContract { .. }
+            | Transaction::CallContract { .. } => {
+                public_fees.push((lat_state::LAT_TOKEN, lat_state::FLAT_TX_FEE));
+            }
             _ => {}
         }
     }
@@ -1520,7 +1534,7 @@ mod tests {
 
         // Block 2: genesis sends 250,000 (solvency-proven). It lands in pending.
         let bal = chain.balance(&genesis_id, lat).unwrap();
-        let xfer = SolventTransfer::create(&genesis_sk, &receiver_sk.public_key(), 250_000, MIN_TRANSFER_FEE, 1_000_000, &bal, 0, &mut rng).unwrap();
+        let xfer = SolventTransfer::create(&genesis_sk, &receiver_sk.public_key(), lat_state::LAT_TOKEN, 250_000, MIN_TRANSFER_FEE, 1_000_000, &bal, 0, &mut rng).unwrap();
         let block2 = chain.mine(vec![Transaction::SolventTransfer { token: lat, xfer }]);
         chain.apply_block(&block2).unwrap();
         assert_eq!(chain.height(), 2);
@@ -1620,7 +1634,7 @@ mod tests {
 
         let bal = chain.balance(&genesis_id, lat_state::LAT_TOKEN).unwrap();
         let xfer = SolventTransfer::create(
-            &genesis_sk, &receiver_pk, 100, MIN_TRANSFER_FEE - 1, 1_000_000, &bal, 0, &mut rng,
+            &genesis_sk, &receiver_pk, lat_state::LAT_TOKEN, 100, MIN_TRANSFER_FEE - 1, 1_000_000, &bal, 0, &mut rng,
         )
         .unwrap();
         let block = chain.mine(vec![Transaction::SolventTransfer { token: lat_state::LAT_TOKEN, xfer }]);
@@ -1645,7 +1659,7 @@ mod tests {
         let fee = MIN_TRANSFER_FEE * 3; // overpaying is allowed — a fee market
         let bal = chain.balance(&genesis_id, lat).unwrap();
         let xfer =
-            SolventTransfer::create(&genesis_sk, &receiver_pk, 100, fee, 1_000_000, &bal, 0, &mut rng).unwrap();
+            SolventTransfer::create(&genesis_sk, &receiver_pk, lat_state::LAT_TOKEN, 100, fee, 1_000_000, &bal, 0, &mut rng).unwrap();
         let block2 = chain.mine_with_reward(miner_id, vec![Transaction::SolventTransfer { token: lat, xfer }]);
         chain.apply_block(&block2).unwrap();
 
@@ -1665,7 +1679,7 @@ mod tests {
 
         let chain = Blockchain::genesis(&[(genesis_id, 1_000_000)], DEFAULT_DIFFICULTY);
         let bal = chain.balance(&genesis_id, lat_state::LAT_TOKEN).unwrap();
-        let xfer = SolventTransfer::create(&genesis_sk, &receiver_pk, 7, 0, 1_000_000, &bal, 0, &mut rng).unwrap();
+        let xfer = SolventTransfer::create(&genesis_sk, &receiver_pk, lat_state::LAT_TOKEN, 7, 0, 1_000_000, &bal, 0, &mut rng).unwrap();
         let block = chain.mine(vec![
             mine_registration([5u8; 32]),
             Transaction::SolventTransfer { token: lat_state::LAT_TOKEN, xfer },
@@ -2110,7 +2124,7 @@ mod tests {
             chain.apply_block(&b1).unwrap();
             let bal = chain.balance(&gid, lat).unwrap();
             let xfer = SolventTransfer::create(
-                &gsk, &receiver_sk.public_key(), 250_000, MIN_TRANSFER_FEE, 1_000_000, &bal, 0, &mut rng,
+                &gsk, &receiver_sk.public_key(), lat_state::LAT_TOKEN, 250_000, MIN_TRANSFER_FEE, 1_000_000, &bal, 0, &mut rng,
             )
             .unwrap();
             let b2 = chain.mine(vec![Transaction::SolventTransfer { token: lat, xfer }]);
@@ -2439,6 +2453,45 @@ mod tests {
     }
 
     #[test]
+    fn flat_tx_fee_matches_the_transfer_fee_floor() {
+        // C-1: the flat fee lives in lat-state; keep it in lock-step with the
+        // chain's transfer fee floor so the fee market is uniform.
+        assert_eq!(lat_state::FLAT_TX_FEE, MIN_TRANSFER_FEE);
+    }
+
+    #[test]
+    fn contract_deploy_fee_is_paid_to_the_miner() {
+        // C-1 end-to-end: a deploy debits FLAT_TX_FEE from the deployer's public
+        // LAT and credits it to the block's miner (its public balance).
+        let lat = lat_state::LAT_TOKEN;
+        let deployer_sk = SecretKey::random(&mut OsRng);
+        let deployer = deployer_sk.public_key().to_bytes();
+        let miner = [7u8; 32];
+
+        let mut chain =
+            Blockchain::genesis_with_public(&[], &[(deployer, 1_000_000)], DEFAULT_DIFFICULTY);
+        let code = vec![0x00u8]; // a single STOP opcode
+        let mut tx = Transaction::DeployContract { deployer, code, sig: [0u8; 64] };
+        let sig = deployer_sk.sign(&tx.signing_bytes()).to_bytes();
+        if let Transaction::DeployContract { sig: s, .. } = &mut tx {
+            *s = sig;
+        }
+        let b = chain.mine_with_reward(miner, vec![tx]);
+        chain.apply_block(&b).unwrap();
+
+        assert_eq!(
+            chain.public_balance(&deployer, lat),
+            Some(1_000_000 - lat_state::FLAT_TX_FEE),
+            "deployer paid the flat fee",
+        );
+        assert_eq!(
+            chain.public_balance(&miner, lat),
+            Some(lat_state::FLAT_TX_FEE),
+            "miner earned the flat fee in its public balance",
+        );
+    }
+
+    #[test]
     fn public_transfer_under_fee_floor_rejected_by_consensus() {
         let sk = SecretKey::random(&mut OsRng);
         let id = sk.public_key().to_bytes();
@@ -2505,7 +2558,7 @@ mod tests {
         let bal = chain.balance(&user, lat).unwrap();
         let cur = user_sk.decrypt(&bal, 24).unwrap();
         let xfer = SolventTransfer::create(
-            &user_sk, &lat_crypto::unshield_view_key(), 100_000, fee, cur, &bal, n2, &mut rng,
+            &user_sk, &lat_crypto::unshield_view_key(), lat_state::LAT_TOKEN, 100_000, fee, cur, &bal, n2, &mut rng,
         )
         .unwrap();
         let unshield = sign_any(
@@ -2526,7 +2579,7 @@ mod tests {
         let sk = SecretKey::random(&mut rng);
         let bal = sk.public_key().encrypt(1_000_000, &mut rng);
         let xfer = SolventTransfer::create(
-            &sk, &lat_crypto::unshield_view_key(), 1, MIN_TRANSFER_FEE - 1, 1_000_000, &bal, 0, &mut rng,
+            &sk, &lat_crypto::unshield_view_key(), lat_state::LAT_TOKEN, 1, MIN_TRANSFER_FEE - 1, 1_000_000, &bal, 0, &mut rng,
         )
         .unwrap();
         let tx = Transaction::Unshield { token: 0, to: [1u8; 32], amount: 1, xfer, sig: [0u8; 64] };
@@ -2562,7 +2615,7 @@ mod tests {
         // ciphertext balances, not just registrations.
         let bal = chain.balance(&genesis_id, lat_state::LAT_TOKEN).unwrap();
         let xfer = SolventTransfer::create(
-            &genesis_sk, &receiver_sk.public_key(), 250_000, MIN_TRANSFER_FEE,
+            &genesis_sk, &receiver_sk.public_key(), lat_state::LAT_TOKEN, 250_000, MIN_TRANSFER_FEE,
             1_000_000, &bal, 0, &mut rng,
         )
         .unwrap();

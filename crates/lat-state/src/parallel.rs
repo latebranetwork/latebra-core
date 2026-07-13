@@ -180,8 +180,8 @@ fn preverify_confidential(
                             }
                             Job::Solvent(tx, bal) => {
                                 let ok = match tx {
-                                    Transaction::SolventTransfer { xfer, .. } => xfer.verify(bal),
-                                    Transaction::Unshield { xfer, .. } => xfer.verify(bal),
+                                    Transaction::SolventTransfer { token, xfer } => xfer.verify(*token, bal),
+                                    Transaction::Unshield { token, xfer, .. } => xfer.verify(*token, bal),
                                     _ => false,
                                 };
                                 if ok {
@@ -495,7 +495,7 @@ mod tests {
         let s0 = Transaction::SolventTransfer {
             token: LAT_TOKEN,
             xfer: lat_crypto::SolventTransfer::create(
-                &csks[0], &csks[1].public_key(), 5_000, 100, 100_000, &bal0, 0, &mut rng,
+                &csks[0], &csks[1].public_key(), LAT_TOKEN, 5_000, 100, 100_000, &bal0, 0, &mut rng,
             )
             .unwrap(),
         };
@@ -503,7 +503,7 @@ mod tests {
         let s2 = Transaction::SolventTransfer {
             token: LAT_TOKEN,
             xfer: lat_crypto::SolventTransfer::create(
-                &csks[2], &csks[3].public_key(), 700, 100, 100_000, &bal2, 0, &mut rng,
+                &csks[2], &csks[3].public_key(), LAT_TOKEN, 700, 100, 100_000, &bal2, 0, &mut rng,
             )
             .unwrap(),
         };
@@ -523,7 +523,7 @@ mod tests {
         let s6 = Transaction::SolventTransfer {
             token: LAT_TOKEN,
             xfer: lat_crypto::SolventTransfer::create(
-                &csks[6], &csks[7].public_key(), 300, 100, 100_000, &bal6, 0, &mut rng,
+                &csks[6], &csks[7].public_key(), LAT_TOKEN, 300, 100, 100_000, &bal6, 0, &mut rng,
             )
             .unwrap(),
         };
@@ -558,7 +558,7 @@ mod tests {
         let bad = Transaction::SolventTransfer {
             token: LAT_TOKEN,
             xfer: lat_crypto::SolventTransfer::create(
-                &csks[0], &csks[1].public_key(), 60_000, 0, 999_999, &fake, 0, &mut rng,
+                &csks[0], &csks[1].public_key(), LAT_TOKEN, 60_000, 0, 999_999, &fake, 0, &mut rng,
             )
             .unwrap(),
         };
@@ -566,7 +566,7 @@ mod tests {
         let good = Transaction::SolventTransfer {
             token: LAT_TOKEN,
             xfer: lat_crypto::SolventTransfer::create(
-                &csks[2], &csks[3].public_key(), 100, 0, 50_000, &bal2, 0, &mut rng,
+                &csks[2], &csks[3].public_key(), LAT_TOKEN, 100, 0, 50_000, &bal2, 0, &mut rng,
             )
             .unwrap(),
         };

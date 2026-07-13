@@ -184,7 +184,7 @@ mod tests {
         let receiver = SecretKey::random(&mut rng);
         let bal = sender.public_key().encrypt(1_000_000, &mut rng);
         let xfer =
-            SolventTransfer::create(&sender, &receiver.public_key(), 1, fee, 1_000_000, &bal, 0, &mut rng)
+            SolventTransfer::create(&sender, &receiver.public_key(), 0, 1, fee, 1_000_000, &bal, 0, &mut rng)
                 .expect("affordable");
         Transaction::SolventTransfer { token: 0, xfer }
     }
