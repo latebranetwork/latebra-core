@@ -21,9 +21,9 @@ use lat_wallet::Wallet;
 use rand::rngs::OsRng;
 
 /// The Latebra logo mark as an inline SVG data-URI — used for the browser
-/// favicon and the header brand mark. Orange rounded "LD" monogram whose right
+/// favicon and the header brand mark. Violet rounded "LD" monogram whose right
 /// edge dissolves into pixels (privacy: data scattering away).
-const LOGO: &str = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><defs><mask id='latm'><rect width='512' height='512' fill='%23000'/><rect x='108' y='104' width='230' height='304' rx='52' fill='%23fff'/><path fill='%23000' d='M192 180H362V292a24 24 0 0 1-24 24H216a24 24 0 0 1-24-24Z'/><rect x='192' y='104' width='34' height='80' fill='%23000'/></mask></defs><g mask='url(%23latm)'><rect width='512' height='512' fill='%23F5A03C'/></g><g fill='%23F5A03C'><rect x='410' y='150' width='30' height='30' rx='5'/><rect x='360' y='182' width='24' height='24' rx='4'/><rect x='404' y='216' width='22' height='22' rx='4'/><rect x='356' y='238' width='18' height='18' rx='3'/><rect x='392' y='262' width='30' height='30' rx='5'/><rect x='352' y='298' width='16' height='16' rx='3'/><rect x='404' y='300' width='14' height='14' rx='3'/><rect x='368' y='330' width='18' height='18' rx='3'/></g></svg>";
+const LOGO: &str = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><defs><mask id='latm'><rect width='512' height='512' fill='%23000'/><rect x='108' y='104' width='230' height='304' rx='52' fill='%23fff'/><path fill='%23000' d='M192 180H362V292a24 24 0 0 1-24 24H216a24 24 0 0 1-24-24Z'/><rect x='192' y='104' width='34' height='80' fill='%23000'/></mask></defs><g mask='url(%23latm)'><rect width='512' height='512' fill='%238b5cf6'/></g><g fill='%238b5cf6'><rect x='410' y='150' width='30' height='30' rx='5'/><rect x='360' y='182' width='24' height='24' rx='4'/><rect x='404' y='216' width='22' height='22' rx='4'/><rect x='356' y='238' width='18' height='18' rx='3'/><rect x='392' y='262' width='30' height='30' rx='5'/><rect x='352' y='298' width='16' height='16' rx='3'/><rect x='404' y='300' width='14' height='14' rx='3'/><rect x='368' y='330' width='18' height='18' rx='3'/></g></svg>";
 
 // Small line icons (24x24, currentColor stroke).
 const IC_BLOCK: &str = "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.7' stroke-linejoin='round'><path d='M12 2 3 7v10l9 5 9-5V7z'/><path d='M3 7l9 5 9-5M12 12v10'/></svg>";
@@ -199,7 +199,8 @@ fn render_home(node: &str, net: &str) -> String {
     let script = feed_script(net);
     let body = format!(
         "<div class='hero'><div class='wrap'>
-           <h1>The Latebra {net_label} explorer</h1>
+           <span class='kicker'>Latebra {net_label} &middot; live ledger</span>
+           <h1>Read the chain.<br><span class='v'>Never the secrets.</span></h1>
            <form class='searchbar' action='/search' method='get'>
              <input name='q' placeholder='Search a block height or address (latt1…)' autocomplete='off'>
              <input type='hidden' name='net' value='{net}'>
@@ -458,7 +459,8 @@ fn render_faucet(node: &str, net: &str, params: &HashMap<String, String>) -> Str
 
     let body = format!(
         "<div class='hero'><div class='wrap'>
-           <h1>Testnet faucet — free test LAT</h1>
+           <span class='kicker'>Testnet &middot; free LAT</span>
+           <h1>Fill your <span class='v'>vault.</span></h1>
            <form class='searchbar' action='/faucet' method='get'>
              <input name='address' placeholder='Your testnet address (latt1…)' autocomplete='off'>
              <input type='hidden' name='net' value='{net}'>
@@ -678,17 +680,18 @@ fn page(title: &str, body: &str, net: &str, status: &str, refresh: bool) -> Stri
            <span>{status}{}<b class='netbadge'>{net_label}</b></span>
          </div></div>
          <div class='hdr'><div class='wrap'>
-           <a class='brand' href='/?net={net}'><img class='brandlogo' src=\"{logo}\" alt=''>Latscan</a>
+           <a class='brand' href='/?net={net}'><img class='brandlogo' src=\"{logo}\" alt=''>Latscan <em>lat1&hellip;</em></a>
            <nav class='nav'>
              <a href='/?net={net}'>Home</a>
              <a href='/faucet?net={net}'>Faucet</a>
              {}{}
            </nav>
          </div></div>
+         <div class='marq'><div>&nbsp;&nbsp;<b>LATEBRA EXPLORER</b> <i>//</i> LIVE CHAIN STATE <i>//</i> SHIELDED BY DEFAULT <i>//</i> lat1&hellip; <i>//</i> AMOUNTS ENCRYPTED <i>//</i> PROOF, NOT EXPOSURE <i>//</i> &nbsp;&nbsp;<b>LATEBRA EXPLORER</b> <i>//</i> LIVE CHAIN STATE <i>//</i> SHIELDED BY DEFAULT <i>//</i> lat1&hellip; <i>//</i> AMOUNTS ENCRYPTED <i>//</i> PROOF, NOT EXPOSURE <i>//</i> &nbsp;&nbsp;</div></div>
          {body}
          <footer><div class='wrap cols2'>
-           <div><b>Latscan</b> — the Latebra block explorer.<br>Balances and amounts are encrypted on-chain.</div>
-           <div class='muted'>Powered by latebrad · testnet-grade software</div>
+           <div><b>Latscan</b> — the Latebra block explorer.<br>Public where it can be, <i>encrypted where it counts.</i></div>
+           <div class='muted'>lat1&hellip; · balances &amp; amounts stay shielded on-chain · powered by latebrad</div>
          </div></footer>
          </body></html>",
         if status.is_empty() { "" } else { " · " },
@@ -861,14 +864,14 @@ fn json_string(s: &str) -> String {
 }
 
 fn css() -> &'static str {
-    // High-contrast "Latscan" theme: near-black canvas, Space Grotesk display +
-    // JetBrains Mono for all data, one disciplined amber accent, blue/violet to
-    // split transparent vs confidential. Braces are literal (this is a value
-    // substituted into page()'s format!, not itself a format string).
-    r#"@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
-:root{--bg:#08080a;--el:#0f0f12;--el2:#151519;--ln:rgba(255,255,255,.08);--ln2:rgba(255,255,255,.15);--tx:#fafafc;--mut:#6f6f7b;--am:#FFB43C;--am2:#ffc25e;--gr:#35d07f;--bl:#4c9bf5;--vi:#b98cf6;--rd:#ff5d6c}
+    // "Cipher Vault" theme matched to the Latebra site: deep slate canvas,
+    // Satoshi display + JetBrains Mono for all data, one violet accent,
+    // blue/violet to split transparent vs confidential. Braces are literal
+    // (this is a value substituted into page()'s format!, not a format string).
+    r#"@import url('https://api.fontshare.com/v2/css?f[]=satoshi@400,500,700,900&display=swap');@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap');
+:root{--bg:#0f172a;--el:#1e1b4b;--el2:#262157;--ln:rgba(148,163,184,.16);--ln2:rgba(139,92,246,.4);--tx:#ffffff;--mut:#94a3b8;--am:#8b5cf6;--am2:#a78bfa;--gr:#34d399;--bl:#4c9bf5;--vi:#a78bfa;--rd:#f87171}
 *{box-sizing:border-box}
-body{margin:0;background:radial-gradient(900px 420px at 50% -12%,#171019 0,#050506 62%),var(--bg);color:var(--tx);font:14px/1.55 'Space Grotesk',system-ui,-apple-system,Segoe UI,sans-serif;-webkit-font-smoothing:antialiased}
+body{margin:0;background:radial-gradient(900px 420px at 50% -12%,rgba(139,92,246,.14) 0,#0f172a 62%),var(--bg);color:var(--tx);font:14px/1.55 'Satoshi',system-ui,-apple-system,Segoe UI,sans-serif;-webkit-font-smoothing:antialiased}
 a{color:var(--am);text-decoration:none}a:hover{color:var(--am2)}
 .wrap{max-width:1160px;margin:0 auto;padding:0 18px}
 .mono{font-family:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;font-variant-numeric:tabular-nums}
@@ -886,19 +889,19 @@ a{color:var(--am);text-decoration:none}a:hover{color:var(--am2)}
 .nav a:hover{color:var(--tx);background:var(--el)}
 .pill{padding:6px 13px;border-radius:9px;font-size:12.5px;font-weight:600;color:var(--mut);border:1px solid var(--ln)}
 .pill:hover{color:var(--tx)}
-.pill.active{background:var(--am);color:#1a1200;border-color:transparent}
+.pill.active{background:var(--am);color:#fff;border-color:transparent}
 .hero{padding:34px 0 26px;border-bottom:1px solid var(--ln)}
 .hero h1{font-size:26px;margin:0 0 16px;font-weight:600;letter-spacing:-.02em}
 .searchbar{display:flex;max-width:760px;background:var(--el);border:1px solid var(--ln);border-radius:13px;overflow:hidden;transition:border-color .18s}
 .searchbar:focus-within{border-color:var(--ln2)}
 .searchbar input{flex:1;border:0;padding:14px 16px;font-size:14px;outline:none;background:transparent;color:var(--tx);font-family:inherit}
 .searchbar input::placeholder{color:var(--mut)}
-.searchbar button{border:0;background:var(--am);color:#1a1200;padding:0 24px;font-weight:600;font-family:inherit;font-size:14px;cursor:pointer;transition:background .18s}
+.searchbar button{border:0;background:var(--am);color:#fff;padding:0 24px;font-weight:600;font-family:inherit;font-size:14px;cursor:pointer;transition:background .18s}
 .searchbar button:hover{background:var(--am2)}
 .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:22px 0}
 .scard{background:var(--el);border:1px solid var(--ln);border-radius:14px;padding:15px 16px;display:flex;gap:12px;align-items:center;animation:rise .5s cubic-bezier(.2,.8,.2,1) both}
 .scard:nth-child(2){animation-delay:.06s}.scard:nth-child(3){animation-delay:.12s}.scard:nth-child(4){animation-delay:.18s}
-.sic{width:40px;height:40px;border-radius:11px;background:rgba(255,180,60,.12);color:var(--am);display:flex;align-items:center;justify-content:center;flex:none}
+.sic{width:40px;height:40px;border-radius:11px;background:rgba(139,92,246,.14);color:var(--am);display:flex;align-items:center;justify-content:center;flex:none}
 .sic svg{width:20px;height:20px}
 .lab{font-size:10.5px;text-transform:uppercase;letter-spacing:.12em;color:var(--mut);font-weight:500}
 .val{font-size:20px;font-weight:600;margin-top:4px;letter-spacing:-.01em}
@@ -915,7 +918,7 @@ a{color:var(--am);text-decoration:none}a:hover{color:var(--am2)}
 .brow+.brow,.trow+.trow{border-top:1px solid var(--ln)}
 .brow:hover,.trow:hover{background:var(--el2)}
 .fresh{animation:slidein .55s cubic-bezier(.2,.8,.2,1),flash 1.6s ease}
-.bic{width:34px;height:34px;border-radius:9px;flex:none;display:flex;align-items:center;justify-content:center;background:#17171d;color:var(--mut)}
+.bic{width:34px;height:34px;border-radius:9px;flex:none;display:flex;align-items:center;justify-content:center;background:#262157;color:var(--mut)}
 .bic svg{width:17px;height:17px}
 .bmid{flex:1;min-width:0}
 .bh{font-size:14px;font-weight:600}
@@ -926,12 +929,12 @@ a{color:var(--am);text-decoration:none}a:hover{color:var(--am2)}
 .badge{font-size:10.5px;font-weight:600;padding:5px 8px;border-radius:7px;flex:none;min-width:62px;text-align:center}
 .b-pub{color:var(--bl);background:rgba(76,155,245,.13)}
 .b-prv{color:var(--vi);background:rgba(185,140,246,.14)}
-.b-tk{color:var(--am);background:rgba(255,180,60,.13)}
+.b-tk{color:var(--am);background:rgba(139,92,246,.14)}
 .b-reg{color:var(--mut);background:rgba(255,255,255,.06)}
 .b-ct{color:#5dd6c0;background:rgba(93,214,192,.13)}
 .tmid{flex:1;min-width:0}
 .troute{font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.troute a{color:#c8c8d2}.troute a:hover{color:var(--am)}
+.troute a{color:#cbd5e1}.troute a:hover{color:var(--am)}
 .tamt{margin-left:auto;text-align:right;font-size:12.5px;font-weight:600;flex:none;font-family:'JetBrains Mono',monospace;font-variant-numeric:tabular-nums;white-space:nowrap}
 .tamt.pos{color:var(--gr)}
 .enc{margin-left:auto;font-size:11.5px;font-weight:500;color:var(--vi);white-space:nowrap;flex:none}
@@ -946,11 +949,11 @@ th,td{text-align:left;padding:12px 18px;border-bottom:1px solid var(--ln);font-s
 th{color:var(--mut);font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.08em}
 tr:last-child td{border-bottom:none}
 tbody tr:hover{background:var(--el2)}
-.hash{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;color:#b7b7c4;word-break:break-all}
+.hash{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;color:#cbd5e1;word-break:break-all}
 .row{display:flex;align-items:center;gap:12px;padding:13px 17px;border-bottom:1px solid var(--ln)}
 .row:last-of-type{border-bottom:none}
 .row:hover{background:var(--el2)}
-.row .ic{width:36px;height:36px;border-radius:10px;background:#17171d;color:var(--mut);display:flex;align-items:center;justify-content:center;flex:none}
+.row .ic{width:36px;height:36px;border-radius:10px;background:#262157;color:var(--mut);display:flex;align-items:center;justify-content:center;flex:none}
 .row .ic svg{width:18px;height:18px}
 .row .mid{flex:1;min-width:0;overflow:hidden}
 .row .t1{font-weight:600}
@@ -958,11 +961,11 @@ tbody tr:hover{background:var(--el2)}
 .row .rt{text-align:right;font-size:12.5px;color:var(--mut);white-space:nowrap}
 .tag{display:inline-block;padding:3px 9px;border-radius:7px;font-size:11.5px;font-weight:600;background:rgba(255,255,255,.05);color:var(--mut)}
 .tag.xfer{background:rgba(185,140,246,.14);color:var(--vi)}
-.tag.tok{background:rgba(255,180,60,.13);color:var(--am)}
+.tag.tok{background:rgba(139,92,246,.14);color:var(--am)}
 .tag.reg{background:rgba(76,155,245,.13);color:var(--bl)}
 .tag.roll{background:rgba(255,255,255,.06);color:var(--mut)}
 .tag.ct{background:rgba(93,214,192,.13);color:#5dd6c0}
-.pill-amt{background:rgba(255,180,60,.13);color:var(--am);border-radius:6px;padding:1px 8px;font-size:12px;font-weight:600}
+.pill-amt{background:rgba(139,92,246,.14);color:var(--am);border-radius:6px;padding:1px 8px;font-size:12px;font-weight:600}
 code{background:var(--el2);padding:2px 6px;border-radius:6px;font-size:13px;color:var(--am2);font-family:'JetBrains Mono',monospace}
 .fmsg{border-radius:12px;padding:13px 16px;margin-bottom:18px;font-weight:500;border:1px solid}
 .fmsg.ok{background:rgba(53,208,127,.1);color:var(--gr);border-color:rgba(53,208,127,.3)}
@@ -971,10 +974,54 @@ footer{border-top:1px solid var(--ln);margin-top:26px;padding:26px 0;color:var(-
 footer .cols2{display:flex;justify-content:space-between;flex-wrap:wrap;gap:20px}footer b{color:var(--tx)}
 @keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
 @keyframes slidein{from{opacity:0;transform:translateY(-14px)}to{opacity:1;transform:none}}
-@keyframes flash{0%{background:rgba(255,180,60,.14)}100%{background:transparent}}
+@keyframes flash{0%{background:rgba(139,92,246,.18)}100%{background:transparent}}
 @keyframes beat{0%,100%{box-shadow:0 0 0 0 rgba(53,208,127,.55)}50%{box-shadow:0 0 0 5px rgba(53,208,127,0)}}
 @media(max-width:820px){.stats{grid-template-columns:repeat(2,1fr)}.cols{grid-template-columns:1fr}}
-@media(prefers-reduced-motion:reduce){.scard,.panel,.fresh,.live{animation:none}}"#
+@media(prefers-reduced-motion:reduce){.scard,.panel,.fresh,.live,.marq>div{animation:none}}
+/* ---- site-match overrides: bring Latscan up to the marketing site's visual language ---- */
+:root{--sans:'Satoshi',ui-sans-serif,system-ui,sans-serif;--mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;--vln:rgba(139,92,246,.22)}
+body{background:radial-gradient(1100px 520px at 74% -12%,rgba(30,27,75,.85) 0,rgba(15,23,42,0) 58%),var(--bg);font-family:var(--sans)}
+::selection{background:var(--am);color:#0f172a}
+.kicker{font-family:var(--mono);font-size:11px;letter-spacing:.3em;color:var(--am);text-transform:uppercase;display:block;margin-bottom:18px}
+.strip{font-family:var(--mono);letter-spacing:.14em;text-transform:uppercase;background:rgba(15,23,42,.55)}
+.marq{overflow:hidden;border-bottom:1px solid var(--ln);background:rgba(30,27,75,.26)}
+.marq>div{display:inline-block;white-space:nowrap;padding:9px 0;font-family:var(--mono);font-size:11px;letter-spacing:.26em;color:var(--mut);text-transform:uppercase;animation:marq 36s linear infinite}
+.marq b{color:var(--am);font-weight:600}
+.marq i{color:var(--am);font-style:normal;opacity:.55;margin:0 4px}
+@keyframes marq{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+.hdr{background:rgba(15,23,42,.72)}.hdr .wrap{height:64px}
+.brand{font-weight:900;letter-spacing:.26em;text-transform:uppercase;font-size:15px;gap:11px}
+.brand em{font-style:normal;font-family:var(--mono);font-size:10px;letter-spacing:.12em;color:var(--am);text-transform:none;margin-left:3px}
+.brandlogo{width:28px;height:28px}
+.nav{gap:clamp(12px,2vw,26px)}
+.nav a:not(.pill){position:relative;color:var(--mut);font-family:var(--mono);font-size:11px;letter-spacing:.18em;text-transform:uppercase;padding:4px 0;border-radius:0}
+.nav a:not(.pill):hover{color:var(--tx);background:none}
+.nav a:not(.pill)::after{content:'';position:absolute;left:0;bottom:-3px;height:1px;width:100%;background:var(--am);transform:scaleX(0);transform-origin:right;transition:transform .35s cubic-bezier(.77,0,.18,1)}
+.nav a:not(.pill):hover::after{transform:scaleX(1);transform-origin:left}
+.pill{border-radius:999px;font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;border-color:var(--vln)}
+.pill.active{background:var(--am);color:#0f172a}
+.hero{background:radial-gradient(120% 130% at 80% -30%,rgba(30,27,75,.8) 0,rgba(15,23,42,0) 55%);padding:clamp(38px,6vw,78px) 0 clamp(28px,4vw,40px)}
+.hero h1{font-size:clamp(30px,5vw,58px);line-height:1.03;font-weight:900;letter-spacing:-.025em;max-width:15ch;margin:0 0 26px}
+.hero h1 .v{color:var(--am)}
+.searchbar{background:rgba(26,23,64,.7);border-color:var(--vln);border-radius:14px}
+.searchbar input{font-family:var(--mono)}
+.searchbar button{background:var(--am);color:#0f172a;font-weight:700;letter-spacing:.04em;font-family:var(--sans)}
+.searchbar button:hover{background:var(--am2)}
+.scard,.panel,.card{background:rgba(26,23,64,.5);border-radius:16px}
+.sic{border-radius:12px}
+.lab{font-family:var(--mono);letter-spacing:.18em}
+.val{font-weight:800}
+.panel .ph,.card .ph{font-family:var(--mono);font-size:12px;letter-spacing:.15em;text-transform:uppercase;color:#cbd5e1}
+.panel .ph .muted{text-transform:none;letter-spacing:0;font-family:var(--sans)}
+.badge{font-family:var(--mono);font-size:9.5px;letter-spacing:.08em;text-transform:uppercase}
+.bh,.txns,.tamt,.troute,.hash,.bm,.row .rt{font-family:var(--mono)}
+.tag{font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase}
+.tag.stake{background:rgba(52,211,153,.13);color:var(--gr)}
+.enc{font-family:var(--mono);text-transform:uppercase;letter-spacing:.06em}
+.pf{font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase}
+.kv .k{font-family:var(--mono);font-size:12px}
+.pill-amt{font-family:var(--mono);color:var(--am2)}
+footer i{font-style:italic;color:var(--am2)}"#
 }
 
 // --- helpers ---------------------------------------------------------------
