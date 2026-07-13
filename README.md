@@ -61,6 +61,16 @@ cargo run --release -p latebrad -- --data ./node-b/chain.db --listen 127.0.0.1:4
 cargo test
 ```
 
+## Documentation
+
+| Doc | What it covers |
+|---|---|
+| [TESTNET.md](TESTNET.md) | Running & joining a node, wallet, explorer |
+| [DEPLOY.md](DEPLOY.md) | Full VPS deployment: chain, explorer, wallet, site, public API behind HTTPS |
+| [RPC.md](RPC.md) | The public JSON-RPC 2.0 developer API (methods, CORS, exposure model) |
+| [LAUNCH.md](LAUNCH.md) | Public-testnet launch checklist + chain parameters + mainnet gate |
+| [THREAT_MODEL.md](THREAT_MODEL.md) · [CRYPTO_SPEC.md](CRYPTO_SPEC.md) | Security posture — what is and isn't guaranteed |
+
 ## Architecture
 
 A Cargo workspace of focused crates:
