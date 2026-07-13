@@ -59,6 +59,14 @@ const GENESIS_PUBLIC_PREMINE: u64 = 100_000_000_000;
 const MAX_TXS_PER_BLOCK: usize = 1000;
 const BLOCK_INTERVAL_SECS: u64 = 3;
 
+/// CORS headers so browser dApps / the explorer / the web wallet can call the
+/// public JSON-RPC from another origin. The API is read-only (plus `lat_submitTx`,
+/// which is self-authenticating), so a permissive origin is safe.
+const CORS: &str = "access-control-allow-origin: *\r\n\
+                    access-control-allow-methods: GET, POST, OPTIONS\r\n\
+                    access-control-allow-headers: content-type\r\n\
+                    access-control-max-age: 86400\r\n";
+
 struct Config {
     data: PathBuf,
     listen: String,
@@ -395,6 +403,12 @@ fn handle_metrics(
     let verb = line.split_whitespace().next().unwrap_or("").to_string();
     let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
 
+    // CORS preflight: browsers send OPTIONS before a cross-origin POST /rpc.
+    if verb == "OPTIONS" {
+        let mut s = stream;
+        return write!(s, "HTTP/1.1 204 No Content\r\n{CORS}content-length: 0\r\nconnection: close\r\n\r\n");
+    }
+
     // T20: JSON-RPC 2.0 over POST /rpc — read headers for the body length,
     // then dispatch. Everything else falls through to the GET endpoints.
     if verb == "POST" && path == "/rpc" {
@@ -422,7 +436,7 @@ fn handle_metrics(
         let mut s = stream;
         return write!(
             s,
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n{CORS}content-length: {}\r\nconnection: close\r\n\r\n{reply}",
             reply.len()
         );
     }
@@ -477,6 +491,7 @@ fn handle_metrics(
                  latebra_uptime_seconds {uptime}\n"
             ),
         ),
+        "/health" => ("text/plain", "ok".to_string()),
         "/status" | "/" => (
             "application/json",
             format!(
@@ -495,7 +510,7 @@ fn handle_metrics(
     let mut s = stream;
     write!(
         s,
-        "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\n{CORS}content-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len()
     )
 }
@@ -523,6 +538,8 @@ fn rpc_handle(node: &SharedNode, body: &[u8]) -> serde_json::Value {
     };
 
     let result: Result<Value, (i64, &str)> = match method {
+        // -- liveness --------------------------------------------------------
+        "lat_health" => Ok(json!("ok")),
         // -- chain info ------------------------------------------------------
         "lat_status" => {
             let n = lock_node(node);
@@ -559,6 +576,107 @@ fn rpc_handle(node: &SharedNode, body: &[u8]) -> serde_json::Value {
                 }
             }
             None => Err((-32602, "params: [tx_hash_hex]")),
+        },
+        // -- decoded, developer-friendly reads (Solana-style) ----------------
+        "lat_getBlock" => match p_u64(0) {
+            Some(h) => {
+                let n = lock_node(node);
+                Ok(n.chain.block_bytes(h).map(block_json).unwrap_or(Value::Null))
+            }
+            None => Err((-32602, "params: [height]")),
+        },
+        "lat_getBlockByHash" => match p_id(0) {
+            Some(bid) => {
+                let n = lock_node(node);
+                Ok(n.chain.block_by_id(&bid).as_deref().map(block_json).unwrap_or(Value::Null))
+            }
+            None => Err((-32602, "params: [block_id_hex]")),
+        },
+        "lat_latestBlocks" => {
+            let count = p_u64(0).unwrap_or(10).clamp(1, 50);
+            let n = lock_node(node);
+            let mut h = n.chain.height();
+            let mut out = Vec::new();
+            loop {
+                if let Some(blk) = n.chain.block_bytes(h).and_then(lat_chain::Block::decode) {
+                    let hdr = &blk.header;
+                    out.push(json!({
+                        "height": hdr.height,
+                        "id": hex::encode(hdr.id()),
+                        "timestamp": hdr.timestamp,
+                        "miner": hex::encode(hdr.miner),
+                        "tx_count": blk.txs.len(),
+                        "reward": emission(hdr.height),
+                    }));
+                }
+                if out.len() as u64 >= count || h == 0 {
+                    break;
+                }
+                h -= 1;
+            }
+            Ok(json!(out))
+        }
+        "lat_getTransaction" => match p_id(0) {
+            Some(hash) => {
+                let n = lock_node(node);
+                match n.chain.tx_location(&hash) {
+                    Some((block_id, index)) => {
+                        let height = n.chain.active_height_of(&block_id);
+                        let tx = n
+                            .chain
+                            .block_by_id(&block_id)
+                            .and_then(|b| lat_chain::Block::decode(&b))
+                            .and_then(|blk| blk.txs.get(index as usize).cloned());
+                        Ok(json!({
+                            "hash": hex::encode(hash),
+                            "block": hex::encode(block_id),
+                            "height": height,
+                            "index": index,
+                            "tx": tx.as_ref().map(tx_summary),
+                        }))
+                    }
+                    None => Ok(Value::Null),
+                }
+            }
+            None => Err((-32602, "params: [tx_hash_hex]")),
+        },
+        "lat_supply" => {
+            let height = lock_node(node).chain.height();
+            let mined = mined_supply(height);
+            let premine = GENESIS_PREMINE as u128 + GENESIS_PUBLIC_PREMINE as u128;
+            Ok(json!({
+                "height": height,
+                "decimals": 5,
+                "current_block_reward": emission(height),
+                "halving_interval": lat_chain::HALVING_INTERVAL,
+                "halvings_done": height / lat_chain::HALVING_INTERVAL,
+                "premine_base_units": premine as u64,
+                "mined_base_units": mined as u64,
+                "total_base_units": (premine + mined) as u64,
+            }))
+        }
+        "lat_validators" => {
+            let n = lock_node(node);
+            let height = n.chain.height();
+            let set = n
+                .chain
+                .validator_set_at(height)
+                .map(|s| {
+                    s.iter()
+                        .map(|(id, stake)| json!({"account": hex::encode(id), "stake": stake}))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            Ok(json!(set))
+        }
+        "lat_token" => match p_str(0) {
+            Some(ticker) => Ok(json!(lock_node(node).chain.token(ticker).map(|t| json!({
+                "id": t.id,
+                "ticker": t.ticker,
+                "creator": hex::encode(t.creator),
+                "supply": t.supply,
+            })))),
+            None => Err((-32602, "params: [ticker]")),
         },
         // -- account reads ---------------------------------------------------
         "lat_publicBalance" => match (p_id(0), p_u64(1)) {
@@ -646,6 +764,116 @@ fn rpc_handle(node: &SharedNode, body: &[u8]) -> serde_json::Value {
             json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
         }
     }
+}
+
+/// A public, privacy-respecting summary of one transaction for the JSON-RPC API.
+/// Confidential fields (encrypted amounts, ZK proofs, anonymity-set members) are
+/// never expanded — only what is public on-chain is surfaced. Amounts are in base
+/// units (1 LAT = 100000). See RPC.md.
+fn tx_summary(tx: &lat_types::Transaction) -> serde_json::Value {
+    use lat_types::Transaction::*;
+    use serde_json::json;
+    let hash = hex::encode(lat_chain::tx_hash(tx));
+    match tx {
+        Register { pubkey, .. } => {
+            json!({"hash": hash, "type": "register", "account": hex::encode(pubkey)})
+        }
+        CreateToken { ticker, creator, supply, .. } => json!({
+            "hash": hash, "type": "create_token",
+            "ticker": ticker, "creator": hex::encode(creator), "supply": supply,
+        }),
+        SolventTransfer { token, .. } => json!({
+            "hash": hash, "type": "confidential_transfer", "token": token,
+            "amount": "confidential",
+        }),
+        Rollover { account, .. } => {
+            json!({"hash": hash, "type": "rollover", "account": hex::encode(account)})
+        }
+        DeployContract { deployer, code, .. } => json!({
+            "hash": hash, "type": "deploy_contract",
+            "deployer": hex::encode(deployer), "code_len": code.len(),
+        }),
+        CallContract { contract, caller, input, .. } => json!({
+            "hash": hash, "type": "call_contract",
+            "contract": hex::encode(contract), "caller": hex::encode(caller), "input": input,
+        }),
+        PublicTransfer { token, from, to, amount, fee, .. } => json!({
+            "hash": hash, "type": "public_transfer", "token": token,
+            "from": hex::encode(from), "to": hex::encode(to), "amount": amount, "fee": fee,
+        }),
+        Shield { token, from, to, amount, fee, .. } => json!({
+            "hash": hash, "type": "shield", "token": token,
+            "from": hex::encode(from), "to": hex::encode(to), "amount": amount, "fee": fee,
+        }),
+        Unshield { token, to, amount, .. } => json!({
+            "hash": hash, "type": "unshield", "token": token,
+            "to": hex::encode(to), "amount": amount,
+        }),
+        ShieldStealth { token, from, amount, fee, .. } => json!({
+            "hash": hash, "type": "shield_stealth", "token": token,
+            "from": hex::encode(from), "amount": amount, "fee": fee,
+        }),
+        AnonTransfer { token, .. } => json!({
+            "hash": hash, "type": "anon_transfer", "token": token,
+            "sender": "hidden", "receiver": "hidden",
+        }),
+        Stake { validator, amount, .. } => json!({
+            "hash": hash, "type": "stake", "validator": hex::encode(validator), "amount": amount,
+        }),
+        Unstake { validator, amount, .. } => json!({
+            "hash": hash, "type": "unstake", "validator": hex::encode(validator), "amount": amount,
+        }),
+        SlashEvidence { validator, beneficiary, height, .. } => json!({
+            "hash": hash, "type": "slash_evidence",
+            "validator": hex::encode(validator), "beneficiary": hex::encode(beneficiary),
+            "height": height,
+        }),
+    }
+}
+
+/// Decode an encoded block into a structured JSON object (header + tx summaries).
+/// Returns `null` if the bytes don't decode.
+fn block_json(bytes: &[u8]) -> serde_json::Value {
+    use serde_json::json;
+    match lat_chain::Block::decode(bytes) {
+        Some(b) => {
+            let h = &b.header;
+            json!({
+                "height": h.height,
+                "id": hex::encode(h.id()),
+                "prev_hash": hex::encode(h.prev_hash),
+                "timestamp": h.timestamp,
+                "tx_root": hex::encode(h.tx_root),
+                "state_root": hex::encode(h.state_root),
+                "miner": hex::encode(h.miner),
+                "nonce": h.nonce,
+                "reward": emission(h.height),
+                "tx_count": b.txs.len(),
+                "txs": b.txs.iter().map(tx_summary).collect::<Vec<_>>(),
+            })
+        }
+        None => serde_json::Value::Null,
+    }
+}
+
+/// Total LAT emitted by mining from block 1..=height, in base units. Computed in
+/// closed form over halving eras (≤64 iterations) rather than per-block, so it is
+/// cheap even for a long chain. Matches `lat_chain::emission` exactly.
+fn mined_supply(height: u64) -> u128 {
+    let mut total: u128 = 0;
+    let mut h: u64 = 1;
+    while h <= height {
+        let reward = emission(h) as u128;
+        if reward == 0 {
+            break; // emission is monotonic non-increasing; nothing more to add.
+        }
+        let era = h / lat_chain::HALVING_INTERVAL;
+        let era_end = (era + 1) * lat_chain::HALVING_INTERVAL; // first height of the next era
+        let upper = era_end.min(height + 1);
+        total += reward * (upper - h) as u128;
+        h = upper;
+    }
+    total
 }
 
 /// Mine one block from the mempool, apply it, and gossip it to every known peer

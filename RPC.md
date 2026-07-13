@@ -15,6 +15,17 @@ The same port also serves `GET /status` (plain JSON summary) and
 `lat_submitTx`. It binds loopback by default — expose it deliberately
 (`--metrics 0.0.0.0:4090`) and firewall it if you do.
 
+**CORS.** All responses send `Access-Control-Allow-Origin: *` and answer
+`OPTIONS` preflight, so browser dApps, the explorer, and the web wallet can
+call `/rpc` from any origin. Everything is read-only except the
+self-authenticating `lat_submitTx`, so an open origin is safe.
+
+> **Publishing a public API.** For a Solana-style public endpoint
+> (`api.<your-domain>`), put a reverse proxy in front and forward **only**
+> `POST /rpc`, `GET /status`, and `GET /health` — keep `/metrics` (peer/mempool
+> internals) on the loopback interface or firewalled to your monitoring host.
+> Add rate limiting at the proxy. See LAUNCH.md.
+
 Conventions: params are **positional**. Account/contract/tx ids and byte
 blobs are lowercase hex strings (no `0x` prefix). Token `0` is native LAT
 (5 decimals: 1 LAT = 100000 units). Missing entities read as `result: null`
@@ -26,13 +37,38 @@ rather than an error.
 
 | Method | Params | Result |
 |---|---|---|
+| `lat_health` | `[]` | `"ok"` — liveness probe |
 | `lat_status` | `[]` | `{height, tip, difficulty, genesis, peers, mempool, finalized: {height, id} \| null}` |
+| `lat_supply` | `[]` | `{height, decimals, current_block_reward, halving_interval, halvings_done, premine_base_units, mined_base_units, total_base_units}` |
 | `lat_blockByHeight` | `[height]` | `{height, bytes}` (hex-encoded block) or `null` |
 | `lat_txByHash` | `[tx_hash_hex]` | `{block, index}` or `null` |
 
 `genesis` is the network fingerprint — check it before trusting a node.
-Block/transaction byte formats are the canonical consensus encodings
-(`lat-chain::Block`, `lat-types::Transaction`).
+`lat_blockByHeight` returns the canonical consensus encoding
+(`lat-chain::Block`); prefer the **decoded** reads below for app/explorer use.
+
+### Decoded reads (developer-friendly)
+
+These return structured JSON — no client-side consensus decoding needed. They
+only surface **public** data: confidential amounts, ZK proofs, and
+anonymity-set members are never expanded. Amounts are base units (1 LAT =
+100000).
+
+| Method | Params | Result |
+|---|---|---|
+| `lat_getBlock` | `[height]` | `{height, id, prev_hash, timestamp, tx_root, state_root, miner, nonce, reward, tx_count, txs: [...] }` or `null` |
+| `lat_getBlockByHash` | `[block_id_hex]` | same shape as `lat_getBlock` or `null` |
+| `lat_latestBlocks` | `[count?]` | newest-first block summaries `[{height, id, timestamp, miner, tx_count, reward}]` (count 1–50, default 10) |
+| `lat_getTransaction` | `[tx_hash_hex]` | `{hash, block, height, index, tx: {...} }` or `null` |
+| `lat_validators` | `[]` | active validator set `[{account, stake}]` |
+| `lat_token` | `[ticker]` | `{id, ticker, creator, supply}` or `null` |
+
+Each element of a block's `txs` (and `lat_getTransaction`'s `tx`) is a summary
+tagged with `type`: `register`, `create_token`, `public_transfer`, `shield`,
+`unshield`, `shield_stealth`, `confidential_transfer` (amount hidden),
+`anon_transfer` (sender+receiver hidden), `rollover`, `deploy_contract`,
+`call_contract`, `stake`, `unstake`, `slash_evidence`. Every summary carries
+its `hash`.
 
 ### Accounts
 
