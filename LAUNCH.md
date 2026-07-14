@@ -34,7 +34,7 @@ automatically. These are the consensus/economic constants as shipped:
 | Max validators | 64 (`MAX_VALIDATORS`) | lat-state |
 | Finality quorum | strictly > 2/3 of bonded stake | lat-chain |
 | Finality set window | 64 blocks (`FINALITY_SET_WINDOW`) | lat-chain |
-| Slash penalty (equivocation) | full burn: bonded stake + unbonding | lat-state |
+| Slash penalty (equivocation) | 10% of bonded + unbonding (`SLASH_FRACTION_BPS`); 5% of the slash to the reporter (`SLASH_REWARD_BPS`); rest burned; validator tombstoned | lat-state |
 
 **Mainnet must additionally decide a validator genesis** (T13/T14): with the
 testnet premine, the genesis wallet can trivially hold every validator seat.
@@ -61,10 +61,14 @@ PoW. To run a validator:
 5. Leave with `lat-wallet unstake --amount <LAT>`, wait out the unbonding
    window, then claim with `lat-wallet stake --amount 0`.
 
-**Equivocation is fatal**: signing finality votes for two different blocks at
-one height is provable by anyone (`SlashEvidence` transaction) and burns the
-offender's entire bond, including funds still unbonding. Run ONE node per
-validator key.
+**Equivocation is fatal to the validator, not to the whole bond**: signing
+finality votes for two different blocks at one height is provable by anyone
+(`SlashEvidence` transaction). It slashes `SLASH_FRACTION_BPS` (10%) of the
+offender's stake — bonded *and* still-unbonding — pays `SLASH_REWARD_BPS` (5%
+of that slash) to whoever submitted the evidence, burns the remainder, and
+**permanently tombstones** the validator. Since a partial slash leaves residual
+stake, the tombstone (not the burn) is what bars a repeat offender from the
+validator set for good. Run ONE node per validator key.
 
 Testnet genesis (in `latebrad`) — **well-known, testnet-only secrets**:
 
