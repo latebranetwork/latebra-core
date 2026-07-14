@@ -2,7 +2,8 @@
 
 > Living document. Paste "continue from the latest checkpoint" in a new
 > conversation and work resumes from the **Current Task** below.
-> Last updated: 2026-07-12 (Checkpoint 22 — Gap-5/T20: JSON-RPC 2.0 surface on latebrad).
+> Last updated: 2026-07-14 (Checkpoint 23 — D4: contract-platform scope decision;
+> VM rewrite deferred, privacy lane is the shipping claim).
 
 ## 0. Mission
 
@@ -119,6 +120,55 @@ incremental-vs-full-rebuild oracle and the snapshot roundtrip.
 - [x] **D3 — First milestone: persistent state DB + authenticated trie.** The
   foundation parallel execution, snapshot sync, pruning, and archive depend on.
 
+### D4 — Contract platform scope (SET 2026-07-14)
+
+- [x] **D4 — DEFER the VM rewrite. The confidential lane is the shipping claim.**
+  Prompted by the question "can Latebra host NFTs/DeFi/tokens at Solana scale
+  while keeping privacy?". Audited `lat-vm` to answer it. Findings:
+
+  **`lat-vm` v1 is an arithmetic sandbox, not a contract platform.** 579 LOC,
+  22 opcodes, `u64 → u64` storage, revert-by-divide-by-zero. It has no
+  value-transfer opcode, no cross-contract `CALL`, no hash, no events/logs, no
+  block context, and no words wider than 64 bits. Consequences, per asked-for
+  feature:
+  - **Native tokens: SHIP.** `CreateToken` + the token registry are native
+    transaction types, not contracts. Unaffected by any of this.
+  - **NFTs: NOT POSSIBLE as contracts.** Need metadata (byte strings) and
+    events (indexers). Would have to become a native tx type like tokens.
+  - **Composable DeFi: NOT POSSIBLE.** DeFi *is* composability; with no `CALL`
+    opcode a contract cannot invoke a token contract. This is structural, not
+    a tuning problem.
+  - **Privacy × DeFi: ARCHITECTURALLY EXCLUDED, and that is fine.** A contract
+    cannot compute on a Pedersen commitment it cannot open. This is why Zcash
+    has no DeFi and why Aleo/Aztec are ZK-circuit architectures, not stack VMs.
+    D1's dual-mode already answers it: privacy lane = transfers, transparent
+    lane = contracts, user picks per tx. **Say this publicly rather than
+    implying both at once.** There is no private AMM on this design.
+
+  **Positioning follows from the measurements, not from ambition.** The
+  transparent lane's headline (~23–30k tx/s, T8) is the lane the launchpad does
+  *not* primarily use — contracts are a serial barrier at ~1,280 calls/s. But
+  the confidential lane at ~650 tx/s (T12) is **20–60× Monero/Zcash shielded
+  throughput (~10–30 TPS)**. That is a first-in-class claim, it is already
+  built, and it needs a testnet + audit rather than a rewrite. Chasing Solana
+  on DeFi means a VM rewrite → compiler → language → tooling → developers, at
+  the end of which Latebra is a slower Solana that also does privacy.
+
+  **Sequencing consequence — T9/T10/T11 are blocked BY THIS DECISION, not by
+  effort.** T8's parallelism rests on transparent txs having *exact static
+  access sets*. A `CALL` opcode destroys static access sets (you cannot know
+  what a contract touches without running it) — which is precisely why Solana
+  makes every tx declare its accounts upfront. So T9's design is downstream of
+  the VM decision: build T9 against the v1 VM and it is rebuilt after any
+  rewrite. **Decide the VM, then parallelize against it.**
+
+  **Decision:** ship the privacy chain as-is with native tokens and the bonding
+  curve, with the latfun settlement gap documented honestly (see §8) rather than
+  hidden. Prove the confidential numbers on a public testnet. THEN, only if
+  traction justifies it, open the VM rewrite as its own program (M7) with the
+  atomicity gap as task one — it is a live soundness issue today, not a future
+  nice-to-have.
+
 ## 5. Roadmap (dependency-ordered; one task ≈ one conversation)
 
 Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
@@ -233,9 +283,15 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
   oracle test guards it. **Measured (parallel_bench, 8 logical cores): 2000
   disjoint public transfers 244→86 ms (~2.9–3.1×, ~23–30k tx/s); hot-receiver
   worst case exactly 1.00× (zero overhead).**  ← T3
-- [ ] T9 Per-tx access lists / state-dependency hints.  ← T8
+- [ ] T9 Per-tx access lists / state-dependency hints.  ← T8, **D4**
+  (BLOCKED BY DECISION: a `CALL` opcode kills static access sets, so the design
+  — declared lists à la Solana vs. optimistic Block-STM — is downstream of the
+  VM choice. Building this against the v1 VM is rework.)
 - [ ] T10 Parallel + batched signature verification.  ← T8
-- [ ] T11 VM optimization (dispatch, gas metering, memory model).  ← T8
+  (Not blocked by D4; the sig-verify wall is real at any TPS. Highest-value M2
+  task that survives either VM outcome.)
+- [ ] T11 VM optimization (dispatch, gas metering, memory model).  ← T8, **D4**
+  (BLOCKED BY DECISION: do not optimize a VM that may be replaced.)
 - [x] **T12 Parallel confidential-proof verification.** A pre-pass in
   `apply_block_parallel` verifies confidential zero-knowledge proofs across
   all cores *before* application, and the apply arms reuse the evidence
@@ -415,6 +471,13 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
   (absent here); redb needs no C toolchain and its MVCC read snapshots suit a
   future CoW overlay. Still behind `KVStore`, so RocksDB remains a drop-in later
   if raw throughput is ever measured to require it.
+- ADR-0005: Contract platform deferred (D4). `lat-vm` v1 stays an arithmetic
+  sandbox for the bonding curve; NFTs/composable DeFi are out of scope until a
+  VM rewrite is justified by traction. Rationale: the confidential lane is
+  already 20–60× shielded-chain throughput and is the defensible claim, while
+  DeFi parity needs VM → compiler → language → tooling → developers. Corollary:
+  T9/T10/T11 wait on the VM decision, since cross-contract `CALL` invalidates
+  T8's static access sets.
 
 ## 7. Public interfaces (append as they land)
 
@@ -514,6 +577,20 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
 
 ## 8. Known limitations / follow-ups
 
+- **latfun's bonding curve is NOT atomic with its settlement (D4, live issue).**
+  `lat-vm` cannot move LAT — it only reads/writes `u64` storage — so the deployed
+  contract is the *pricing and accounting* half only, and the actual LAT movement
+  is a **separate transparent transfer** that latfun orchestrates alongside the
+  `CallContract`. The two are not bound by consensus. If latfun fails, crashes,
+  or is interrupted between the two steps, on-chain holdings and real LAT
+  diverge, with no chain-level rollback: the curve's storage says one thing and
+  the treasury balance says another. Today this is bounded by latfun being the
+  only orchestrator (a trusted server doing the money half — which is precisely
+  the property the on-chain curve was built to remove). **This is task one of any
+  VM program (M7): a VM-native token-transfer opcode so a trade is one atomic
+  call.** Documented honestly at `lat-contracts/src/lib.rs` ("Honest boundary
+  (v1 VM)"); do not ship launchpad marketing that implies consensus-enforced
+  settlement until this closes.
 - **RESOLVED by T7** (was: chain ledger base is still in-memory). Persistent
   chains commit state to the chain DB per adopted block and boot from records.
   Remaining T7 residue: an in-memory chain (`Blockchain::genesis`) still keeps
@@ -537,6 +614,14 @@ Legend: [x] done · [~] in progress · [ ] todo. Arrows = hard dependency.
   (~64 accounts); wins decisively at large state (O(log n) vs O(n)).
 
 ## 9. Current Task
+
+**SCOPE SET BY D4 (2026-07-14): the remaining path is testnet → audit → mainnet
+on the PRIVACY claim. No further VM/DeFi engineering before traction.** The
+shipping claim is the confidential lane (~650 tx/s vs. ~10–30 TPS for Monero /
+Zcash shielded), not Solana parity — NFTs and composable DeFi are out of scope
+until a VM rewrite is justified (§4 D4, ADR-0005). T9/T11 are parked behind that
+decision; T10 (parallel sig verification) is the only M2 task still worth doing
+unconditionally. Do not let a VM detour displace the four gates below.
 
 **PROGRAM CODE-COMPLETE for the testnet→audit→mainnet path.** M0–M4 + M6
 done; M5 T20 JSON-RPC now DONE (T21 SDKs remain post-launch polish), T18 is an hour
@@ -608,10 +693,12 @@ The remaining gates are NOT code tasks:
 4. **Mainnet-must-change list** (LAUNCH.md §5): fresh genesis + premine
    ceremony, real seed hosts, difficulty/emission review, RandomX decision.
 
-If more engineering IS wanted meanwhile, the highest-value options: T20
-(consolidated JSON-RPC so explorers/exchanges don't speak the binary
-protocol), partial-slash + whistleblower rewards (T16 deferral), or an
-incremental prune sweep (§8 known debt).
+If more engineering IS wanted meanwhile, the highest-value options that survive
+D4: **T10** (parallel + batched signature verification — the sig-verify wall is
+real under either VM outcome), an incremental prune sweep (§8 known debt), or
+the pre-existing flaky `prune_window_bounds…` test. NB: T20 and the T16
+partial-slash deferral, listed here previously, are both DONE. Do **not** start
+T9/T11 — see D4.
 
 ### Build/verify commands
 - Tests: `cargo test -p lat-store` (+ per-crate as tasks land).
