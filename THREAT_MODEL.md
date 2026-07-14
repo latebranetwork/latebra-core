@@ -82,6 +82,21 @@ Ranked by how much they matter for holding value.
    batching is future work.
 8. **VM scope.** Contracts run on a simple deterministic stack VM with basic gas
    metering — adequate for the bonding-curve use case, not a general audited EVM.
+9. **Not post-quantum; the privacy guarantee has a horizon.** All of the
+   cryptography rests on discrete-log/DDH on Curve25519, which Shor's algorithm
+   breaks. It sits last in this ranking because it matters least for *holding
+   value today* — no cryptographically-relevant quantum computer (CRQC) exists,
+   and credible estimates run to the 2030s or beyond. But it ranks **first** for
+   the one thing this chain sells: privacy *durability*. Balances (ElGamal),
+   recipients (stealth/ECDH) and senders (ring unlinkability/DDH) are only
+   *computationally* hidden, so **"harvest now, decrypt later" applies**: anyone
+   archiving the chain today de-anonymizes all of it once a CRQC exists, and **no
+   future fork can undo that**, because the data is already published. Theft risk
+   is different in kind — signature forgery is a future event a fork *can* get
+   ahead of, and signatures could migrate to ML-DSA. The privacy scheme has no
+   comparable migration path. Latebra is at parity with Monero and Zcash here (no
+   production privacy chain is post-quantum), but **do not market confidentiality
+   as permanent**. Full analysis: [CRYPTO_SPEC.md](CRYPTO_SPEC.md) §5.6.
 
 ## 3. Trust assumptions
 

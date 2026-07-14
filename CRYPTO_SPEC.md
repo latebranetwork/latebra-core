@@ -209,6 +209,43 @@ the Cosmos-style "one equivocation and you're out" model.
    from any challenge.
 5. **Epoch replay tradeoff**: one anonymous spend per account per epoch. A
    busy account must wait for the next epoch or use the confidential path.
+6. **Not post-quantum — and for privacy this is _retroactive_.** Every
+   assumption in §0 (discrete-log and DDH in Ristretto; `log_G H` unknown) falls
+   to Shor's algorithm on a cryptographically-relevant quantum computer (CRQC).
+   Two consequences, and the second is the one peculiar to a privacy chain:
+   - **Forward** (breaks only once a CRQC exists): Ed25519 forgery (any account
+     spends), Pedersen binding failure + Bulletproofs unsoundness (mint
+     unlimited *hidden* value — the inflation is invisible precisely because
+     amounts are hidden), ring-signature forgery, finality-vote forgery.
+   - **Retroactive** ("harvest now, decrypt later"): ElGamal balances (§0) are
+     only *computationally* hidden; stealth addresses (§3) are ECDH; ring
+     unlinkability is DDH (§2.4). An adversary archiving the chain **today**
+     recovers every balance, every recipient and every sender once a CRQC
+     exists. **No future hard fork repairs this** — the ciphertexts are already
+     public. The privacy guarantee has a horizon.
+
+   The account model forecloses Bitcoin's partial mitigation: balances are
+   `Enc_Y(v; r)` encrypted *to* the account key, so `Y` must be on-chain for
+   anyone to pay the account. Unlike a P2PKH hash (which reveals the key only on
+   spend, leaving un-reused addresses behind a hash barrier Grover merely
+   halves), **every Latebra account is Shor-exposed permanently, by design.**
+
+   Pedersen commitments are *perfectly* hiding, so a commitment alone survives a
+   CRQC — but v3 also carries the receiver credit as an ElGamal ciphertext under
+   the stealth one-time key (§2.3), so the amount is recoverable by that path
+   regardless. The information-theoretic property does not rescue the scheme.
+   Hashing is fine (Grover is only quadratic: BLAKE3/SHA-512 at 256 bits retain
+   ~128-bit security).
+
+   **This is peer-parity, not a Latebra deficiency.** Monero (ring signatures +
+   stealth) and Zcash (Jubjub/Pallas) rest on the same hardness; no production
+   privacy chain is post-quantum, because the primitives do not exist at usable
+   size and speed. Migration is **asymmetric**: signatures could later move to
+   ML-DSA (FIPS 204) at ~40× key/signature size, but the privacy scheme cannot be
+   swapped without replacing ElGamal, Pedersen, Bulletproofs *and* the ring
+   construction with lattice- or hash-based equivalents that are orders of
+   magnitude larger and slower. STARKs are the most credible post-quantum ZK
+   path, and adopting them is a full proof-system rewrite, not a migration.
 
 ---
 
