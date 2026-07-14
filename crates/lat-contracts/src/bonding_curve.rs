@@ -99,8 +99,39 @@ fn save(slot: u64) -> Vec<lat_vm::assembler::Instr> {
 
 /// The compiled bonding-curve contract bytecode. Deterministic — the same bytes
 /// every time, so its `contract_id` (hash of deployer+code) is stable.
+///
+/// NB: *because* it is stable, one deployer can hold only ONE unsalted curve —
+/// a second `DeployContract` with these bytes hits `LedgerError::ContractExists`.
+/// A launchpad needs a distinct curve per token: use [`bytecode_for`].
 pub fn bytecode() -> Vec<u8> {
+    program(None)
+}
+
+/// The curve bytecode salted for one token, so every token gets its own curve
+/// instance under one deployer.
+///
+/// `contract_id` is `hash(deployer ‖ code)` and `DeployContract` carries no salt
+/// field, so distinct instances require distinct *code*. This prepends a dead
+/// `Push(salt); Pop` — 10 bytes, 2 gas, no effect on the stack the program then
+/// builds — which is enough to move the hash. The id stays deterministic: anyone
+/// who knows `(deployer, salt)` can recompute it and verify they are trading
+/// against the real curve rather than a look-alike.
+///
+/// Pass the token id as `salt`; the chain already enforces token-id uniqueness,
+/// so curve ids inherit that uniqueness.
+pub fn bytecode_for(salt: u64) -> Vec<u8> {
+    program(Some(salt))
+}
+
+/// Shared program body. `salt = None` reproduces the original unsalted bytes
+/// exactly, so [`bytecode`]'s contract id is unchanged.
+fn program(salt: Option<u64>) -> Vec<u8> {
     let mut a = Asm::new();
+
+    // --- salt: unique contract_id per token; dead code, never read ----------
+    if let Some(s) = salt {
+        a = a.extend([Push(s), Pop]);
+    }
 
     // --- prologue: initialize on first call ---------------------------------
     a = a.extend(load(SLOT_INIT)).ins(PushLabel("post_init")).ins(JumpI); // init!=0 -> skip
@@ -317,6 +348,42 @@ mod tests {
     fn bytecode_is_deterministic() {
         assert_eq!(bytecode(), bytecode(), "same bytes every build (stable contract id)");
         assert!(bytecode().len() < DEFAULT_GAS as usize, "fits the gas budget comfortably");
+    }
+
+    /// A launchpad deploys one curve per token from ONE wallet. `contract_id` is
+    /// `hash(deployer ‖ code)` and `DeployContract` has no salt field, so the
+    /// salt must live in the code or the second token's deploy is rejected as
+    /// `ContractExists` and every token would share one curve.
+    #[test]
+    fn salted_bytecode_gives_each_token_its_own_contract_id() {
+        let deployer = caller(9);
+        let id = |code: &[u8]| lat_vm::contract_id(&deployer, code);
+
+        assert_eq!(bytecode_for(7), bytecode_for(7), "same salt -> same bytes (stable id)");
+        assert_ne!(id(&bytecode_for(1)), id(&bytecode_for(2)), "distinct tokens must not collide");
+        assert_ne!(id(&bytecode_for(1)), id(&bytecode()), "salted differs from unsalted");
+        assert_eq!(bytecode_for(1).len(), bytecode().len() + 10, "salt costs Push8+Pop = 10 bytes");
+    }
+
+    /// The salt is dead code: it must not perturb the curve it prefixes.
+    #[test]
+    fn salt_does_not_change_behaviour() {
+        let alice = caller(1);
+        let run = |code: &[u8]| {
+            let mut s = Storage::new();
+            let mut ok = true;
+            for amt in [10 * 100_000u64, 3 * 100_000, 25 * 100_000] {
+                let input = encode_trade(true, amt);
+                ok &= execute(code, &mut s, &alice, input, DEFAULT_GAS).is_ok();
+            }
+            (ok, view(&s), *s.get(&holdings_key(&alice)).unwrap_or(&0))
+        };
+
+        let plain = run(&bytecode());
+        assert!(plain.0, "unsalted curve accepted the trades");
+        for salt in [1u64, 42, u64::MAX] {
+            assert_eq!(run(&bytecode_for(salt)), plain, "salt {salt} altered the curve");
+        }
     }
 
     #[test]
