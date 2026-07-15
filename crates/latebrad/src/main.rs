@@ -42,6 +42,24 @@ use lat_p2p::{lock_node, serve, sync_shared, NodeState, SharedNode};
 use lat_types::Network;
 use lat_wallet::Wallet;
 
+/// **T18 — bootstrap seeds.** Public `host:port`s a fresh node dials when it has
+/// no `--peer` and no `peers.txt`. This is the difference between "join the
+/// testnet" meaning *download and run it* versus *ask a human for an IP*.
+///
+/// It matters more than it looks. Every `latebrad` derives the same deterministic
+/// genesis, so a node that finds nobody does not error — it quietly mines its own
+/// private chain and looks perfectly healthy while being alone. Nothing tells the
+/// operator. These entries are what stop that being the default experience.
+///
+/// EMPTY UNTIL REAL SEEDS EXIST. Do not invent an address here: a hardcoded host
+/// that does not answer is worse than none, because every node retries it forever.
+/// Add the seeds once they are deployed and reachable, e.g.
+/// `["seed1.latebra.network:4040", "seed2.latebra.network:4040"]`.
+///
+/// Prefer DNS names over bare IPs — a name can be repointed when a box is
+/// rebuilt, whereas a baked-in IP strands every node already in the wild.
+const BOOTSTRAP_SEEDS: &[&str] = &[];
+
 /// Fixed testnet genesis so every `latebrad` instance derives the SAME genesis
 /// block and can sync with the others. The premine goes to a well-known testnet
 /// wallet (seed below). Testnet only — a real launch sets its own genesis.
@@ -250,6 +268,27 @@ fn main() {
         let restored = n.load_peers(&peers_path);
         if restored > 0 {
             println!("  peers       : restored {restored} from {}", peers_path.display());
+        }
+
+        // T18: only fall back to the baked-in seeds when we know nobody else.
+        // A node that has been running already has peers.txt and does not need
+        // them; --peer always wins, so an operator can point at a private net.
+        // Self-addresses are filtered so a seed does not dial itself.
+        if cfg.peers.is_empty() && restored == 0 {
+            let seeds: Vec<&str> =
+                BOOTSTRAP_SEEDS.iter().copied().filter(|s| *s != public_addr).collect();
+            if seeds.is_empty() {
+                // Say so LOUDLY. Finding nobody is silent by design: this node
+                // will mine a private chain and look completely healthy doing it.
+                println!("  peers       : NONE — no --peer, no peers.txt, no bootstrap seeds");
+                println!("                This node is ALONE. It will mine its own private");
+                println!("                chain. To join a network pass --peer <host:port>.");
+            } else {
+                for s in &seeds {
+                    n.add_peer(s);
+                }
+                println!("  peers       : bootstrapping from {} seed(s): {}", seeds.len(), seeds.join(", "));
+            }
         }
     }
 
