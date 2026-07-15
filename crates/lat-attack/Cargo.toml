@@ -21,6 +21,10 @@ path = "src/main.rs"
 name = "bench"
 path = "examples/bench.rs"
 
+[[example]]
+name = "loadtest"
+path = "examples/loadtest.rs"
+
 [dependencies]
 lat-crypto.workspace = true
 lat-types.workspace = true
@@ -28,4 +32,5 @@ lat-state.workspace = true
 lat-chain.workspace = true
 lat-wallet.workspace = true
 lat-vm.workspace = true
+lat-p2p.workspace = true
 rand.workspace = true

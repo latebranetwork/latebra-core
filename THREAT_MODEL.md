@@ -87,9 +87,18 @@ Ranked by how much they matter for holding value.
      them. An operator holding seeds does not need to fake a curve — they can
      spend directly. This is testnet-only posture (as with `lat-wallet-web`);
      local signing is a prerequisite for any real value.
-7. **Rate model.** One anonymous spend per account per epoch (20 blocks); one
-   confidential/public spend per account per block. Known Zether-style tradeoffs;
-   batching is future work.
+7. **Rate model.** One anonymous spend per account per epoch (20 blocks).
+   Confidential spends are one per account per block: the solvency proof binds a
+   balance snapshot, so a second spend in the same block would prove against a
+   stale one. Known Zether-style tradeoffs; batching is future work.
+
+   **Public** spends are NOT so limited, contrary to what this said until
+   measured: the only replay rule is `nonce == account.nonce`, and a block
+   applies transactions in order, so nonces n, n+1, n+2… from one account all
+   land in the same block. Measured against a live node
+   (`cargo run --release --example loadtest -p lat-attack`): **1000 public
+   transfers from a single sender in one block** — the consensus cap, not an
+   account limit.
 8. **VM scope.** Contracts run on a simple deterministic stack VM with basic gas
    metering — adequate for the bonding-curve use case, not a general audited EVM.
 9. **Not post-quantum; the privacy guarantee has a horizon.** All of the

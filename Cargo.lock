@@ -265,6 +265,7 @@ version = "0.1.0"
 dependencies = [
  "lat-chain",
  "lat-crypto",
+ "lat-p2p",
  "lat-state",
  "lat-types",
  "lat-vm",
