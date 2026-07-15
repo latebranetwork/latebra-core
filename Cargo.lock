@@ -440,6 +440,7 @@ name = "latfun"
 version = "0.1.0"
 dependencies = [
  "lat-chain",
+ "lat-contracts",
  "lat-crypto",
  "lat-p2p",
  "lat-types",

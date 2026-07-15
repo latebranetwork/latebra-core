@@ -86,6 +86,13 @@ pub fn encode_trade(is_buy: bool, amount: u64) -> u64 {
     ((is_buy as u64) << 63) | (amount & MASK63)
 }
 
+/// Inverse of [`encode_trade`]: recover `(is_buy, amount)` from a call's input
+/// word. An indexer reading mined `CallContract` transactions uses this to see
+/// what each trade actually was.
+pub fn decode_trade(input: u64) -> (bool, u64) {
+    (input >> 63 == 1, input & MASK63)
+}
+
 /// `[Push(slot), Sload]` — push `storage[slot]`.
 fn load(slot: u64) -> Vec<lat_vm::assembler::Instr> {
     vec![Push(slot), Sload]
@@ -123,6 +130,16 @@ pub fn bytecode() -> Vec<u8> {
 /// curve can be deployed in the same breath as the token.
 pub fn bytecode_for(salt: u64) -> Vec<u8> {
     program(Some(salt))
+}
+
+/// The contract id of `creator`'s curve for `normalized_ticker` — the whole
+/// derivation in one place, so a caller never has to reassemble it.
+///
+/// Every input is public, which is the point: a trader can recompute this from
+/// the token's creator and ticker and check that the curve they are about to
+/// trade against is the real one, not a look-alike the operator points them at.
+pub fn curve_id(creator: &[u8; 32], normalized_ticker: &str) -> [u8; 32] {
+    lat_vm::contract_id(creator, &bytecode_for(ticker_salt(normalized_ticker)))
 }
 
 /// The curve salt for a normalized ticker: the first 8 bytes of a domain-tagged
@@ -378,6 +395,13 @@ mod tests {
         assert_ne!(id(&bytecode_for(1)), id(&bytecode_for(2)), "distinct tokens must not collide");
         assert_ne!(id(&bytecode_for(1)), id(&bytecode()), "salted differs from unsalted");
         assert_eq!(bytecode_for(1).len(), bytecode().len() + 10, "salt costs Push8+Pop = 10 bytes");
+    }
+
+    #[test]
+    fn decode_trade_inverts_encode_trade() {
+        for (is_buy, amount) in [(true, 0u64), (false, 1), (true, MAX_TRADE), (false, MASK63)] {
+            assert_eq!(decode_trade(encode_trade(is_buy, amount)), (is_buy, amount));
+        }
     }
 
     #[test]
