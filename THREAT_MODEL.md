@@ -73,10 +73,20 @@ Ranked by how much they matter for holding value.
    (below) have had no economic/game-theory review. The testnet genesis and
    faucet use a **well-known seed** (`0x2a…`), so testnet "value" is meaningless
    by design — this must change for any real launch (see [LAUNCH.md](LAUNCH.md)).
-6. **Launchpad curve is off-chain (beta).** In the latfun launchpad, on-chain
-   `CreateToken` and ticker uniqueness are real; the **bonding-curve pricing runs
-   off-chain** in the backend until the DVM curve contract ships (Phase 2). Do not
-   treat curve balances as on-chain funds.
+6. **Launchpad settlement is not atomic, and latfun is custodial.** The
+   bonding-curve *pricing and token accounting* are now real: each token's curve
+   is a deployed `lat-contracts` contract, trades are signed `CallContract`
+   transactions, and reserves/holdings are read from contract storage — so the
+   operator cannot fake a price or invent a holding, and only a key holder can
+   move their own tokens. Two limits remain, both material:
+   - **No atomic settlement (D4).** The VM has no value-transfer opcode, so the
+     LAT leg of a trade is a separate transfer latfun orchestrates. If it fails
+     between the two, the curve's books and the LAT diverge. The fee split
+     (dev/community treasury) is latfun bookkeeping for the same reason.
+   - **Custodial.** Callers post their *seed* to the backend, which signs for
+     them. An operator holding seeds does not need to fake a curve — they can
+     spend directly. This is testnet-only posture (as with `lat-wallet-web`);
+     local signing is a prerequisite for any real value.
 7. **Rate model.** One anonymous spend per account per epoch (20 blocks); one
    confidential/public spend per account per block. Known Zether-style tradeoffs;
    batching is future work.

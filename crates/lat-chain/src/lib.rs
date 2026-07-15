@@ -94,6 +94,29 @@ pub fn tx_fee(tx: &Transaction) -> u64 {
 /// can bloat the chain.
 pub const MAX_CONTRACT_CODE_BYTES: usize = 24 * 1024;
 
+/// Consensus cap on how many transactions one block may carry.
+///
+/// This is a **consensus rule, not miner policy** — that distinction is the
+/// whole point. Proof-of-work covers only the header, so a block costs the same
+/// to mine whether it holds one transaction or a million, while every node on
+/// the network must validate all of them. Worse, fees do not deter it: the
+/// attacker *is* the miner, so every fee they pay to stuff their own block comes
+/// straight back as coinbase. Without a rule here, one cheap block can stall the
+/// whole network (a confidential transfer costs ~5.8 ms to verify; 100k of them
+/// is minutes per node).
+///
+/// The value matches what `latebrad` already produced, so honest miners see no
+/// change — it makes an existing assumption enforceable by everyone else.
+///
+/// KNOWN CRUDENESS: a *count* cap prices a 140 µs public transfer the same as a
+/// 5.8 ms confidential one — a ~40x spread — so this bounds the worst case far
+/// more loosely than it bounds the typical one. A weight/gas-metered block limit
+/// is the correct long-term fix (it is why Ethereum meters gas rather than
+/// counting transactions). Until then this is deliberately sized so that even an
+/// all-confidential block stays inside the block interval: 1000 × 5.8 ms ≈ 5.8 s
+/// serial, ≈ 1.8 s with T12's parallel proof pre-pass, against a 3 s target.
+pub const MAX_TXS_PER_BLOCK: usize = 1000;
+
 /// Blocks between ledger snapshots (L8). Every time the active chain reaches a
 /// multiple of this height, the node persists the full ledger next to the block
 /// log so the next startup replays only the blocks after it (~25 min of blocks
@@ -440,6 +463,8 @@ pub enum ChainError {
     FeeTooLow,
     /// A contract deploy exceeds [`MAX_CONTRACT_CODE_BYTES`].
     OversizedContract,
+    /// The block carries more than [`MAX_TXS_PER_BLOCK`] transactions.
+    TooManyTxs,
     /// An anonymous transfer's ring exceeds [`MAX_RING_SIZE`].
     RingTooLarge,
 }
@@ -890,6 +915,12 @@ impl Blockchain {
         if self.tree.contains_key(&id) {
             return Ok(());
         }
+        // Same guard as apply_block, and for the same reason: reject before
+        // tx_root walks every transaction. Both paths need it — a skeleton
+        // insert is reachable from a peer's block just as apply_block is.
+        if block.txs.len() > MAX_TXS_PER_BLOCK {
+            return Err(ChainError::TooManyTxs);
+        }
         let parent = self
             .tree
             .get(&block.header.prev_hash)
@@ -1158,6 +1189,12 @@ impl Blockchain {
         }
 
         // --- structural + PoW validation against the parent ---
+        // Cheapest rejection first: bail before tx_root, which hashes every
+        // transaction in the block and is exactly the work an oversized block is
+        // trying to make us do.
+        if block.txs.len() > MAX_TXS_PER_BLOCK {
+            return Err(ChainError::TooManyTxs);
+        }
         let parent = self
             .tree
             .get(&block.header.prev_hash)
@@ -1958,6 +1995,50 @@ mod tests {
         let block = chain.mine(vec![mine_registration([7u8; 32])]);
         assert_ne!(block.header.state_root, gh.state_root, "state changed, root must too");
         chain.apply_block(&block).unwrap();
+    }
+
+    /// Proof-of-work covers the header only, so a block costs the same to mine
+    /// whether it carries one transaction or a million — while every node must
+    /// validate all of them. Fees do not deter it either: the attacker is the
+    /// miner, so the fees come back as coinbase. Only a consensus rule stops it.
+    #[test]
+    fn rejects_a_block_stuffed_past_the_tx_cap() {
+        let chain_id = SecretKey::random(&mut OsRng).public_key().to_bytes();
+        let mut chain = Blockchain::genesis(&[(chain_id, 10)], DEFAULT_DIFFICULTY);
+
+        // One transaction over the line, each individually valid.
+        let stuffing: Vec<Transaction> = (0..=MAX_TXS_PER_BLOCK)
+            .map(|i| {
+                let mut pk = [0u8; 32];
+                pk[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                mine_registration(pk)
+            })
+            .collect();
+        assert_eq!(stuffing.len(), MAX_TXS_PER_BLOCK + 1);
+
+        let mut block = chain.mine(stuffing);
+        // Re-mine so the header still satisfies PoW: the attacker can always do
+        // this, so the cap — not the PoW — must be what rejects the block.
+        let d = chain.difficulty();
+        while !meets_difficulty(&block.header.id(), d) {
+            block.header.nonce += 1;
+        }
+
+        assert_eq!(chain.apply_block(&block), Err(ChainError::TooManyTxs));
+        assert_eq!(chain.height(), 0, "the stuffed block was not adopted");
+
+        // And exactly at the cap is still fine — the rule must not cost honest
+        // miners the block they were already allowed to produce.
+        let ok: Vec<Transaction> = (0..MAX_TXS_PER_BLOCK)
+            .map(|i| {
+                let mut pk = [1u8; 32];
+                pk[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                mine_registration(pk)
+            })
+            .collect();
+        let good = chain.mine(ok);
+        assert_eq!(chain.apply_block(&good), Ok(()));
+        assert_eq!(chain.height(), 1);
     }
 
     #[test]

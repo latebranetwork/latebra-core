@@ -6,9 +6,20 @@
 //!     (tickers are unique on-chain — the chain enforces it, we just surface it),
 //!   * reads real on-chain balances for connected wallets,
 //!   * signs + submits real `CreateToken` / transfer transactions,
-//!   * keeps an off-chain store (JSON on disk) for the things that aren't on-chain:
-//!     token image/description, the bonding-curve pricing (BETA — off-chain until
-//!     the DVM curve contract lands), community chat, and governance proposals/votes.
+//!   * deploys each token's **bonding curve as a real contract** and trades it
+//!     with signed `CallContract` transactions, reading reserves and holdings back
+//!     out of contract storage — so no node (including this one) can fake a price
+//!     or invent a holding,
+//!   * keeps an off-chain store (JSON on disk) only for what genuinely isn't
+//!     on-chain: token image/description, community chat, governance
+//!     proposals/votes, and the fee split (the VM has no value-transfer opcode).
+//!
+//! ## Honest boundary
+//! Pricing and token accounting are consensus-enforced. **LAT settlement is not**:
+//! the VM cannot move value, so the LAT leg of a trade is a separate transfer and
+//! the two are not atomic. See D4 in PROJECT_CHECKPOINT.md and THREAT_MODEL §2.6.
+//! latfun is also **custodial** — callers post their seed — which is testnet-only
+//! posture, not a launch posture.
 //!
 //! Run:
 //!   latfun --node 127.0.0.1:4040 --listen 127.0.0.1:5180 --frontend latebra-launchpad/frontend
@@ -31,15 +42,27 @@ use serde::{Deserialize, Serialize};
 const LAT_TOKEN: u32 = 0;
 const NET: Network = Network::Testnet;
 
-// Bonding-curve defaults (BETA, off-chain), mirroring contracts/bonding_curve.bas.
-const VLAT0: f64 = 30.0;
-const VTOK0: f64 = 1_000_000_000.0;
-const GRADUATE_LAT: f64 = 500.0;
-const FEE_BPS: f64 = 100.0; // 1% trading fee
-// The 1% fee splits: 20% auto to the dev (creator) wallet, 80% to the community
-// treasury, which holders govern by vote.
-const DEV_SHARE: f64 = 0.20;
-const COMMUNITY_SHARE: f64 = 0.80;
+// Curve parameters live in ONE place — the deployed contract (lat-contracts).
+// latfun no longer keeps its own copy: it re-exports the contract's so a quote
+// rendered here can never drift from the price consensus will actually charge.
+use lat_contracts::bonding_curve::{Curve, GRADUATE_LAT, VTOK0};
+
+/// Base units per LAT (the ledger is 5-decimal: 1 LAT = 100_000).
+const LAT_UNITS: u64 = 100_000;
+
+// The 1% trading fee (the contract's FEE_DIVISOR) splits 50/50 between the
+// platform (whoever runs this launchpad) and the token's creator, who may do
+// whatever they like with their half.
+//
+// NB: the *split* is latfun bookkeeping. The contract deducts the fee from the
+// trade but has no opcode to pay anyone (D4), so these are running totals of
+// what WOULD be owed — nothing is transferred. See THREAT_MODEL §2.6.
+const PLATFORM_SHARE_BPS: u64 = 5_000;
+const CREATOR_SHARE_BPS: u64 = 5_000;
+// The creator takes `fee - platform_cut` rather than its own bps of the fee, so
+// the sub-base-unit remainder of the integer split lands with the creator rather
+// than evaporating. Only correct while the two shares are the whole fee:
+const _: () = assert!(PLATFORM_SHARE_BPS + CREATOR_SHARE_BPS == 10_000, "fee split must be whole");
 // A governance proposal executes once it has more YES than NO votes and at least
 // this many total votes (the community quorum).
 const QUORUM: usize = 3;
@@ -48,25 +71,49 @@ const QUORUM: usize = 3;
 // Off-chain store
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize, Deserialize, Clone)]
-struct Curve {
-    vlat: f64,
-    vtok: f64,
-    real_lat: f64,
+/// Serde mirror of the contract's [`Curve`], which is consensus-side and derives
+/// no serde. Kept as a *mirror* rather than a second implementation: all curve
+/// math runs in [`Curve`], so latfun's quotes are the contract's arithmetic to
+/// the base unit — not a float restatement that rounds differently.
+#[derive(Serialize, Deserialize, Clone, Copy)]
+struct CurveState {
+    vlat: u64,
+    vtok: u64,
+    real_lat: u64,
     graduated: bool,
 }
-impl Default for Curve {
+impl Default for CurveState {
     fn default() -> Self {
-        Curve { vlat: VLAT0, vtok: VTOK0, real_lat: 0.0, graduated: false }
+        Curve::default().into()
     }
 }
-impl Curve {
-    fn price(&self) -> f64 { self.vlat / self.vtok }
-    fn market_cap(&self) -> f64 { self.price() * VTOK0 }
+impl From<Curve> for CurveState {
+    fn from(c: Curve) -> Self {
+        CurveState { vlat: c.vlat, vtok: c.vtok, real_lat: c.real_lat, graduated: c.graduated }
+    }
+}
+impl From<CurveState> for Curve {
+    fn from(c: CurveState) -> Self {
+        Curve { vlat: c.vlat, vtok: c.vtok, real_lat: c.real_lat, graduated: c.graduated }
+    }
+}
+impl CurveState {
+    /// Spot price in LAT per token (display only — never fed back into math).
+    fn price(&self) -> f64 {
+        Curve::from(*self).price_scaled() as f64 / 1e9 / LAT_UNITS as f64
+    }
+    fn market_cap(&self) -> f64 {
+        self.price() * VTOK0 as f64
+    }
+    /// Progress toward graduation, 0..=100 (display only).
+    fn progress(&self) -> f64 {
+        Curve::from(*self).graduation_bps() as f64 / 100.0
+    }
 }
 
+/// One recorded trade. `lat` and `tok` are **base units**, matching the contract.
 #[derive(Serialize, Deserialize, Clone)]
-struct Trade { kind: String, user: String, lat: f64, tok: f64, time: u64 }
+struct Trade { kind: String, user: String, lat: u64, tok: u64, time: u64 }
 
 #[derive(Serialize, Deserialize, Clone)]
 struct ChatMsg { user: String, text: String, time: u64 }
@@ -75,13 +122,13 @@ struct ChatMsg { user: String, text: String, time: u64 }
 struct Proposal {
     id: u64,
     /// What to change: "name" | "ticker" | "image" | "banner" | "description" |
-    /// "twitter" | "telegram" | "website" | "treasury" (spend LAT).
+    /// "twitter" | "telegram" | "website".
+    ///
+    /// There is no "treasury" kind: the 50/50 platform/creator split funds no
+    /// community pot, so there is nothing for holders to vote to spend.
     kind: String,
-    /// Proposed new value, or the purpose/recipient for a treasury spend.
+    /// Proposed new value.
     text: String,
-    /// For a "treasury" proposal: LAT to release from the community treasury.
-    #[serde(default)]
-    amount: f64,
     proposer: String,
     time: u64,
     yes: Vec<String>,  // voter addresses
@@ -112,23 +159,28 @@ struct TokenMeta {
     supply: u64,
     token_id: u32,      // on-chain sequential id (assigned by replay order)
     created_at: u64,
-    curve: Curve,
-    /// Off-chain fee accounting (BETA): 80% of each 1% fee accrues here for the
-    /// community to govern; 20% is auto-credited to the dev below.
+    curve: CurveState,
+    /// Off-chain fee accounting (base units). Each 1% trade fee splits 50/50:
+    /// half to the platform, half to this token's creator. The contract deducts
+    /// the fee but cannot pay it out (no value-transfer opcode), so these are
+    /// what WOULD be owed, not balances — see THREAT_MODEL §2.6.
     #[serde(default)]
-    community_treasury: f64,
+    platform_fees: u64,
     #[serde(default)]
-    dev_fees: f64,
+    creator_fees: u64,
     #[serde(default)]
     trades: Vec<Trade>,
+    /// Spot price samples, as the contract's scaled integer (`price_scaled`).
     #[serde(default)]
-    price_history: Vec<f64>,
+    price_history: Vec<u64>,
     #[serde(default)]
     chat: Vec<ChatMsg>,
     #[serde(default)]
     proposals: Vec<Proposal>,
+    /// address -> token balance in base units. Mirrors the curve contract's
+    /// holdings slot; the contract is authoritative once a curve is deployed.
     #[serde(default)]
-    holdings: HashMap<String, f64>, // address -> token balance (BETA curve accounting)
+    holdings: HashMap<String, u64>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -152,6 +204,66 @@ struct App {
 
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Render base units as a human LAT string (the ledger is 5-decimal). Display
+/// only — base units are what cross the API and the curve.
+fn lat(units: u64) -> String {
+    format!("{}.{:05}", units / LAT_UNITS, units % LAT_UNITS)
+}
+
+/// Inverse of [`hex_id`]: decode a 32-byte account id from hex.
+fn account_id(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Read a token's curve straight from the chain's contract storage — the
+/// authoritative state, as consensus applied it. `None` if the curve isn't
+/// deployed yet or the node is unreachable.
+///
+/// This is what makes the curve checkable: the numbers come from the ledger, not
+/// from latfun's JSON, so the operator cannot quote a price the chain disagrees
+/// with. Slot 4 (`SLOT_INIT`) is 0 until the first trade initializes the
+/// reserves, in which case the contract is deployed but still at its defaults.
+fn read_curve(node: &str, contract: [u8; 32]) -> Option<Curve> {
+    use lat_contracts::bonding_curve::{SLOT_GRADUATED, SLOT_INIT, SLOT_REAL_LAT, SLOT_VLAT, SLOT_VTOK};
+    let slot = |k: u64| lat_p2p::get_contract_storage(node, contract, k).ok();
+    if slot(SLOT_INIT)? == 0 {
+        // Deployed but never traded: the contract initializes on first call, so
+        // its storage is empty and the defaults are the honest answer.
+        return Some(Curve::default());
+    }
+    Some(Curve {
+        vlat: slot(SLOT_VLAT)?,
+        vtok: slot(SLOT_VTOK)?,
+        real_lat: slot(SLOT_REAL_LAT)?,
+        graduated: slot(SLOT_GRADUATED)? != 0,
+    })
+}
+
+/// Read one account's on-chain holdings of a token's curve.
+fn read_holdings(node: &str, contract: [u8; 32], who: &[u8; 32]) -> Option<u64> {
+    lat_p2p::get_contract_storage(node, contract, lat_contracts::bonding_curve::holdings_key(who)).ok()
+}
+
+/// Which indexed token, if any, owns `contract` as its curve.
+///
+/// Derived rather than stored: a curve id is `hash(creator ‖ salted code)`, so
+/// recomputing it per token is the same check a trader would run. Contracts the
+/// launchpad didn't deploy simply don't match, which is what keeps an unrelated
+/// contract from being indexed as somebody's curve.
+fn curve_owner(s: &Store, contract: &[u8; 32]) -> Option<String> {
+    s.tokens.iter().find_map(|(norm, t)| {
+        let creator = account_id(&t.creator_id)?;
+        (&lat_contracts::bonding_curve::curve_id(&creator, norm) == contract).then(|| norm.clone())
+    })
 }
 
 impl App {
@@ -209,7 +321,7 @@ fn index_chain(app: &App) {
                 let creator_str = lat_crypto::PublicKey::from_bytes(creator)
                     .map(|pk| Address::new(NET, pk).encode())
                     .unwrap_or_else(|| creator_id_hex.clone());
-                let entry = s.tokens.entry(norm.clone()).or_insert_with(TokenMeta::default);
+                let entry = s.tokens.entry(norm.clone()).or_default();
                 // Only fill on first sight (an operator may have set image/desc via create()).
                 if entry.token_id == 0 {
                     entry.ticker = norm.clone();
@@ -220,9 +332,56 @@ fn index_chain(app: &App) {
                     entry.token_id = id;
                     if entry.created_at == 0 { entry.created_at = block.header.timestamp; }
                     if entry.price_history.is_empty() {
-                        entry.price_history.push(entry.curve.price());
+                        entry.price_history.push(Curve::from(entry.curve).price_scaled());
                     }
                 }
+            }
+
+            // A MINED CallContract against a token's curve is a settled trade.
+            // Recording them here rather than in the trade() endpoint is what
+            // makes the books honest: a submitted trade that the chain rejects
+            // (bad nonce, reverted by the curve) never reaches a block, so it can
+            // never reach the ledger below either.
+            if let Transaction::CallContract { contract, caller, input, .. } = tx {
+                let Some(norm) = curve_owner(&s, contract) else { continue };
+                let (is_buy, amount) = lat_contracts::bonding_curve::decode_trade(*input);
+                let Some(t) = s.tokens.get_mut(&norm) else { continue };
+
+                // Replay the trade through the contract's own math, from the
+                // state we last agreed with the chain on. The curve is
+                // deterministic and blocks arrive in order, so this tracks it
+                // exactly — and read_curve() re-anchors us to the ledger anyway.
+                let mut curve: Curve = t.curve.into();
+                let who = hex_id(caller);
+                let held = t.holdings.get(&who).copied().unwrap_or(0);
+                let Some(fill) = (if is_buy { curve.apply_buy(amount) } else { curve.apply_sell(amount, held) })
+                else {
+                    continue; // The contract reverted; consensus changed nothing.
+                };
+                if is_buy {
+                    *t.holdings.entry(who.clone()).or_insert(0) += fill.out;
+                } else {
+                    *t.holdings.entry(who.clone()).or_insert(0) -= amount;
+                }
+                t.curve = curve.into();
+
+                // 1% on both sides, as the curve computed it — never recomputed
+                // here, or the two could drift apart again. Integer split; the
+                // sub-unit remainder stays with the creator.
+                let platform_cut = fill.fee * PLATFORM_SHARE_BPS / 10_000;
+                t.platform_fees += platform_cut;
+                t.creator_fees += fill.fee - platform_cut;
+
+                t.trades.insert(0, Trade {
+                    kind: if is_buy { "buy".into() } else { "sell".into() },
+                    user: who,
+                    lat: if is_buy { amount } else { fill.out },
+                    tok: if is_buy { fill.out } else { amount },
+                    time: block.header.timestamp,
+                });
+                if t.trades.len() > 200 { t.trades.truncate(200); }
+                t.price_history.push(curve.price_scaled());
+                if t.price_history.len() > 200 { t.price_history.remove(0); }
             }
         }
         s.scanned_height = h;
@@ -441,7 +600,9 @@ fn api(app: &App, req: &Req) -> (&'static str, String) {
     match (req.method.as_str(), seg.as_slice()) {
         ("GET", ["status"]) => ok(status_json(app)),
         ("GET", ["tokens"]) => ok(tokens_json(app)),
-        ("GET", ["token", ticker]) => token_detail(app, ticker),
+        ("GET", ["token", ticker]) => {
+            token_detail(app, ticker, req.query.get("id").map(String::as_str).unwrap_or(""))
+        }
         ("GET", ["balance"]) => balance_json(app, req.query.get("addr").map(String::as_str).unwrap_or("")),
         ("POST", ["connect"]) => connect(app, &body),
         ("POST", ["create"]) => create_token(app, &body),
@@ -474,13 +635,21 @@ fn status_json(app: &App) -> serde_json::Value {
         "indexed": s.scanned_height,
         "tokens": s.tokens.len(),
         "graduate_lat": GRADUATE_LAT,
-        "fee_bps": FEE_BPS,
+        "fee_bps": 10_000 / lat_contracts::bonding_curve::FEE_DIVISOR,
     })
 }
 
+/// The launched coins.
+///
+/// Only tokens the indexer has SEEN MINE are listed. `token_id` is assigned by
+/// replay of an accepted on-chain `CreateToken`, so `token_id == 0` means "we
+/// stashed this creator's metadata but the chain never took the token" — a
+/// rejected or still-pending launch. Listing those put coins in the grid that do
+/// not exist on-chain, at 0% and indistinguishable from real ones.
 fn tokens_json(app: &App) -> serde_json::Value {
     let s = app.store.lock().unwrap();
-    let mut list: Vec<serde_json::Value> = s.tokens.values().map(token_summary).collect();
+    let mut list: Vec<serde_json::Value> =
+        s.tokens.values().filter(|t| t.token_id != 0).map(token_summary).collect();
     // newest first
     list.sort_by(|a, b| b["created_at"].as_u64().unwrap_or(0).cmp(&a["created_at"].as_u64().unwrap_or(0)));
     serde_json::json!({ "ok": true, "tokens": list })
@@ -506,13 +675,13 @@ fn token_summary(t: &TokenMeta) -> serde_json::Value {
         "market_cap": t.curve.market_cap(),
         "real_lat": t.curve.real_lat,
         "graduated": t.curve.graduated,
-        "progress": (t.curve.real_lat / GRADUATE_LAT * 100.0).min(100.0),
+        "progress": t.curve.progress(),
         "trades": t.trades.len(),
         "replies": t.chat.len(),
     })
 }
 
-fn token_detail(app: &App, ticker: &str) -> (&'static str, String) {
+fn token_detail(app: &App, ticker: &str, viewer_id: &str) -> (&'static str, String) {
     let norm = match lat_types::normalize_ticker(ticker) {
         Some(t) => t,
         None => return err("bad ticker"),
@@ -529,9 +698,17 @@ fn token_detail(app: &App, ticker: &str) -> (&'static str, String) {
             "created_at": t.created_at,
             "price": t.curve.price(), "market_cap": t.curve.market_cap(),
             "real_lat": t.curve.real_lat, "graduated": t.curve.graduated,
-            "progress": (t.curve.real_lat / GRADUATE_LAT * 100.0).min(100.0),
+            "progress": t.curve.progress(),
             "vlat": t.curve.vlat, "vtok": t.curve.vtok,
-            "community_treasury": t.community_treasury, "dev_fees": t.dev_fees,
+            "platform_fees": t.platform_fees, "creator_fees": t.creator_fees,
+            // The curve's contract id, derived from (creator, ticker) — both
+            // public. Surfaced so a client can recompute it and confirm it is
+            // trading the real curve rather than one this server points it at.
+            "curve_id": account_id(&t.creator_id)
+                .map(|c| hex_id(&lat_contracts::bonding_curve::curve_id(&c, &t.ticker))),
+            // The viewer's own position, keyed by account id (the contract's
+            // CALLER), not by address.
+            "holdings_self": t.holdings.get(viewer_id).copied().unwrap_or(0),
             "quorum": QUORUM,
             "price_history": t.price_history,
             "trades": t.trades,
@@ -577,6 +754,10 @@ fn connect(app: &App, body: &serde_json::Value) -> (&'static str, String) {
     }
     ok(serde_json::json!({
         "ok": true, "address": addr, "registered": registered,
+        // Holdings are keyed by account id (that is what the contract's CALLER
+        // is), not by the bech32 address — a client needs this to look its own
+        // position up.
+        "id": hex_id(&w.id()),
         "public_lat": public, "note": note,
     }))
 }
@@ -620,6 +801,31 @@ fn create_token(app: &App, body: &serde_json::Value) -> (&'static str, String) {
         }
         Err(_) => return err("node offline"),
     }
+    // Refuse early if the flat fees can't be paid.
+    //
+    // `submit_tx` returning true only means the MEMPOOL took it — the ledger
+    // re-checks at apply time and silently drops what it rejects. Without this,
+    // an under-funded creator got "Token submitted on-chain!" and then nothing,
+    // forever, with no way to tell a slow block from a dead transaction.
+    //
+    // The trap this catches is specific: MINING REWARDS ARE NOT PUBLIC LAT.
+    // reward_miner credits the confidential balance (an unblinded `mint`
+    // ciphertext), while CreateToken/DeployContract need FLAT_TX_FEE from the
+    // *public* balance — so a miner with thousands of LAT reads as broke here
+    // and must unshield first. Nothing else in the UI would ever tell them.
+    let need = lat_state::FLAT_TX_FEE * 2; // CreateToken + the curve's DeployContract
+    match lat_p2p::get_public_balance(&app.node, w.id(), LAT_TOKEN) {
+        Ok(Some(bal)) if bal >= need => {}
+        Ok(_) => {
+            return err(&format!(
+                "not enough public LAT for the fees (need {}, flat fee per tx is {}). \
+                 Mining rewards land in your CONFIDENTIAL balance — unshield some first.",
+                lat(need),
+                lat(lat_state::FLAT_TX_FEE)
+            ))
+        }
+        Err(_) => return err("node offline"),
+    }
     // Build + submit the real on-chain CreateToken.
     let tx = w.create_token(&norm, supply);
     match lat_p2p::submit_tx(&app.node, &tx.encode()) {
@@ -627,11 +833,27 @@ fn create_token(app: &App, body: &serde_json::Value) -> (&'static str, String) {
         Ok(false) => return err("node rejected the token (ticker taken or duplicate in mempool)"),
         Err(_) => return err("node offline"),
     }
+    // Deploy this token's curve in the same breath. The creator deploys it (they
+    // are already paying fees here and hold the key), salted by ticker so it gets
+    // its own instance — see bonding_curve::bytecode_for. The id is derivable from
+    // (creator, ticker), both public, so anyone can verify the curve later.
+    //
+    // Independent of the CreateToken above: DeployContract does not reference the
+    // token, so mempool ordering between the two does not matter. A rejection here
+    // is not fatal to the token — the curve can be re-deployed — so it is reported
+    // rather than unwound (there is no way to unwind a submitted tx anyway).
+    let curve_code = lat_contracts::bonding_curve::bytecode_for(
+        lat_contracts::bonding_curve::ticker_salt(&norm),
+    );
+    let curve_deployed = matches!(
+        lat_p2p::submit_tx(&app.node, &w.deploy_contract(curve_code).encode()),
+        Ok(true)
+    );
     // Stash the off-chain metadata now, keyed by ticker; the indexer fills token_id
     // once it's mined.
     {
         let mut s = app.store.lock().unwrap();
-        let entry = s.tokens.entry(norm.clone()).or_insert_with(TokenMeta::default);
+        let entry = s.tokens.entry(norm.clone()).or_default();
         entry.ticker = norm.clone();
         entry.name = name;
         entry.description = description;
@@ -644,76 +866,130 @@ fn create_token(app: &App, body: &serde_json::Value) -> (&'static str, String) {
         entry.creator_id = hex_id(&w.id());
         entry.supply = supply;
         if entry.created_at == 0 { entry.created_at = now(); }
-        if entry.price_history.is_empty() { entry.price_history.push(entry.curve.price()); }
+        if entry.price_history.is_empty() { entry.price_history.push(Curve::from(entry.curve).price_scaled()); }
         let snap = clone_store(&s);
         drop(s);
         app.save(&snap);
     }
-    ok(serde_json::json!({ "ok": true, "ticker": norm, "note": "Token submitted on-chain — it appears once the next block mines." }))
+    let note = if curve_deployed {
+        "Token + bonding curve submitted on-chain — they appear once the next block mines."
+    } else {
+        "Token submitted on-chain, but the node rejected its curve — trading stays off-chain until it deploys."
+    };
+    ok(serde_json::json!({
+        "ok": true,
+        "ticker": norm,
+        "curve_deployed": curve_deployed,
+        "curve_id": hex_id(&lat_contracts::bonding_curve::curve_id(&w.id(), &norm)),
+        "note": note,
+    }))
 }
 
-/// Bonding-curve buy/sell — BETA, off-chain accounting against the virtual curve.
-/// Real on-chain LAT movement lands when the DVM curve contract is deployed.
+/// Bonding-curve buy/sell — a real on-chain `CallContract` against the token's
+/// deployed curve.
+///
+/// `amount` is **base units** (LAT in for a buy, whole tokens for a sell).
+///
+/// Three things changed when this stopped being JSON arithmetic:
+///
+/// 1. **It is authenticated.** The old endpoint took an `address` STRING and no
+///    proof, so any HTTP client could trade as anyone and sell someone else's
+///    holdings. A `CallContract` is signed, and the contract keys holdings by
+///    `CALLER`, so only the key holder can move their tokens — consensus enforces
+///    it, not latfun.
+/// 2. **It is asynchronous.** The trade is a transaction: it lands in the mempool
+///    and only takes effect when a block mines (~3s). This returns the expected
+///    result as a *quote* and `pending: true`; callers re-read the token to see
+///    the settled state.
+/// 3. **latfun is no longer authoritative.** Reserves and holdings are read from
+///    contract storage, not the local store. The operator cannot fake a price.
+///
+/// Still true (D4): the VM cannot move LAT, so this settles token accounting
+/// only — the LAT leg is a separate transfer and the two are not atomic. See
+/// THREAT_MODEL §2.6.
 fn trade(app: &App, body: &serde_json::Value) -> (&'static str, String) {
     let ticker = body["ticker"].as_str().unwrap_or("");
     let side = body["side"].as_str().unwrap_or("buy");
-    let amount = body["amount"].as_f64().unwrap_or(0.0);
-    let user = body["address"].as_str().unwrap_or("anon").to_string();
+    let amount = body["amount"].as_u64().unwrap_or(0);
+    let seed = body["seed"].as_str().unwrap_or("");
     let norm = match lat_types::normalize_ticker(ticker) {
         Some(t) => t,
         None => return err("bad ticker"),
     };
-    if amount <= 0.0 { return err("amount must be positive"); }
-
-    let mut s = app.store.lock().unwrap();
-    let Some(t) = s.tokens.get_mut(&norm) else { return err("no such token") };
-    if t.curve.graduated { return err("token graduated — trade on the DEX (coming soon)"); }
-
-    let (out, note);
-    let fee;
-    if side == "buy" {
-        fee = amount * FEE_BPS / 10000.0;
-        let net = amount - fee;
-        let tok = (t.curve.vtok * net) / (t.curve.vlat + net);
-        t.curve.vlat += net; t.curve.vtok -= tok; t.curve.real_lat += net;
-        *t.holdings.entry(user.clone()).or_insert(0.0) += tok;
-        out = tok;
-        note = format!("bought {:.0} {}", tok, t.ticker);
-    } else {
-        let have = *t.holdings.get(&user).unwrap_or(&0.0);
-        if amount > have + 1e-9 { return err("you don't hold that many tokens"); }
-        let gross = (t.curve.vlat * amount) / (t.curve.vtok + amount);
-        fee = gross * FEE_BPS / 10000.0;
-        let lat = gross - fee;
-        t.curve.vtok += amount; t.curve.vlat -= gross; t.curve.real_lat = (t.curve.real_lat - gross).max(0.0);
-        *t.holdings.entry(user.clone()).or_insert(0.0) -= amount;
-        out = lat;
-        note = format!("sold {:.0} {}", amount, t.ticker);
+    if amount == 0 {
+        return err("amount must be positive (base units)");
     }
-    // Split the fee: 20% auto to the dev wallet, 80% to the community treasury.
-    t.dev_fees += fee * DEV_SHARE;
-    t.community_treasury += fee * COMMUNITY_SHARE;
-    t.trades.insert(0, Trade {
-        kind: side.to_string(), user: user.clone(),
-        lat: if side == "buy" { amount } else { out },
-        tok: if side == "buy" { out } else { amount },
-        time: now(),
-    });
-    if t.trades.len() > 200 { t.trades.truncate(200); }
-    t.price_history.push(t.curve.price());
-    if t.price_history.len() > 200 { t.price_history.remove(0); }
-    if t.curve.real_lat >= GRADUATE_LAT { t.curve.graduated = true; }
+    let w = match Wallet::from_seed_hex(NET, seed) {
+        Ok(w) => w,
+        Err(_) => return err("connect a wallet first"),
+    };
 
-    let holding = *t.holdings.get(&user).unwrap_or(&0.0);
-    let resp = serde_json::json!({
-        "ok": true, "out": out, "note": note,
-        "price": t.curve.price(), "market_cap": t.curve.market_cap(),
-        "holding": holding, "progress": (t.curve.real_lat / GRADUATE_LAT * 100.0).min(100.0),
-    });
-    let snap = clone_store(&s);
-    drop(s);
-    app.save(&snap);
-    ok(resp)
+    // Derive the curve from public data (creator + ticker) — never from a
+    // client-supplied id, or the caller could point us at their own contract.
+    let creator_hex = {
+        let s = app.store.lock().unwrap();
+        let Some(t) = s.tokens.get(&norm) else { return err("no such token") };
+        t.creator_id.clone()
+    };
+    let Some(creator) = account_id(&creator_hex) else {
+        return err("that token hasn't mined yet — wait for the next block");
+    };
+    let contract = lat_contracts::bonding_curve::curve_id(&creator, &norm);
+
+    // Authoritative state: the ledger's, not ours.
+    let Some(mut curve) = read_curve(&app.node, contract) else {
+        return err("the curve isn't on-chain yet (or the node is offline) — retry shortly");
+    };
+    if curve.graduated {
+        return err("token graduated — trade on the DEX (coming soon)");
+    }
+    let held = read_holdings(&app.node, contract, &w.id()).unwrap_or(0);
+
+    // Dry-run the contract's own math so a doomed trade costs no transaction, and
+    // so we can quote what it will produce. The chain re-runs this for real.
+    let is_buy = side == "buy";
+    let quote = if is_buy { curve.apply_buy(amount) } else { curve.apply_sell(amount, held) };
+    let Some(fill) = quote else {
+        return err(if !is_buy && amount > held {
+            "you don't hold that many tokens"
+        } else {
+            "the curve would reject that trade (zero, or above MAX_TRADE)"
+        });
+    };
+
+    let nonce = match lat_p2p::get_nonce(&app.node, w.id()) {
+        Ok(Some(n)) => n,
+        Ok(None) => {
+            let _ = lat_p2p::submit_tx(&app.node, &w.registration_tx().encode());
+            return err("your account isn't registered yet — registering now, retry in a few seconds");
+        }
+        Err(_) => return err("node offline"),
+    };
+    let input = lat_contracts::bonding_curve::encode_trade(is_buy, amount);
+    match lat_p2p::submit_tx(&app.node, &w.call_contract(contract, input, nonce).encode()) {
+        Ok(true) => {}
+        Ok(false) => return err("the node rejected the trade (duplicate nonce, or too little LAT for the fee)"),
+        Err(_) => return err("node offline"),
+    }
+
+    let note = if is_buy {
+        format!("buying ~{} {norm} for {} LAT — confirms in a block", fill.out, lat(amount))
+    } else {
+        format!("selling {amount} {norm} for ~{} LAT — confirms in a block", lat(fill.out))
+    };
+    // Quoted, not settled: these are what the curve WILL produce if this trade is
+    // the next one to touch it. Another trade mining first re-prices it.
+    ok(serde_json::json!({
+        "ok": true,
+        "pending": true,
+        "quoted_out": fill.out,
+        "quoted_fee": fill.fee,
+        "note": note,
+        "curve_id": hex_id(&contract),
+        "price": CurveState::from(curve).price(),
+        "market_cap": CurveState::from(curve).market_cap(),
+        "progress": CurveState::from(curve).progress(),
+    }))
 }
 
 fn post_chat(app: &App, ticker: &str, body: &serde_json::Value) -> (&'static str, String) {
@@ -737,16 +1013,17 @@ fn post_proposal(app: &App, ticker: &str, body: &serde_json::Value) -> (&'static
     let proposer = body["address"].as_str().unwrap_or("").to_string();
     let kind = body["kind"].as_str().unwrap_or("other").to_string();
     let text = body["text"].as_str().unwrap_or("").trim().to_string();
-    let amount = body["amount"].as_f64().unwrap_or(0.0);
     if proposer.is_empty() { return err("connect a wallet to propose"); }
     if text.is_empty() || text.len() > 200 { return err("proposal must be 1-200 chars"); }
-    if kind == "treasury" && amount <= 0.0 { return err("treasury spend needs a positive LAT amount"); }
+    if kind == "treasury" {
+        return err("treasury proposals are gone — fees split 50/50 platform/creator, so there is no community pot to spend");
+    }
     let norm = match lat_types::normalize_ticker(ticker) { Some(t) => t, None => return err("bad ticker") };
     let mut s = app.store.lock().unwrap();
     let pid = s.next_proposal; s.next_proposal += 1;
     let Some(t) = s.tokens.get_mut(&norm) else { return err("no such token") };
     t.proposals.insert(0, Proposal {
-        id: pid, kind, text, amount, proposer: proposer.clone(), time: now(),
+        id: pid, kind, text, proposer: proposer.clone(), time: now(),
         yes: vec![proposer], no: vec![], status: "open".into(),
     });
     let props = serde_json::to_value(&t.proposals).unwrap_or(serde_json::Value::Null);
@@ -774,9 +1051,9 @@ fn vote(app: &App, ticker: &str, body: &serde_json::Value) -> (&'static str, Str
     let mut executed = String::new();
     if yes + no >= QUORUM {
         if yes > no {
-            let (kind, text, amount) = (p.kind.clone(), p.text.clone(), p.amount);
+            let (kind, text) = (p.kind.clone(), p.text.clone());
             p.status = "executed".into();
-            executed = execute_proposal(t, &kind, &text, amount);
+            executed = execute_proposal(t, &kind, &text);
         } else {
             p.status = "rejected".into();
         }
@@ -789,9 +1066,14 @@ fn vote(app: &App, ticker: &str, body: &serde_json::Value) -> (&'static str, Str
 }
 
 /// Apply an approved proposal to the token. Field changes update the off-chain
-/// display metadata (the on-chain ticker/id are immutable); a "treasury" proposal
-/// releases LAT from the community treasury. Returns a human-readable note.
-fn execute_proposal(t: &mut TokenMeta, kind: &str, text: &str, amount: f64) -> String {
+/// display metadata (the on-chain ticker/id are immutable). Returns a
+/// human-readable note.
+///
+/// The "treasury" kind is GONE: it released LAT from the community treasury, and
+/// the fee split no longer funds one (50/50 platform/creator). A proposal type
+/// that can only ever spend zero is worse than no proposal type — it looks like
+/// governance while doing nothing.
+fn execute_proposal(t: &mut TokenMeta, kind: &str, text: &str) -> String {
     match kind {
         "name" => { t.name = text.to_string(); format!("renamed to {text}") }
         "ticker" => { t.display_ticker = text.to_string(); format!("display ticker → {text}") }
@@ -801,11 +1083,6 @@ fn execute_proposal(t: &mut TokenMeta, kind: &str, text: &str, amount: f64) -> S
         "twitter" => { t.twitter = text.to_string(); "twitter updated".into() }
         "telegram" => { t.telegram = text.to_string(); "telegram updated".into() }
         "website" => { t.website = text.to_string(); "website updated".into() }
-        "treasury" => {
-            let spend = amount.min(t.community_treasury);
-            t.community_treasury -= spend;
-            format!("released {spend:.4} LAT from the treasury: {text}")
-        }
         _ => "approved".into(),
     }
 }
