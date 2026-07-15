@@ -255,7 +255,8 @@ a throwaway seed holding nothing.
 token accounting are consensus-enforced* — no node, including yours, can fake a
 price or invent a holding. But the VM has no value-transfer opcode (**D4**), so a
 buy debits nobody: it costs only the transaction fee. The fee tallies
-(`platform_fees` / `creator_fees`, 50/50) are totals **owed**, not balances —
+(`creator_fees` — the whole 1%, and the platform takes no cut) are totals
+**owed**, not balances —
 nothing is ever paid out. This is a working demonstration of an on-chain curve,
 not a market. Do not present it as one.
 

@@ -12,7 +12,7 @@
 //!     or invent a holding,
 //!   * keeps an off-chain store (JSON on disk) only for what genuinely isn't
 //!     on-chain: token image/description, community chat, governance
-//!     proposals/votes, and the fee split (the VM has no value-transfer opcode).
+//!     proposals/votes, and the creator's fee tally (the VM cannot pay it out).
 //!
 //! ## Honest boundary
 //! Pricing and token accounting are consensus-enforced. **LAT settlement is not**:
@@ -50,19 +50,14 @@ use lat_contracts::bonding_curve::{Curve, GRADUATE_LAT, VTOK0};
 /// Base units per LAT (the ledger is 5-decimal: 1 LAT = 100_000).
 const LAT_UNITS: u64 = 100_000;
 
-// The 1% trading fee (the contract's FEE_DIVISOR) splits 50/50 between the
-// platform (whoever runs this launchpad) and the token's creator, who may do
-// whatever they like with their half.
+// The 1% trading fee (the contract's FEE_DIVISOR) goes ENTIRELY to the token's
+// creator. The platform takes nothing — there is no operator cut to account for,
+// so there is no split, no remainder rule, and no platform address to configure.
 //
-// NB: the *split* is latfun bookkeeping. The contract deducts the fee from the
-// trade but has no opcode to pay anyone (D4), so these are running totals of
-// what WOULD be owed — nothing is transferred. See THREAT_MODEL §2.6.
-const PLATFORM_SHARE_BPS: u64 = 5_000;
-const CREATOR_SHARE_BPS: u64 = 5_000;
-// The creator takes `fee - platform_cut` rather than its own bps of the fee, so
-// the sub-base-unit remainder of the integer split lands with the creator rather
-// than evaporating. Only correct while the two shares are the whole fee:
-const _: () = assert!(PLATFORM_SHARE_BPS + CREATOR_SHARE_BPS == 10_000, "fee split must be whole");
+// NB: this is still latfun bookkeeping. The contract deducts the fee from the
+// trade but has no opcode to pay anyone (D4), so `creator_fees` is a running
+// total of what WOULD be owed — nothing is transferred. See THREAT_MODEL §2.6.
+
 // A governance proposal executes once it has more YES than NO votes and at least
 // this many total votes (the community quorum).
 const QUORUM: usize = 3;
@@ -124,8 +119,8 @@ struct Proposal {
     /// What to change: "name" | "ticker" | "image" | "banner" | "description" |
     /// "twitter" | "telegram" | "website".
     ///
-    /// There is no "treasury" kind: the 50/50 platform/creator split funds no
-    /// community pot, so there is nothing for holders to vote to spend.
+    /// There is no "treasury" kind: the whole fee goes to the creator, so no
+    /// community pot exists for holders to vote to spend.
     kind: String,
     /// Proposed new value.
     text: String,
@@ -160,12 +155,10 @@ struct TokenMeta {
     token_id: u32,      // on-chain sequential id (assigned by replay order)
     created_at: u64,
     curve: CurveState,
-    /// Off-chain fee accounting (base units). Each 1% trade fee splits 50/50:
-    /// half to the platform, half to this token's creator. The contract deducts
-    /// the fee but cannot pay it out (no value-transfer opcode), so these are
-    /// what WOULD be owed, not balances — see THREAT_MODEL §2.6.
-    #[serde(default)]
-    platform_fees: u64,
+    /// Off-chain fee accounting (base units): the whole 1% trade fee, owed to
+    /// this token's creator. The contract deducts the fee but cannot pay it out
+    /// (no value-transfer opcode), so this is what WOULD be owed, not a balance
+    /// — see THREAT_MODEL §2.6.
     #[serde(default)]
     creator_fees: u64,
     #[serde(default)]
@@ -366,11 +359,9 @@ fn index_chain(app: &App) {
                 t.curve = curve.into();
 
                 // 1% on both sides, as the curve computed it — never recomputed
-                // here, or the two could drift apart again. Integer split; the
-                // sub-unit remainder stays with the creator.
-                let platform_cut = fill.fee * PLATFORM_SHARE_BPS / 10_000;
-                t.platform_fees += platform_cut;
-                t.creator_fees += fill.fee - platform_cut;
+                // here, or the two could drift apart again. All of it is the
+                // creator's; the platform takes no cut.
+                t.creator_fees += fill.fee;
 
                 t.trades.insert(0, Trade {
                     kind: if is_buy { "buy".into() } else { "sell".into() },
@@ -700,7 +691,7 @@ fn token_detail(app: &App, ticker: &str, viewer_id: &str) -> (&'static str, Stri
             "real_lat": t.curve.real_lat, "graduated": t.curve.graduated,
             "progress": t.curve.progress(),
             "vlat": t.curve.vlat, "vtok": t.curve.vtok,
-            "platform_fees": t.platform_fees, "creator_fees": t.creator_fees,
+            "creator_fees": t.creator_fees,
             // The curve's contract id, derived from (creator, ticker) — both
             // public. Surfaced so a client can recompute it and confirm it is
             // trading the real curve rather than one this server points it at.
@@ -1016,7 +1007,7 @@ fn post_proposal(app: &App, ticker: &str, body: &serde_json::Value) -> (&'static
     if proposer.is_empty() { return err("connect a wallet to propose"); }
     if text.is_empty() || text.len() > 200 { return err("proposal must be 1-200 chars"); }
     if kind == "treasury" {
-        return err("treasury proposals are gone — fees split 50/50 platform/creator, so there is no community pot to spend");
+        return err("treasury proposals are gone — the whole fee goes to the creator, so there is no community pot to spend");
     }
     let norm = match lat_types::normalize_ticker(ticker) { Some(t) => t, None => return err("bad ticker") };
     let mut s = app.store.lock().unwrap();
