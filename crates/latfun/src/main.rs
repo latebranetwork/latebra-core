@@ -31,15 +31,20 @@ use serde::{Deserialize, Serialize};
 const LAT_TOKEN: u32 = 0;
 const NET: Network = Network::Testnet;
 
-// Bonding-curve defaults (BETA, off-chain), mirroring contracts/bonding_curve.bas.
-const VLAT0: f64 = 30.0;
-const VTOK0: f64 = 1_000_000_000.0;
-const GRADUATE_LAT: f64 = 500.0;
-const FEE_BPS: f64 = 100.0; // 1% trading fee
-// The 1% fee splits: 20% auto to the dev (creator) wallet, 80% to the community
-// treasury, which holders govern by vote.
-const DEV_SHARE: f64 = 0.20;
-const COMMUNITY_SHARE: f64 = 0.80;
+// Curve parameters live in ONE place — the deployed contract (lat-contracts).
+// latfun no longer keeps its own copy: it re-exports the contract's so a quote
+// rendered here can never drift from the price consensus will actually charge.
+use lat_contracts::bonding_curve::{Curve, GRADUATE_LAT, VTOK0};
+
+/// Base units per LAT (the ledger is 5-decimal: 1 LAT = 100_000).
+const LAT_UNITS: u64 = 100_000;
+
+// The 1% trading fee (the contract's FEE_DIVISOR) splits 20% to the dev
+// (creator) wallet, 80% to the community treasury, which holders govern by vote.
+// NB: the *split* is latfun bookkeeping — the contract deducts the fee from the
+// trade but has no opcode to pay anyone, so this accounting stays off-chain.
+const DEV_SHARE_BPS: u64 = 2_000;
+const COMMUNITY_SHARE_BPS: u64 = 8_000;
 // A governance proposal executes once it has more YES than NO votes and at least
 // this many total votes (the community quorum).
 const QUORUM: usize = 3;
@@ -48,25 +53,49 @@ const QUORUM: usize = 3;
 // Off-chain store
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize, Deserialize, Clone)]
-struct Curve {
-    vlat: f64,
-    vtok: f64,
-    real_lat: f64,
+/// Serde mirror of the contract's [`Curve`], which is consensus-side and derives
+/// no serde. Kept as a *mirror* rather than a second implementation: all curve
+/// math runs in [`Curve`], so latfun's quotes are the contract's arithmetic to
+/// the base unit — not a float restatement that rounds differently.
+#[derive(Serialize, Deserialize, Clone, Copy)]
+struct CurveState {
+    vlat: u64,
+    vtok: u64,
+    real_lat: u64,
     graduated: bool,
 }
-impl Default for Curve {
+impl Default for CurveState {
     fn default() -> Self {
-        Curve { vlat: VLAT0, vtok: VTOK0, real_lat: 0.0, graduated: false }
+        Curve::default().into()
     }
 }
-impl Curve {
-    fn price(&self) -> f64 { self.vlat / self.vtok }
-    fn market_cap(&self) -> f64 { self.price() * VTOK0 }
+impl From<Curve> for CurveState {
+    fn from(c: Curve) -> Self {
+        CurveState { vlat: c.vlat, vtok: c.vtok, real_lat: c.real_lat, graduated: c.graduated }
+    }
+}
+impl From<CurveState> for Curve {
+    fn from(c: CurveState) -> Self {
+        Curve { vlat: c.vlat, vtok: c.vtok, real_lat: c.real_lat, graduated: c.graduated }
+    }
+}
+impl CurveState {
+    /// Spot price in LAT per token (display only — never fed back into math).
+    fn price(&self) -> f64 {
+        Curve::from(*self).price_scaled() as f64 / 1e9 / LAT_UNITS as f64
+    }
+    fn market_cap(&self) -> f64 {
+        self.price() * VTOK0 as f64
+    }
+    /// Progress toward graduation, 0..=100 (display only).
+    fn progress(&self) -> f64 {
+        Curve::from(*self).graduation_bps() as f64 / 100.0
+    }
 }
 
+/// One recorded trade. `lat` and `tok` are **base units**, matching the contract.
 #[derive(Serialize, Deserialize, Clone)]
-struct Trade { kind: String, user: String, lat: f64, tok: f64, time: u64 }
+struct Trade { kind: String, user: String, lat: u64, tok: u64, time: u64 }
 
 #[derive(Serialize, Deserialize, Clone)]
 struct ChatMsg { user: String, text: String, time: u64 }
@@ -79,9 +108,10 @@ struct Proposal {
     kind: String,
     /// Proposed new value, or the purpose/recipient for a treasury spend.
     text: String,
-    /// For a "treasury" proposal: LAT to release from the community treasury.
+    /// For a "treasury" proposal: LAT (base units) to release from the community
+    /// treasury.
     #[serde(default)]
-    amount: f64,
+    amount: u64,
     proposer: String,
     time: u64,
     yes: Vec<String>,  // voter addresses
@@ -112,23 +142,28 @@ struct TokenMeta {
     supply: u64,
     token_id: u32,      // on-chain sequential id (assigned by replay order)
     created_at: u64,
-    curve: Curve,
-    /// Off-chain fee accounting (BETA): 80% of each 1% fee accrues here for the
-    /// community to govern; 20% is auto-credited to the dev below.
+    curve: CurveState,
+    /// Off-chain fee accounting (base units): 80% of each 1% fee accrues here for
+    /// the community to govern; 20% is auto-credited to the dev below. The
+    /// contract deducts the fee but cannot pay it out (no value-transfer opcode),
+    /// so this split stays latfun's books — see THREAT_MODEL §2.6.
     #[serde(default)]
-    community_treasury: f64,
+    community_treasury: u64,
     #[serde(default)]
-    dev_fees: f64,
+    dev_fees: u64,
     #[serde(default)]
     trades: Vec<Trade>,
+    /// Spot price samples, as the contract's scaled integer (`price_scaled`).
     #[serde(default)]
-    price_history: Vec<f64>,
+    price_history: Vec<u64>,
     #[serde(default)]
     chat: Vec<ChatMsg>,
     #[serde(default)]
     proposals: Vec<Proposal>,
+    /// address -> token balance in base units. Mirrors the curve contract's
+    /// holdings slot; the contract is authoritative once a curve is deployed.
     #[serde(default)]
-    holdings: HashMap<String, f64>, // address -> token balance (BETA curve accounting)
+    holdings: HashMap<String, u64>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -152,6 +187,12 @@ struct App {
 
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Render base units as a human LAT string (the ledger is 5-decimal). Display
+/// only — base units are what cross the API and the curve.
+fn lat(units: u64) -> String {
+    format!("{}.{:05}", units / LAT_UNITS, units % LAT_UNITS)
 }
 
 impl App {
@@ -209,7 +250,7 @@ fn index_chain(app: &App) {
                 let creator_str = lat_crypto::PublicKey::from_bytes(creator)
                     .map(|pk| Address::new(NET, pk).encode())
                     .unwrap_or_else(|| creator_id_hex.clone());
-                let entry = s.tokens.entry(norm.clone()).or_insert_with(TokenMeta::default);
+                let entry = s.tokens.entry(norm.clone()).or_default();
                 // Only fill on first sight (an operator may have set image/desc via create()).
                 if entry.token_id == 0 {
                     entry.ticker = norm.clone();
@@ -220,7 +261,7 @@ fn index_chain(app: &App) {
                     entry.token_id = id;
                     if entry.created_at == 0 { entry.created_at = block.header.timestamp; }
                     if entry.price_history.is_empty() {
-                        entry.price_history.push(entry.curve.price());
+                        entry.price_history.push(Curve::from(entry.curve).price_scaled());
                     }
                 }
             }
@@ -474,7 +515,7 @@ fn status_json(app: &App) -> serde_json::Value {
         "indexed": s.scanned_height,
         "tokens": s.tokens.len(),
         "graduate_lat": GRADUATE_LAT,
-        "fee_bps": FEE_BPS,
+        "fee_bps": 10_000 / lat_contracts::bonding_curve::FEE_DIVISOR,
     })
 }
 
@@ -506,7 +547,7 @@ fn token_summary(t: &TokenMeta) -> serde_json::Value {
         "market_cap": t.curve.market_cap(),
         "real_lat": t.curve.real_lat,
         "graduated": t.curve.graduated,
-        "progress": (t.curve.real_lat / GRADUATE_LAT * 100.0).min(100.0),
+        "progress": t.curve.progress(),
         "trades": t.trades.len(),
         "replies": t.chat.len(),
     })
@@ -529,7 +570,7 @@ fn token_detail(app: &App, ticker: &str) -> (&'static str, String) {
             "created_at": t.created_at,
             "price": t.curve.price(), "market_cap": t.curve.market_cap(),
             "real_lat": t.curve.real_lat, "graduated": t.curve.graduated,
-            "progress": (t.curve.real_lat / GRADUATE_LAT * 100.0).min(100.0),
+            "progress": t.curve.progress(),
             "vlat": t.curve.vlat, "vtok": t.curve.vtok,
             "community_treasury": t.community_treasury, "dev_fees": t.dev_fees,
             "quorum": QUORUM,
@@ -631,7 +672,7 @@ fn create_token(app: &App, body: &serde_json::Value) -> (&'static str, String) {
     // once it's mined.
     {
         let mut s = app.store.lock().unwrap();
-        let entry = s.tokens.entry(norm.clone()).or_insert_with(TokenMeta::default);
+        let entry = s.tokens.entry(norm.clone()).or_default();
         entry.ticker = norm.clone();
         entry.name = name;
         entry.description = description;
@@ -644,7 +685,7 @@ fn create_token(app: &App, body: &serde_json::Value) -> (&'static str, String) {
         entry.creator_id = hex_id(&w.id());
         entry.supply = supply;
         if entry.created_at == 0 { entry.created_at = now(); }
-        if entry.price_history.is_empty() { entry.price_history.push(entry.curve.price()); }
+        if entry.price_history.is_empty() { entry.price_history.push(Curve::from(entry.curve).price_scaled()); }
         let snap = clone_store(&s);
         drop(s);
         app.save(&snap);
@@ -652,47 +693,61 @@ fn create_token(app: &App, body: &serde_json::Value) -> (&'static str, String) {
     ok(serde_json::json!({ "ok": true, "ticker": norm, "note": "Token submitted on-chain — it appears once the next block mines." }))
 }
 
-/// Bonding-curve buy/sell — BETA, off-chain accounting against the virtual curve.
-/// Real on-chain LAT movement lands when the DVM curve contract is deployed.
+/// Bonding-curve buy/sell. All curve math is the deployed contract's own
+/// [`Curve`], so a quote here is exactly the price consensus computes — no float
+/// restatement that rounds apart from it.
+///
+/// `amount` is **base units** (LAT in for a buy, whole tokens for a sell).
+///
+/// STILL OFF-CHAIN: this mutates latfun's mirror rather than submitting a
+/// `CallContract`, so the operator can still edit the books. Deploying + calling
+/// the real curve is the next step; see THREAT_MODEL §2.6.
 fn trade(app: &App, body: &serde_json::Value) -> (&'static str, String) {
     let ticker = body["ticker"].as_str().unwrap_or("");
     let side = body["side"].as_str().unwrap_or("buy");
-    let amount = body["amount"].as_f64().unwrap_or(0.0);
+    let amount = body["amount"].as_u64().unwrap_or(0);
     let user = body["address"].as_str().unwrap_or("anon").to_string();
     let norm = match lat_types::normalize_ticker(ticker) {
         Some(t) => t,
         None => return err("bad ticker"),
     };
-    if amount <= 0.0 { return err("amount must be positive"); }
+    if amount == 0 { return err("amount must be positive (base units)"); }
 
     let mut s = app.store.lock().unwrap();
     let Some(t) = s.tokens.get_mut(&norm) else { return err("no such token") };
     if t.curve.graduated { return err("token graduated — trade on the DEX (coming soon)"); }
 
-    let (out, note);
-    let fee;
-    if side == "buy" {
-        fee = amount * FEE_BPS / 10000.0;
-        let net = amount - fee;
-        let tok = (t.curve.vtok * net) / (t.curve.vlat + net);
-        t.curve.vlat += net; t.curve.vtok -= tok; t.curve.real_lat += net;
-        *t.holdings.entry(user.clone()).or_insert(0.0) += tok;
-        out = tok;
-        note = format!("bought {:.0} {}", tok, t.ticker);
+    let mut curve: Curve = t.curve.into();
+    let held = t.holdings.get(&user).copied().unwrap_or(0);
+
+    // The contract charges its 1% on BUYS only (`apply_buy` nets the fee off the
+    // input; `apply_sell` takes none). latfun's old float curve charged both
+    // sides — a drift that consensus would simply have overruled.
+    let (out, fee, note) = if side == "buy" {
+        let Some(tok) = curve.apply_buy(amount) else {
+            return err("the curve rejected that buy (zero or above MAX_TRADE)");
+        };
+        *t.holdings.entry(user.clone()).or_insert(0) += tok;
+        (tok, amount / lat_contracts::bonding_curve::FEE_DIVISOR, format!("bought {tok} {}", t.ticker))
     } else {
-        let have = *t.holdings.get(&user).unwrap_or(&0.0);
-        if amount > have + 1e-9 { return err("you don't hold that many tokens"); }
-        let gross = (t.curve.vlat * amount) / (t.curve.vtok + amount);
-        fee = gross * FEE_BPS / 10000.0;
-        let lat = gross - fee;
-        t.curve.vtok += amount; t.curve.vlat -= gross; t.curve.real_lat = (t.curve.real_lat - gross).max(0.0);
-        *t.holdings.entry(user.clone()).or_insert(0.0) -= amount;
-        out = lat;
-        note = format!("sold {:.0} {}", amount, t.ticker);
-    }
+        if amount > held {
+            return err("you don't hold that many tokens");
+        }
+        let Some(lat) = curve.apply_sell(amount, held) else {
+            return err("the curve rejected that sell (zero or above MAX_TRADE)");
+        };
+        *t.holdings.entry(user.clone()).or_insert(0) -= amount;
+        (lat, 0, format!("sold {amount} {}", t.ticker))
+    };
+    // Graduation is the contract's call, made inside apply_buy.
+    t.curve = curve.into();
+
     // Split the fee: 20% auto to the dev wallet, 80% to the community treasury.
-    t.dev_fees += fee * DEV_SHARE;
-    t.community_treasury += fee * COMMUNITY_SHARE;
+    // Integer split; the remainder (<1 base unit) stays with the community.
+    let dev_cut = fee * DEV_SHARE_BPS / 10_000;
+    t.dev_fees += dev_cut;
+    t.community_treasury += fee - dev_cut;
+    debug_assert_eq!(DEV_SHARE_BPS + COMMUNITY_SHARE_BPS, 10_000, "fee split must be whole");
     t.trades.insert(0, Trade {
         kind: side.to_string(), user: user.clone(),
         lat: if side == "buy" { amount } else { out },
@@ -700,15 +755,14 @@ fn trade(app: &App, body: &serde_json::Value) -> (&'static str, String) {
         time: now(),
     });
     if t.trades.len() > 200 { t.trades.truncate(200); }
-    t.price_history.push(t.curve.price());
+    t.price_history.push(curve.price_scaled());
     if t.price_history.len() > 200 { t.price_history.remove(0); }
-    if t.curve.real_lat >= GRADUATE_LAT { t.curve.graduated = true; }
 
-    let holding = *t.holdings.get(&user).unwrap_or(&0.0);
+    let holding = t.holdings.get(&user).copied().unwrap_or(0);
     let resp = serde_json::json!({
         "ok": true, "out": out, "note": note,
         "price": t.curve.price(), "market_cap": t.curve.market_cap(),
-        "holding": holding, "progress": (t.curve.real_lat / GRADUATE_LAT * 100.0).min(100.0),
+        "holding": holding, "progress": t.curve.progress(),
     });
     let snap = clone_store(&s);
     drop(s);
@@ -737,10 +791,11 @@ fn post_proposal(app: &App, ticker: &str, body: &serde_json::Value) -> (&'static
     let proposer = body["address"].as_str().unwrap_or("").to_string();
     let kind = body["kind"].as_str().unwrap_or("other").to_string();
     let text = body["text"].as_str().unwrap_or("").trim().to_string();
-    let amount = body["amount"].as_f64().unwrap_or(0.0);
+    // Base units, like every other amount crossing this API.
+    let amount = body["amount"].as_u64().unwrap_or(0);
     if proposer.is_empty() { return err("connect a wallet to propose"); }
     if text.is_empty() || text.len() > 200 { return err("proposal must be 1-200 chars"); }
-    if kind == "treasury" && amount <= 0.0 { return err("treasury spend needs a positive LAT amount"); }
+    if kind == "treasury" && amount == 0 { return err("treasury spend needs a positive LAT amount"); }
     let norm = match lat_types::normalize_ticker(ticker) { Some(t) => t, None => return err("bad ticker") };
     let mut s = app.store.lock().unwrap();
     let pid = s.next_proposal; s.next_proposal += 1;
@@ -791,7 +846,7 @@ fn vote(app: &App, ticker: &str, body: &serde_json::Value) -> (&'static str, Str
 /// Apply an approved proposal to the token. Field changes update the off-chain
 /// display metadata (the on-chain ticker/id are immutable); a "treasury" proposal
 /// releases LAT from the community treasury. Returns a human-readable note.
-fn execute_proposal(t: &mut TokenMeta, kind: &str, text: &str, amount: f64) -> String {
+fn execute_proposal(t: &mut TokenMeta, kind: &str, text: &str, amount: u64) -> String {
     match kind {
         "name" => { t.name = text.to_string(); format!("renamed to {text}") }
         "ticker" => { t.display_ticker = text.to_string(); format!("display ticker → {text}") }
@@ -804,7 +859,7 @@ fn execute_proposal(t: &mut TokenMeta, kind: &str, text: &str, amount: f64) -> S
         "treasury" => {
             let spend = amount.min(t.community_treasury);
             t.community_treasury -= spend;
-            format!("released {spend:.4} LAT from the treasury: {text}")
+            format!("released {} LAT from the treasury: {text}", lat(spend))
         }
         _ => "approved".into(),
     }
