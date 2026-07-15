@@ -38,7 +38,9 @@ pub const VLAT0: u64 = 30 * 100_000;
 pub const VTOK0: u64 = 1_000_000_000;
 /// Real LAT collected at which the token graduates: 500 LAT.
 pub const GRADUATE_LAT: u64 = 500 * 100_000;
-/// Trading fee, as a divisor: `fee = amount / FEE_DIVISOR` (100 ⇒ 1%).
+/// Trading fee, as a divisor: `fee = amount / FEE_DIVISOR` (100 ⇒ 1%). Charged on
+/// **both sides**, as pump.fun does — withheld from the input on a buy, from the
+/// payout on a sell. Only the buy side is consensus-enforced; see [`Fill`].
 pub const FEE_DIVISOR: u64 = 100;
 /// Largest single-trade amount accepted (base units). Keeps every intermediate
 /// product below `u64::MAX`: with `vtok ≤ VTOK0 = 1e9`, `vtok · amount ≤ 5e18`,
@@ -291,11 +293,32 @@ impl Default for Curve {
     }
 }
 
+/// What a fill produced: `out` to the trader, `fee` retained by the platform.
+///
+/// The two fees are **not equally enforced**, and callers must not pretend
+/// otherwise:
+///
+/// * A **buy** fee is enforced by consensus. The contract adds only `amount −
+///   fee` to the reserves, so the pool provably never received the fee — that is
+///   a fact on-chain, checkable by anyone.
+/// * A **sell** fee is bookkeeping. The contract debits the reserves by the full
+///   gross (it has no value-transfer opcode, so it cannot pay anyone), and the
+///   payout happens off-chain. Nothing on-chain forces the payer to withhold
+///   exactly `fee` — or to pay at all. pump.fun can enforce both sides because
+///   its Solana program moves the SOL itself; Latebra cannot until D4 is closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fill {
+    /// Tokens (buy) or LAT (sell) owed to the trader, net of fee.
+    pub out: u64,
+    /// LAT retained by the platform.
+    pub fee: u64,
+}
+
 impl Curve {
-    /// Apply a buy of `amount` LAT (base units). Returns the tokens bought, or
-    /// `None` if the trade would revert on-chain (graduated / zero / oversize).
-    /// Mutates the reserves exactly as the contract does.
-    pub fn apply_buy(&mut self, amount: u64) -> Option<u64> {
+    /// Apply a buy of `amount` LAT (base units). `None` if the trade would revert
+    /// on-chain (graduated / zero / oversize). Mutates the reserves exactly as the
+    /// contract does.
+    pub fn apply_buy(&mut self, amount: u64) -> Option<Fill> {
         if self.graduated || amount == 0 || amount > MAX_TRADE {
             return None;
         }
@@ -309,24 +332,30 @@ impl Curve {
         if self.real_lat >= GRADUATE_LAT {
             self.graduated = true;
         }
-        Some(tok)
+        Some(Fill { out: tok, fee })
     }
 
     /// Apply a sell of `amount` tokens by a holder currently holding `hold`.
-    /// Returns the LAT paid out, or `None` if it would revert (graduated / zero /
-    /// oversize / more than held).
-    pub fn apply_sell(&mut self, amount: u64, hold: u64) -> Option<u64> {
+    /// `None` if it would revert (graduated / zero / oversize / more than held).
+    ///
+    /// The 1% is taken from the *payout*, matching pump.fun's fee on both sides:
+    /// the reserves fall by the full gross, the seller receives `gross − fee`.
+    /// Note the reserve move is identical either way, which is exactly why this
+    /// needed no bytecode change — and why it is not consensus-enforced. See
+    /// [`Fill`].
+    pub fn apply_sell(&mut self, amount: u64, hold: u64) -> Option<Fill> {
         if self.graduated || amount == 0 || amount > MAX_TRADE || amount > hold {
             return None;
         }
         let denom = self.vtok + amount;
-        let lat = ((self.vlat as u128 * amount as u128) / denom as u128) as u64;
+        let gross = ((self.vlat as u128 * amount as u128) / denom as u128) as u64;
+        let fee = gross / FEE_DIVISOR;
         self.vtok += amount;
-        self.vlat -= lat;
-        self.real_lat = self.real_lat.saturating_sub(lat);
+        self.vlat -= gross;
+        self.real_lat = self.real_lat.saturating_sub(gross);
         // Selling never triggers graduation (real_lat only falls), matching the
         // contract, which checks the threshold with the same `<` after every trade.
-        Some(lat)
+        Some(Fill { out: gross - fee, fee })
     }
 
     /// Current spot price in LAT-base-units per token, scaled by 1e9 for display
@@ -397,6 +426,28 @@ mod tests {
         assert_eq!(bytecode_for(1).len(), bytecode().len() + 10, "salt costs Push8+Pop = 10 bytes");
     }
 
+    /// pump.fun charges 1% on BOTH sides. Pin that, and pin where each fee comes
+    /// from: a buy fee is withheld from the input (so the pool never receives it —
+    /// consensus-visible), a sell fee is withheld from the payout (so the reserves
+    /// still fall by the full gross — off-chain, see `Fill`).
+    #[test]
+    fn one_percent_is_charged_on_both_sides() {
+        let mut c = Curve::default();
+        let buy = 10 * 100_000u64;
+        let bought = c.apply_buy(buy).unwrap();
+        assert_eq!(bought.fee, buy / 100, "buy fee is 1% of the input");
+
+        // The pool only ever saw the net: real_lat is the fee-adjusted input.
+        assert_eq!(c.real_lat, buy - bought.fee, "fee never entered the reserves");
+
+        let before = c;
+        let sold = c.apply_sell(bought.out, bought.out).unwrap();
+        let gross = sold.out + sold.fee;
+        assert_eq!(sold.fee, gross / 100, "sell fee is 1% of the gross payout");
+        assert!(sold.out < gross, "seller receives the payout net of fee");
+        assert_eq!(before.vlat - c.vlat, gross, "reserves fall by the GROSS, not the net");
+    }
+
     #[test]
     fn decode_trade_inverts_encode_trade() {
         for (is_buy, amount) in [(true, 0u64), (false, 1), (true, MAX_TRADE), (false, MASK63)] {
@@ -445,7 +496,7 @@ mod tests {
         assert!(trade(&mut storage, &alice, true, 10 * 100_000)); // buy 10 LAT
 
         let mut reference = Curve::default();
-        let tok = reference.apply_buy(10 * 100_000).unwrap();
+        let tok = reference.apply_buy(10 * 100_000).unwrap().out;
 
         assert_eq!(view(&storage), reference, "on-chain curve matches the reference");
         assert_eq!(*storage.get(&holdings_key(&alice)).unwrap(), tok, "holdings credited");
@@ -460,7 +511,7 @@ mod tests {
 
         // Bob buys 50 LAT worth.
         assert!(trade(&mut storage, &bob, true, 50 * 100_000));
-        let bought = reference.apply_buy(50 * 100_000).unwrap();
+        let bought = reference.apply_buy(50 * 100_000).unwrap().out;
         assert_eq!(*storage.get(&holdings_key(&bob)).unwrap(), bought);
 
         // Bob sells half of them back.
@@ -500,8 +551,8 @@ mod tests {
             };
             let ok = trade(&mut storage, &c, is_buy, amount);
             assert_eq!(ok, expect.is_some(), "success matches reference for {who} {is_buy} {amount}");
-            if let Some(out) = expect {
-                let new_hold = if is_buy { hold + out } else { hold - amount };
+            if let Some(fill) = expect {
+                let new_hold = if is_buy { hold + fill.out } else { hold - amount };
                 holds.insert(key, new_hold);
                 assert_eq!(*storage.get(&key).unwrap_or(&0), new_hold, "holdings match");
             }
@@ -538,7 +589,7 @@ mod tests {
         let chunk = 90 * 100_000;
         let mut graduated = false;
         for _ in 0..8 {
-            let expect = reference.apply_buy(chunk);
+            let expect = reference.apply_buy(chunk).map(|f| f.out);
             let ok = trade(&mut storage, &whale, true, chunk);
             match expect {
                 Some(_) => assert!(ok),

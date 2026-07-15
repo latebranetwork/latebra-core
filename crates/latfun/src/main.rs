@@ -350,31 +350,31 @@ fn index_chain(app: &App) {
                 // deterministic and blocks arrive in order, so this tracks it
                 // exactly — and read_curve() re-anchors us to the ledger anyway.
                 let mut curve: Curve = t.curve.into();
-                let held = t.holdings.get(&hex_id(caller)).copied().unwrap_or(0);
-                let Some(out) = (if is_buy { curve.apply_buy(amount) } else { curve.apply_sell(amount, held) })
+                let who = hex_id(caller);
+                let held = t.holdings.get(&who).copied().unwrap_or(0);
+                let Some(fill) = (if is_buy { curve.apply_buy(amount) } else { curve.apply_sell(amount, held) })
                 else {
                     continue; // The contract reverted; consensus changed nothing.
                 };
-                let who = hex_id(caller);
                 if is_buy {
-                    *t.holdings.entry(who.clone()).or_insert(0) += out;
+                    *t.holdings.entry(who.clone()).or_insert(0) += fill.out;
                 } else {
                     *t.holdings.entry(who.clone()).or_insert(0) -= amount;
                 }
                 t.curve = curve.into();
 
-                // Fee split (buys only — apply_sell takes none). Integer split;
-                // the sub-unit remainder stays with the community.
-                let fee = if is_buy { amount / lat_contracts::bonding_curve::FEE_DIVISOR } else { 0 };
-                let dev_cut = fee * DEV_SHARE_BPS / 10_000;
+                // 1% on both sides, as the curve computed it — never recomputed
+                // here, or the two could drift apart again. Integer split; the
+                // sub-unit remainder stays with the community.
+                let dev_cut = fill.fee * DEV_SHARE_BPS / 10_000;
                 t.dev_fees += dev_cut;
-                t.community_treasury += fee - dev_cut;
+                t.community_treasury += fill.fee - dev_cut;
 
                 t.trades.insert(0, Trade {
                     kind: if is_buy { "buy".into() } else { "sell".into() },
                     user: who,
-                    lat: if is_buy { amount } else { out },
-                    tok: if is_buy { out } else { amount },
+                    lat: if is_buy { amount } else { fill.out },
+                    tok: if is_buy { fill.out } else { amount },
                     time: block.header.timestamp,
                 });
                 if t.trades.len() > 200 { t.trades.truncate(200); }
@@ -900,7 +900,7 @@ fn trade(app: &App, body: &serde_json::Value) -> (&'static str, String) {
     // so we can quote what it will produce. The chain re-runs this for real.
     let is_buy = side == "buy";
     let quote = if is_buy { curve.apply_buy(amount) } else { curve.apply_sell(amount, held) };
-    let Some(out) = quote else {
+    let Some(fill) = quote else {
         return err(if !is_buy && amount > held {
             "you don't hold that many tokens"
         } else {
@@ -924,16 +924,17 @@ fn trade(app: &App, body: &serde_json::Value) -> (&'static str, String) {
     }
 
     let note = if is_buy {
-        format!("buying ~{out} {norm} for {} LAT — confirms in a block", lat(amount))
+        format!("buying ~{} {norm} for {} LAT — confirms in a block", fill.out, lat(amount))
     } else {
-        format!("selling {amount} {norm} for ~{} LAT — confirms in a block", lat(out))
+        format!("selling {amount} {norm} for ~{} LAT — confirms in a block", lat(fill.out))
     };
     // Quoted, not settled: these are what the curve WILL produce if this trade is
     // the next one to touch it. Another trade mining first re-prices it.
     ok(serde_json::json!({
         "ok": true,
         "pending": true,
-        "quoted_out": out,
+        "quoted_out": fill.out,
+        "quoted_fee": fill.fee,
         "note": note,
         "curve_id": hex_id(&contract),
         "price": CurveState::from(curve).price(),
