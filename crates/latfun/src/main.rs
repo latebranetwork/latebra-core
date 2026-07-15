@@ -598,7 +598,9 @@ fn api(app: &App, req: &Req) -> (&'static str, String) {
     match (req.method.as_str(), seg.as_slice()) {
         ("GET", ["status"]) => ok(status_json(app)),
         ("GET", ["tokens"]) => ok(tokens_json(app)),
-        ("GET", ["token", ticker]) => token_detail(app, ticker),
+        ("GET", ["token", ticker]) => {
+            token_detail(app, ticker, req.query.get("id").map(String::as_str).unwrap_or(""))
+        }
         ("GET", ["balance"]) => balance_json(app, req.query.get("addr").map(String::as_str).unwrap_or("")),
         ("POST", ["connect"]) => connect(app, &body),
         ("POST", ["create"]) => create_token(app, &body),
@@ -669,7 +671,7 @@ fn token_summary(t: &TokenMeta) -> serde_json::Value {
     })
 }
 
-fn token_detail(app: &App, ticker: &str) -> (&'static str, String) {
+fn token_detail(app: &App, ticker: &str, viewer_id: &str) -> (&'static str, String) {
     let norm = match lat_types::normalize_ticker(ticker) {
         Some(t) => t,
         None => return err("bad ticker"),
@@ -689,6 +691,14 @@ fn token_detail(app: &App, ticker: &str) -> (&'static str, String) {
             "progress": t.curve.progress(),
             "vlat": t.curve.vlat, "vtok": t.curve.vtok,
             "community_treasury": t.community_treasury, "dev_fees": t.dev_fees,
+            // The curve's contract id, derived from (creator, ticker) — both
+            // public. Surfaced so a client can recompute it and confirm it is
+            // trading the real curve rather than one this server points it at.
+            "curve_id": account_id(&t.creator_id)
+                .map(|c| hex_id(&lat_contracts::bonding_curve::curve_id(&c, &t.ticker))),
+            // The viewer's own position, keyed by account id (the contract's
+            // CALLER), not by address.
+            "holdings_self": t.holdings.get(viewer_id).copied().unwrap_or(0),
             "quorum": QUORUM,
             "price_history": t.price_history,
             "trades": t.trades,
@@ -734,6 +744,10 @@ fn connect(app: &App, body: &serde_json::Value) -> (&'static str, String) {
     }
     ok(serde_json::json!({
         "ok": true, "address": addr, "registered": registered,
+        // Holdings are keyed by account id (that is what the contract's CALLER
+        // is), not by the bech32 address — a client needs this to look its own
+        // position up.
+        "id": hex_id(&w.id()),
         "public_lat": public, "note": note,
     }))
 }
