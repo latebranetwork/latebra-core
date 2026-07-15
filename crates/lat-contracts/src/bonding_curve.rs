@@ -117,10 +117,25 @@ pub fn bytecode() -> Vec<u8> {
 /// who knows `(deployer, salt)` can recompute it and verify they are trading
 /// against the real curve rather than a look-alike.
 ///
-/// Pass the token id as `salt`; the chain already enforces token-id uniqueness,
-/// so curve ids inherit that uniqueness.
+/// Pass [`ticker_salt`] of the token's normalized ticker: the chain enforces
+/// ticker uniqueness, so curve ids inherit it — and unlike the sequential
+/// `token_id`, a ticker is known *before* the `CreateToken` is mined, so the
+/// curve can be deployed in the same breath as the token.
 pub fn bytecode_for(salt: u64) -> Vec<u8> {
     program(Some(salt))
+}
+
+/// The curve salt for a normalized ticker: the first 8 bytes of a domain-tagged
+/// BLAKE3 of it. Deterministic and collision-free in practice — and a collision
+/// could only ever strand *one creator's own* second token (the deployer is part
+/// of `contract_id`), never let one token hijack another's curve.
+pub fn ticker_salt(normalized_ticker: &str) -> u64 {
+    let mut h = blake3::Hasher::new();
+    h.update(b"LAT-curve-salt");
+    h.update(normalized_ticker.as_bytes());
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&h.finalize().as_bytes()[..8]);
+    u64::from_le_bytes(b)
 }
 
 /// Shared program body. `salt = None` reproduces the original unsalted bytes
@@ -363,6 +378,19 @@ mod tests {
         assert_ne!(id(&bytecode_for(1)), id(&bytecode_for(2)), "distinct tokens must not collide");
         assert_ne!(id(&bytecode_for(1)), id(&bytecode()), "salted differs from unsalted");
         assert_eq!(bytecode_for(1).len(), bytecode().len() + 10, "salt costs Push8+Pop = 10 bytes");
+    }
+
+    #[test]
+    fn ticker_salt_is_deterministic_and_separates_tickers() {
+        assert_eq!(ticker_salt("DOGE"), ticker_salt("DOGE"), "same ticker -> same curve id");
+        assert_ne!(ticker_salt("DOGE"), ticker_salt("PEPE"), "distinct tickers -> distinct curves");
+        // Normalization is the caller's job (lat_types::normalize_ticker); the
+        // salt is over the *normalized* form, so raw case must not sneak past.
+        assert_ne!(ticker_salt("DOGE"), ticker_salt("doge"), "salt is over normalized input only");
+
+        let deployer = caller(9);
+        let id = |t: &str| lat_vm::contract_id(&deployer, &bytecode_for(ticker_salt(t)));
+        assert_ne!(id("DOGE"), id("PEPE"), "one creator's two tokens get two curves");
     }
 
     /// The salt is dead code: it must not perturb the curve it prefixes.
