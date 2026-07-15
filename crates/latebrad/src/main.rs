@@ -56,7 +56,9 @@ const GENESIS_PREMINE: u64 = 100_000_000_000;
 // spendable plaintext LAT for Public->Public transfers from genesis. Adds only
 // ledger state (not a new genesis block id), so existing chain logs still replay.
 const GENESIS_PUBLIC_PREMINE: u64 = 100_000_000_000;
-const MAX_TXS_PER_BLOCK: usize = 1000;
+// Was a local daemon constant — meaning every other node simply trusted us to
+// honour it. It is now a consensus rule that peers enforce against us too.
+use lat_chain::MAX_TXS_PER_BLOCK;
 const BLOCK_INTERVAL_SECS: u64 = 3;
 
 /// CORS headers so browser dApps / the explorer / the web wallet can call the
