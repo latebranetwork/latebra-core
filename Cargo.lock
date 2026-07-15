@@ -443,6 +443,7 @@ dependencies = [
  "lat-contracts",
  "lat-crypto",
  "lat-p2p",
+ "lat-state",
  "lat-types",
  "lat-wallet",
  "rand",

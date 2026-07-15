@@ -50,16 +50,19 @@ use lat_contracts::bonding_curve::{Curve, GRADUATE_LAT, VTOK0};
 /// Base units per LAT (the ledger is 5-decimal: 1 LAT = 100_000).
 const LAT_UNITS: u64 = 100_000;
 
-// The 1% trading fee (the contract's FEE_DIVISOR) splits 20% to the dev
-// (creator) wallet, 80% to the community treasury, which holders govern by vote.
-// NB: the *split* is latfun bookkeeping — the contract deducts the fee from the
-// trade but has no opcode to pay anyone, so this accounting stays off-chain.
-const DEV_SHARE_BPS: u64 = 2_000;
-const COMMUNITY_SHARE_BPS: u64 = 8_000;
-// The community takes `fee - dev_cut` rather than its own bps of the fee, so the
-// sub-base-unit remainder of the integer split lands with the community instead
-// of evaporating. That is only correct while the two shares are the whole fee:
-const _: () = assert!(DEV_SHARE_BPS + COMMUNITY_SHARE_BPS == 10_000, "fee split must be whole");
+// The 1% trading fee (the contract's FEE_DIVISOR) splits 50/50 between the
+// platform (whoever runs this launchpad) and the token's creator, who may do
+// whatever they like with their half.
+//
+// NB: the *split* is latfun bookkeeping. The contract deducts the fee from the
+// trade but has no opcode to pay anyone (D4), so these are running totals of
+// what WOULD be owed — nothing is transferred. See THREAT_MODEL §2.6.
+const PLATFORM_SHARE_BPS: u64 = 5_000;
+const CREATOR_SHARE_BPS: u64 = 5_000;
+// The creator takes `fee - platform_cut` rather than its own bps of the fee, so
+// the sub-base-unit remainder of the integer split lands with the creator rather
+// than evaporating. Only correct while the two shares are the whole fee:
+const _: () = assert!(PLATFORM_SHARE_BPS + CREATOR_SHARE_BPS == 10_000, "fee split must be whole");
 // A governance proposal executes once it has more YES than NO votes and at least
 // this many total votes (the community quorum).
 const QUORUM: usize = 3;
@@ -119,14 +122,13 @@ struct ChatMsg { user: String, text: String, time: u64 }
 struct Proposal {
     id: u64,
     /// What to change: "name" | "ticker" | "image" | "banner" | "description" |
-    /// "twitter" | "telegram" | "website" | "treasury" (spend LAT).
+    /// "twitter" | "telegram" | "website".
+    ///
+    /// There is no "treasury" kind: the 50/50 platform/creator split funds no
+    /// community pot, so there is nothing for holders to vote to spend.
     kind: String,
-    /// Proposed new value, or the purpose/recipient for a treasury spend.
+    /// Proposed new value.
     text: String,
-    /// For a "treasury" proposal: LAT (base units) to release from the community
-    /// treasury.
-    #[serde(default)]
-    amount: u64,
     proposer: String,
     time: u64,
     yes: Vec<String>,  // voter addresses
@@ -158,14 +160,14 @@ struct TokenMeta {
     token_id: u32,      // on-chain sequential id (assigned by replay order)
     created_at: u64,
     curve: CurveState,
-    /// Off-chain fee accounting (base units): 80% of each 1% fee accrues here for
-    /// the community to govern; 20% is auto-credited to the dev below. The
-    /// contract deducts the fee but cannot pay it out (no value-transfer opcode),
-    /// so this split stays latfun's books — see THREAT_MODEL §2.6.
+    /// Off-chain fee accounting (base units). Each 1% trade fee splits 50/50:
+    /// half to the platform, half to this token's creator. The contract deducts
+    /// the fee but cannot pay it out (no value-transfer opcode), so these are
+    /// what WOULD be owed, not balances — see THREAT_MODEL §2.6.
     #[serde(default)]
-    community_treasury: u64,
+    platform_fees: u64,
     #[serde(default)]
-    dev_fees: u64,
+    creator_fees: u64,
     #[serde(default)]
     trades: Vec<Trade>,
     /// Spot price samples, as the contract's scaled integer (`price_scaled`).
@@ -365,10 +367,10 @@ fn index_chain(app: &App) {
 
                 // 1% on both sides, as the curve computed it — never recomputed
                 // here, or the two could drift apart again. Integer split; the
-                // sub-unit remainder stays with the community.
-                let dev_cut = fill.fee * DEV_SHARE_BPS / 10_000;
-                t.dev_fees += dev_cut;
-                t.community_treasury += fill.fee - dev_cut;
+                // sub-unit remainder stays with the creator.
+                let platform_cut = fill.fee * PLATFORM_SHARE_BPS / 10_000;
+                t.platform_fees += platform_cut;
+                t.creator_fees += fill.fee - platform_cut;
 
                 t.trades.insert(0, Trade {
                     kind: if is_buy { "buy".into() } else { "sell".into() },
@@ -637,9 +639,17 @@ fn status_json(app: &App) -> serde_json::Value {
     })
 }
 
+/// The launched coins.
+///
+/// Only tokens the indexer has SEEN MINE are listed. `token_id` is assigned by
+/// replay of an accepted on-chain `CreateToken`, so `token_id == 0` means "we
+/// stashed this creator's metadata but the chain never took the token" — a
+/// rejected or still-pending launch. Listing those put coins in the grid that do
+/// not exist on-chain, at 0% and indistinguishable from real ones.
 fn tokens_json(app: &App) -> serde_json::Value {
     let s = app.store.lock().unwrap();
-    let mut list: Vec<serde_json::Value> = s.tokens.values().map(token_summary).collect();
+    let mut list: Vec<serde_json::Value> =
+        s.tokens.values().filter(|t| t.token_id != 0).map(token_summary).collect();
     // newest first
     list.sort_by(|a, b| b["created_at"].as_u64().unwrap_or(0).cmp(&a["created_at"].as_u64().unwrap_or(0)));
     serde_json::json!({ "ok": true, "tokens": list })
@@ -690,7 +700,7 @@ fn token_detail(app: &App, ticker: &str, viewer_id: &str) -> (&'static str, Stri
             "real_lat": t.curve.real_lat, "graduated": t.curve.graduated,
             "progress": t.curve.progress(),
             "vlat": t.curve.vlat, "vtok": t.curve.vtok,
-            "community_treasury": t.community_treasury, "dev_fees": t.dev_fees,
+            "platform_fees": t.platform_fees, "creator_fees": t.creator_fees,
             // The curve's contract id, derived from (creator, ticker) — both
             // public. Surfaced so a client can recompute it and confirm it is
             // trading the real curve rather than one this server points it at.
@@ -788,6 +798,31 @@ fn create_token(app: &App, body: &serde_json::Value) -> (&'static str, String) {
         Ok(None) => {
             let _ = lat_p2p::submit_tx(&app.node, &w.registration_tx().encode());
             return err("your account isn't registered yet — registering now, retry in a few seconds");
+        }
+        Err(_) => return err("node offline"),
+    }
+    // Refuse early if the flat fees can't be paid.
+    //
+    // `submit_tx` returning true only means the MEMPOOL took it — the ledger
+    // re-checks at apply time and silently drops what it rejects. Without this,
+    // an under-funded creator got "Token submitted on-chain!" and then nothing,
+    // forever, with no way to tell a slow block from a dead transaction.
+    //
+    // The trap this catches is specific: MINING REWARDS ARE NOT PUBLIC LAT.
+    // reward_miner credits the confidential balance (an unblinded `mint`
+    // ciphertext), while CreateToken/DeployContract need FLAT_TX_FEE from the
+    // *public* balance — so a miner with thousands of LAT reads as broke here
+    // and must unshield first. Nothing else in the UI would ever tell them.
+    let need = lat_state::FLAT_TX_FEE * 2; // CreateToken + the curve's DeployContract
+    match lat_p2p::get_public_balance(&app.node, w.id(), LAT_TOKEN) {
+        Ok(Some(bal)) if bal >= need => {}
+        Ok(_) => {
+            return err(&format!(
+                "not enough public LAT for the fees (need {}, flat fee per tx is {}). \
+                 Mining rewards land in your CONFIDENTIAL balance — unshield some first.",
+                lat(need),
+                lat(lat_state::FLAT_TX_FEE)
+            ))
         }
         Err(_) => return err("node offline"),
     }
@@ -978,17 +1013,17 @@ fn post_proposal(app: &App, ticker: &str, body: &serde_json::Value) -> (&'static
     let proposer = body["address"].as_str().unwrap_or("").to_string();
     let kind = body["kind"].as_str().unwrap_or("other").to_string();
     let text = body["text"].as_str().unwrap_or("").trim().to_string();
-    // Base units, like every other amount crossing this API.
-    let amount = body["amount"].as_u64().unwrap_or(0);
     if proposer.is_empty() { return err("connect a wallet to propose"); }
     if text.is_empty() || text.len() > 200 { return err("proposal must be 1-200 chars"); }
-    if kind == "treasury" && amount == 0 { return err("treasury spend needs a positive LAT amount"); }
+    if kind == "treasury" {
+        return err("treasury proposals are gone — fees split 50/50 platform/creator, so there is no community pot to spend");
+    }
     let norm = match lat_types::normalize_ticker(ticker) { Some(t) => t, None => return err("bad ticker") };
     let mut s = app.store.lock().unwrap();
     let pid = s.next_proposal; s.next_proposal += 1;
     let Some(t) = s.tokens.get_mut(&norm) else { return err("no such token") };
     t.proposals.insert(0, Proposal {
-        id: pid, kind, text, amount, proposer: proposer.clone(), time: now(),
+        id: pid, kind, text, proposer: proposer.clone(), time: now(),
         yes: vec![proposer], no: vec![], status: "open".into(),
     });
     let props = serde_json::to_value(&t.proposals).unwrap_or(serde_json::Value::Null);
@@ -1016,9 +1051,9 @@ fn vote(app: &App, ticker: &str, body: &serde_json::Value) -> (&'static str, Str
     let mut executed = String::new();
     if yes + no >= QUORUM {
         if yes > no {
-            let (kind, text, amount) = (p.kind.clone(), p.text.clone(), p.amount);
+            let (kind, text) = (p.kind.clone(), p.text.clone());
             p.status = "executed".into();
-            executed = execute_proposal(t, &kind, &text, amount);
+            executed = execute_proposal(t, &kind, &text);
         } else {
             p.status = "rejected".into();
         }
@@ -1031,9 +1066,14 @@ fn vote(app: &App, ticker: &str, body: &serde_json::Value) -> (&'static str, Str
 }
 
 /// Apply an approved proposal to the token. Field changes update the off-chain
-/// display metadata (the on-chain ticker/id are immutable); a "treasury" proposal
-/// releases LAT from the community treasury. Returns a human-readable note.
-fn execute_proposal(t: &mut TokenMeta, kind: &str, text: &str, amount: u64) -> String {
+/// display metadata (the on-chain ticker/id are immutable). Returns a
+/// human-readable note.
+///
+/// The "treasury" kind is GONE: it released LAT from the community treasury, and
+/// the fee split no longer funds one (50/50 platform/creator). A proposal type
+/// that can only ever spend zero is worse than no proposal type — it looks like
+/// governance while doing nothing.
+fn execute_proposal(t: &mut TokenMeta, kind: &str, text: &str) -> String {
     match kind {
         "name" => { t.name = text.to_string(); format!("renamed to {text}") }
         "ticker" => { t.display_ticker = text.to_string(); format!("display ticker → {text}") }
@@ -1043,11 +1083,6 @@ fn execute_proposal(t: &mut TokenMeta, kind: &str, text: &str, amount: u64) -> S
         "twitter" => { t.twitter = text.to_string(); "twitter updated".into() }
         "telegram" => { t.telegram = text.to_string(); "telegram updated".into() }
         "website" => { t.website = text.to_string(); "website updated".into() }
-        "treasury" => {
-            let spend = amount.min(t.community_treasury);
-            t.community_treasury -= spend;
-            format!("released {} LAT from the treasury: {text}", lat(spend))
-        }
         _ => "approved".into(),
     }
 }
