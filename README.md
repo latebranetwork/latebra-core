@@ -120,5 +120,10 @@ protocol; one spend per account per block (full epoch batching is future work).
 
 ## License
 
-Latebra's own code is licensed `MIT OR Apache-2.0`. It depends only on
-permissively-licensed third-party libraries.
+Latebra's own code is licensed `MIT OR Apache-2.0` at your option — see
+[LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE). It depends only
+on permissively-licensed third-party libraries.
+
+Unless you state otherwise, any contribution intentionally submitted for
+inclusion in this work shall be dual licensed as above, without additional terms
+or conditions.
