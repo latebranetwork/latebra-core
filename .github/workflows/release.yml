@@ -50,7 +50,13 @@ jobs:
             target: aarch64-apple-darwin
             ext: ""
             archive: tar.gz
-          - os: macos-13
+          # Intel Mac binaries cross-compile from the Apple-silicon runner: the
+          # Xcode toolchain ships both slices, and every dependency here is pure
+          # Rust. Building this on a macos-13 runner instead leaves the job
+          # queued indefinitely now that GitHub has retired that image — and
+          # because `publish` needs the whole matrix, one stuck job means the
+          # release never appears at all.
+          - os: macos-14
             target: x86_64-apple-darwin
             ext: ""
             archive: tar.gz
