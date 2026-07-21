@@ -84,6 +84,9 @@ cargo test
 | [RPC.md](RPC.md) | The public JSON-RPC 2.0 developer API (methods, CORS, exposure model) |
 | [LAUNCH.md](LAUNCH.md) | Public-testnet launch checklist + chain parameters + mainnet gate |
 | [THREAT_MODEL.md](THREAT_MODEL.md) · [CRYPTO_SPEC.md](CRYPTO_SPEC.md) | Security posture — what is and isn't guaranteed |
+| [SECURITY.md](SECURITY.md) | Reporting a vulnerability privately, and what's in scope |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Building, the CI gate, and the bar for consensus/crypto changes |
+| [CHANGELOG.md](CHANGELOG.md) | What changed in each release |
 
 ## Architecture
 
