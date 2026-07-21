@@ -135,6 +135,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "crunchy"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -274,6 +280,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "lat-bridge"
+version = "0.1.0"
+dependencies = [
+ "bech32",
+ "curve25519-dalek",
+ "hex",
+ "lat-chain",
+ "lat-p2p",
+ "lat-types",
+ "rand",
+ "sha2",
+ "tiny-keccak",
+]
+
+[[package]]
 name = "lat-chain"
 version = "0.1.0"
 dependencies = [
@@ -358,11 +379,13 @@ name = "lat-state"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "lat-contracts",
  "lat-crypto",
  "lat-store",
  "lat-types",
  "lat-vm",
  "rand",
+ "sha2",
 ]
 
 [[package]]
@@ -378,6 +401,7 @@ name = "lat-types"
 version = "0.1.0"
 dependencies = [
  "bech32",
+ "blake3",
  "lat-crypto",
  "rand",
 ]
@@ -417,11 +441,14 @@ name = "lat-wallet-web"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "lat-bridge",
+ "lat-chain",
  "lat-crypto",
  "lat-p2p",
  "lat-types",
  "lat-wallet",
  "rand",
+ "sha2",
 ]
 
 [[package]]
@@ -674,6 +701,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tiny-keccak"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c9d3793400a45f954c52e73d068316d76b6f4e36977e3fcebb13a2721e80237"
+dependencies = [
+ "crunchy",
 ]
 
 [[package]]

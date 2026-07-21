@@ -79,6 +79,15 @@ impl Mempool {
         if matches!(&tx, Transaction::AnonTransfer { xfer, .. } if xfer.fee < MIN_TRANSFER_FEE) {
             return false;
         }
+        // DEX + HTLC-lock transactions carry the same public fee floor.
+        if matches!(&tx,
+            Transaction::AddLiquidity { fee, .. }
+            | Transaction::RemoveLiquidity { fee, .. }
+            | Transaction::Swap { fee, .. }
+            | Transaction::HtlcLock { fee, .. } if *fee < MIN_TRANSFER_FEE)
+        {
+            return false;
+        }
         // Two anonymous spends sharing a nullifier are the same account spending
         // twice in one epoch — only one can ever be mined. Keep the higher-fee
         // one (fee replacement), refuse the other.

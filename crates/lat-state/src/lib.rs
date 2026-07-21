@@ -124,6 +124,85 @@ fn release_matured(v: &mut Validator, height: u64) -> u64 {
     released
 }
 
+// -- native DEX parameters (consensus) ----------------------------------------
+
+/// AMM swap fee kept by the pool's reserves (i.e. earned by the LPs), in basis
+/// points: 30 = 0.3%, the constant-product-market standard. Consensus: baked
+/// into the swap-output formula every node computes.
+pub const SWAP_FEE_BPS: u64 = 30;
+
+/// LP shares burned to the zero address on pool creation, so the first
+/// provider can't mint dust shares and inflate their value against later
+/// providers (Uniswap V2's MINIMUM_LIQUIDITY defense).
+pub const MIN_POOL_LIQUIDITY: u64 = 1_000;
+
+/// A constant-product liquidity pool pairing `token` against native LAT.
+/// `lat * tok` is the invariant a `Swap` preserves (fee excepted, which only
+/// grows it). `lp_supply` is the total of all LP shares outstanding.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Pool {
+    pub token: u32,
+    /// LAT-side reserve (public, plaintext).
+    pub lat: u64,
+    /// Token-side reserve.
+    pub tok: u64,
+    /// Total LP shares outstanding (including the burned minimum).
+    pub lp_supply: u64,
+}
+
+/// A native bonding-curve pool for one token (the launchpad primitive). Holds
+/// the constant-product virtual reserves that price a `CurveTrade`, plus the
+/// `real_lat` the curve actually custodies — the source of a seller's payout,
+/// so the curve can never pay out LAT it does not hold. The pricing math is the
+/// shared reference in [`lat_contracts::bonding_curve`], so the native curve and
+/// the launchpad's off-chain quote agree exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CurvePool {
+    pub token: u32,
+    /// Virtual LAT reserve (prices the curve; starts at `VLAT0`).
+    pub vlat: u64,
+    /// Virtual token reserve (starts at `VTOK0`; falls as tokens are minted out).
+    pub vtok: u64,
+    /// Real LAT the curve holds — grows on buys, is paid out on sells.
+    pub real_lat: u64,
+    /// Once graduated (`real_lat` reached the threshold), the curve locks.
+    pub graduated: bool,
+}
+
+impl CurvePool {
+    /// A fresh curve for `token` at its genesis virtual reserves.
+    pub fn genesis(token: u32) -> Self {
+        Self::from_math(token, lat_contracts::bonding_curve::Curve::default())
+    }
+
+    /// The pricing view (drops the token id) for the shared curve math.
+    pub fn math(&self) -> lat_contracts::bonding_curve::Curve {
+        lat_contracts::bonding_curve::Curve {
+            vlat: self.vlat,
+            vtok: self.vtok,
+            real_lat: self.real_lat,
+            graduated: self.graduated,
+        }
+    }
+
+    fn from_math(token: u32, c: lat_contracts::bonding_curve::Curve) -> Self {
+        CurvePool { token, vlat: c.vlat, vtok: c.vtok, real_lat: c.real_lat, graduated: c.graduated }
+    }
+}
+
+/// An open hash time-locked contract (the cross-chain bridge escrow): `amount`
+/// of `token`, claimable by `to` with the SHA-256 preimage of `hashlock`
+/// before block `expiry`, refundable to `from` from `expiry` on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Htlc {
+    pub token: u32,
+    pub from: [u8; 32],
+    pub to: [u8; 32],
+    pub amount: u64,
+    pub hashlock: [u8; 32],
+    pub expiry: u64,
+}
+
 /// Metadata recorded for each created token.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TokenMeta {
@@ -192,6 +271,14 @@ enum DirtyKey {
     Nullifier([u8; 32]),
     /// A validator's staking record (T13).
     Validator([u8; 32]),
+    /// A DEX liquidity pool, keyed by the paired token's id.
+    Pool(u32),
+    /// A native bonding-curve pool, keyed by its token's id.
+    Curve(u32),
+    /// One provider's LP-share balance in one pool.
+    Lp(u32, [u8; 32]),
+    /// An open HTLC escrow, keyed by its id.
+    Htlc([u8; 32]),
     /// The `next_token_id` meta record.
     Meta,
 }
@@ -288,6 +375,21 @@ pub(crate) enum ProofPass {
     AgainstBalance(Ciphertext),
 }
 
+/// Integer square root (floor) of a u128 — LP shares minted on pool creation.
+/// The product of two u64s roots back into u64 range, so the cast is exact.
+fn isqrt(n: u128) -> u64 {
+    if n == 0 {
+        return 0;
+    }
+    let mut x = n;
+    let mut y = x.div_ceil(2);
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    x as u64
+}
+
 /// Verify a transparent transaction's Schnorr signature by the account key `id`
 /// over the transaction's signing bytes.
 fn check_sig(id: &[u8; 32], tx: &Transaction, sig: &[u8; 64]) -> Result<(), LedgerError> {
@@ -350,6 +452,40 @@ pub enum LedgerError {
     /// Valid evidence, but the named validator holds no stake and no
     /// unbonding funds — already slashed (a replay) or never bonded.
     NothingToSlash,
+    /// A DEX transaction named an invalid pool token (native LAT itself, or a
+    /// token id that was never created).
+    BadPoolToken,
+    /// A swap or liquidity removal named a pool that doesn't exist.
+    PoolNotFound,
+    /// A liquidity add/remove is too small: it would mint or burn zero LP
+    /// shares (or seed a pool below the burned minimum liquidity).
+    InsufficientLiquidity,
+    /// A swap's computed output fell below the trader's `min_out` bound (or
+    /// would drain the reserve entirely).
+    SlippageExceeded,
+    /// An HTLC claim/refund named an id with no open lock (never existed,
+    /// already claimed, or already refunded).
+    HtlcNotFound,
+    /// An HTLC claim arrived at or after the lock's expiry height.
+    HtlcExpired,
+    /// An HTLC refund arrived before the lock's expiry height.
+    HtlcNotExpired,
+    /// An HTLC claim's preimage does not SHA-256-hash to the lock's hashlock.
+    BadPreimage,
+    /// A lock with this exact id is already open (same sender, fields, and
+    /// nonce — impossible via the nonce, but checked defensively).
+    HtlcExists,
+    /// A DEX/HTLC amount was zero.
+    ZeroAmount,
+    /// A `CurveTrade` sell (or a trade after graduation) named a token whose
+    /// bonding curve doesn't exist — no buy ever opened it.
+    CurveNotFound,
+    /// A `CurveTrade` hit a graduated curve; trading has moved off the curve.
+    CurveGraduated,
+    /// A `CurveTrade` sell would pay out more LAT than the curve holds. Refused
+    /// so the curve can never become insolvent (should be unreachable given the
+    /// constant-product math; enforced defensively).
+    CurveInsolvent,
 }
 
 impl Ledger {
@@ -472,6 +608,25 @@ impl Ledger {
             let id: [u8; 32] = key.get(1..)?.try_into().ok()?;
             decode_validator(&body)?;
             dirty.push(DirtyKey::Validator(id));
+        }
+        for (key, body) in ledger.store.scan_prefix(Column::Objects, &[REC_POOL]) {
+            let p = decode_pool(&body)?;
+            // Same key/body-id consistency rule as token records.
+            if key.get(1..)? != p.token.to_be_bytes() {
+                return None;
+            }
+            dirty.push(DirtyKey::Pool(p.token));
+        }
+        for (key, body) in ledger.store.scan_prefix(Column::Objects, &[REC_LP]) {
+            let token = u32::from_be_bytes(key.get(1..5)?.try_into().ok()?);
+            let provider: [u8; 32] = key.get(5..)?.try_into().ok()?;
+            let _shares = u64::from_le_bytes(body.as_slice().try_into().ok()?);
+            dirty.push(DirtyKey::Lp(token, provider));
+        }
+        for (key, body) in ledger.store.scan_prefix(Column::Objects, &[REC_HTLC]) {
+            let id: [u8; 32] = key.get(1..)?.try_into().ok()?;
+            decode_htlc(&body)?;
+            dirty.push(DirtyKey::Htlc(id));
         }
         // Rebuild the ticker index from committed tokens (self-heals tampering).
         for (ticker, id) in tickers {
@@ -673,6 +828,86 @@ impl Ledger {
         }
     }
 
+    /// Read one liquidity-pool record by paired-token id.
+    pub fn pool(&self, token: u32) -> Option<Pool> {
+        let bytes = self.store.get(Column::Objects, &rec_key(REC_POOL, &token.to_be_bytes()))?;
+        Some(decode_pool(&bytes).expect("corrupt pool record"))
+    }
+
+    /// Write one pool record. A fully-drained pool (no shares outstanding) is
+    /// DELETED so committed state matches a chain where it never existed.
+    fn put_pool(&mut self, p: &Pool) {
+        if p.lp_supply == 0 {
+            self.store.delete(Column::Objects, rec_key(REC_POOL, &p.token.to_be_bytes()));
+        } else {
+            self.store.put(Column::Objects, rec_key(REC_POOL, &p.token.to_be_bytes()), encode_pool(p));
+        }
+    }
+
+    /// Every live pool, ascending by token id (explorer/wallet listing).
+    pub fn pools(&self) -> Vec<Pool> {
+        self.store
+            .scan_prefix(Column::Objects, &[REC_POOL])
+            .into_iter()
+            .filter_map(|(_, body)| decode_pool(&body))
+            .collect()
+    }
+
+    /// Read one bonding-curve pool by token id.
+    pub fn curve(&self, token: u32) -> Option<CurvePool> {
+        let bytes = self.store.get(Column::Objects, &rec_key(REC_CURVE, &token.to_be_bytes()))?;
+        Some(decode_curve(&bytes).expect("corrupt curve record"))
+    }
+
+    /// Write one bonding-curve pool record.
+    fn put_curve(&mut self, c: &CurvePool) {
+        self.store.put(Column::Objects, rec_key(REC_CURVE, &c.token.to_be_bytes()), encode_curve(c));
+    }
+
+    /// Every live bonding curve, ascending by token id (launchpad listing).
+    pub fn curves(&self) -> Vec<CurvePool> {
+        self.store
+            .scan_prefix(Column::Objects, &[REC_CURVE])
+            .into_iter()
+            .filter_map(|(_, body)| decode_curve(&body))
+            .collect()
+    }
+
+    /// One provider's LP shares in the pool for `token` (0 if none).
+    pub fn lp_shares(&self, token: u32, provider: &[u8; 32]) -> u64 {
+        self.store
+            .get(Column::Objects, &lp_key(token, provider))
+            .and_then(|b| Some(u64::from_le_bytes(b.as_slice().try_into().ok()?)))
+            .unwrap_or(0)
+    }
+
+    /// Write one LP-share record; zero-share records are deleted (canonical).
+    fn put_lp(&mut self, token: u32, provider: &[u8; 32], shares: u64) {
+        if shares == 0 {
+            self.store.delete(Column::Objects, lp_key(token, provider));
+        } else {
+            self.store.put(Column::Objects, lp_key(token, provider), shares.to_le_bytes().to_vec());
+        }
+    }
+
+    /// Read one open HTLC by id.
+    pub fn htlc(&self, id: &[u8; 32]) -> Option<Htlc> {
+        let bytes = self.store.get(Column::Objects, &rec_key(REC_HTLC, id))?;
+        Some(decode_htlc(&bytes).expect("corrupt htlc record"))
+    }
+
+    /// Every open HTLC as `(id, lock)`, ascending by id (bridge/wallet UIs).
+    pub fn htlcs(&self) -> Vec<([u8; 32], Htlc)> {
+        self.store
+            .scan_prefix(Column::Objects, &[REC_HTLC])
+            .into_iter()
+            .filter_map(|(key, body)| {
+                let id: [u8; 32] = key.get(1..)?.try_into().ok()?;
+                Some((id, decode_htlc(&body)?))
+            })
+            .collect()
+    }
+
     /// The validator's currently bonded stake (0 if it never staked).
     pub fn staked(&self, id: &[u8; 32]) -> u64 {
         self.validator(id).map(|v| v.staked).unwrap_or(0)
@@ -780,6 +1015,30 @@ impl Ledger {
             }
             Transaction::SlashEvidence { validator, .. } => {
                 vec![DirtyKey::Validator(*validator)]
+            }
+            Transaction::AddLiquidity { token, provider, .. }
+            | Transaction::RemoveLiquidity { token, provider, .. } => vec![
+                DirtyKey::Account(*provider),
+                DirtyKey::Pool(*token),
+                DirtyKey::Lp(*token, *provider),
+            ],
+            Transaction::Swap { token, trader, .. } => {
+                vec![DirtyKey::Account(*trader), DirtyKey::Pool(*token)]
+            }
+            // The creator account (credited the curve fee) isn't knowable from
+            // the tx alone — it comes from the token record — so the apply arm
+            // marks it directly; here we cover the trader and the curve.
+            Transaction::CurveTrade { token, trader, .. } => {
+                vec![DirtyKey::Account(*trader), DirtyKey::Curve(*token)]
+            }
+            Transaction::HtlcLock { token, from, to, amount, hashlock, expiry, nonce, .. } => vec![
+                DirtyKey::Account(*from),
+                DirtyKey::Htlc(lat_types::htlc_id(*token, from, to, *amount, hashlock, *expiry, *nonce)),
+            ],
+            // The credited account is only knowable from the (now-deleted) lock
+            // record, so the apply arm marks it directly; here we cover the lock.
+            Transaction::HtlcClaim { id, .. } | Transaction::HtlcRefund { id } => {
+                vec![DirtyKey::Htlc(*id)]
             }
         }
     }
@@ -1470,6 +1729,334 @@ impl Ledger {
                 }
                 Ok(())
             }
+
+            Transaction::AddLiquidity { token, provider, lat_amount, tok_amount, fee, nonce, sig } => {
+                // Deposit public LAT + token into the constant-product pool,
+                // minting LP shares. Transparent auth, both legs debited from
+                // the provider's public balances.
+                check_sig(provider, tx, sig)?;
+                if *token == LAT_TOKEN || self.token_by_id(*token).is_none() {
+                    return Err(LedgerError::BadPoolToken);
+                }
+                if *lat_amount == 0 || *tok_amount == 0 {
+                    return Err(LedgerError::ZeroAmount);
+                }
+                let mut acct = self.account(provider).ok_or(LedgerError::SenderNotRegistered)?;
+                if *nonce != acct.nonce {
+                    return Err(LedgerError::BadNonce);
+                }
+                // Work out the actual deposit and the shares it mints.
+                let (pool, tok_used, minted) = match self.pool(*token) {
+                    None => {
+                        // Pool creation: geometric-mean shares, with the first
+                        // MIN_POOL_LIQUIDITY burned (never owned by anyone) so
+                        // share value can't be inflated against later providers.
+                        let lp0 = isqrt(*lat_amount as u128 * *tok_amount as u128);
+                        if lp0 <= MIN_POOL_LIQUIDITY {
+                            return Err(LedgerError::InsufficientLiquidity);
+                        }
+                        let pool = Pool { token: *token, lat: *lat_amount, tok: *tok_amount, lp_supply: lp0 };
+                        (pool, *tok_amount, lp0 - MIN_POOL_LIQUIDITY)
+                    }
+                    Some(mut p) => {
+                        // Ratio-matched add: `lat_amount` is exact, the token
+                        // leg is computed (rounded UP, favoring the pool);
+                        // `tok_amount` is the provider's ceiling on that leg.
+                        let tok_needed = ((*lat_amount as u128 * p.tok as u128)
+                            .div_ceil(p.lat as u128))
+                            .try_into()
+                            .map_err(|_| LedgerError::InsufficientLiquidity)?;
+                        if tok_needed > *tok_amount {
+                            return Err(LedgerError::SlippageExceeded);
+                        }
+                        // Shares floor-scaled by the LAT leg (rounding favors the pool).
+                        let minted = (*lat_amount as u128 * p.lp_supply as u128 / p.lat as u128)
+                            as u64;
+                        if minted == 0 || tok_needed == 0 {
+                            return Err(LedgerError::InsufficientLiquidity);
+                        }
+                        p.lat = p.lat.checked_add(*lat_amount).ok_or(LedgerError::InsufficientLiquidity)?;
+                        p.tok = p.tok.checked_add(tok_needed).ok_or(LedgerError::InsufficientLiquidity)?;
+                        p.lp_supply = p.lp_supply.checked_add(minted).ok_or(LedgerError::InsufficientLiquidity)?;
+                        (p, tok_needed, minted)
+                    }
+                };
+                // Solvency: LAT leg + fee against public LAT, token leg against
+                // the public token balance.
+                let lat_total = lat_amount.checked_add(*fee).ok_or(LedgerError::InsufficientPublicBalance)?;
+                if acct.public(LAT_TOKEN) < lat_total || acct.public(*token) < tok_used {
+                    return Err(LedgerError::InsufficientPublicBalance);
+                }
+                acct.set_public(LAT_TOKEN, acct.public(LAT_TOKEN) - lat_total);
+                acct.set_public(*token, acct.public(*token) - tok_used);
+                acct.nonce += 1;
+                self.put_account(provider, acct);
+                let shares = self
+                    .lp_shares(*token, provider)
+                    .checked_add(minted)
+                    .ok_or(LedgerError::InsufficientLiquidity)?;
+                self.put_lp(*token, provider, shares);
+                self.put_pool(&pool);
+                Ok(())
+            }
+
+            Transaction::RemoveLiquidity { token, provider, lp_amount, fee, nonce, sig } => {
+                check_sig(provider, tx, sig)?;
+                if *lp_amount == 0 {
+                    return Err(LedgerError::ZeroAmount);
+                }
+                let mut acct = self.account(provider).ok_or(LedgerError::SenderNotRegistered)?;
+                if *nonce != acct.nonce {
+                    return Err(LedgerError::BadNonce);
+                }
+                let mut p = self.pool(*token).ok_or(LedgerError::PoolNotFound)?;
+                let shares = self.lp_shares(*token, provider);
+                if shares < *lp_amount {
+                    return Err(LedgerError::InsufficientLiquidity);
+                }
+                // Proportional payout, floored (rounding dust stays in the pool).
+                let lat_out = (*lp_amount as u128 * p.lat as u128 / p.lp_supply as u128) as u64;
+                let tok_out = (*lp_amount as u128 * p.tok as u128 / p.lp_supply as u128) as u64;
+                if lat_out == 0 && tok_out == 0 {
+                    return Err(LedgerError::InsufficientLiquidity); // pure share burn
+                }
+                if acct.public(LAT_TOKEN) < *fee {
+                    return Err(LedgerError::InsufficientPublicBalance);
+                }
+                acct.set_public(LAT_TOKEN, acct.public(LAT_TOKEN) - fee);
+                acct.nonce += 1;
+                // The burned MIN_POOL_LIQUIDITY is unowned, so lp_supply never
+                // hits zero here and the reserves never fully drain.
+                p.lat -= lat_out;
+                p.tok -= tok_out;
+                p.lp_supply -= lp_amount;
+                acct.set_public(LAT_TOKEN, acct.public(LAT_TOKEN).saturating_add(lat_out));
+                acct.set_public(*token, acct.public(*token).saturating_add(tok_out));
+                self.put_account(provider, acct);
+                self.put_lp(*token, provider, shares - lp_amount);
+                self.put_pool(&p);
+                Ok(())
+            }
+
+            Transaction::Swap { token, trader, lat_in, amount_in, min_out, fee, nonce, sig } => {
+                check_sig(trader, tx, sig)?;
+                if *amount_in == 0 {
+                    return Err(LedgerError::ZeroAmount);
+                }
+                let mut acct = self.account(trader).ok_or(LedgerError::SenderNotRegistered)?;
+                if *nonce != acct.nonce {
+                    return Err(LedgerError::BadNonce);
+                }
+                let mut p = self.pool(*token).ok_or(LedgerError::PoolNotFound)?;
+                // Constant-product output with the swap fee kept by the
+                // reserves: out = in·(1−f)·R_out / (R_in + in·(1−f)), in basis
+                // points and u128 so no intermediate overflows. Strictly less
+                // than R_out, so the pool can never be drained by a swap.
+                let (r_in, r_out) = if *lat_in { (p.lat, p.tok) } else { (p.tok, p.lat) };
+                let in_after_fee = *amount_in as u128 * (10_000 - SWAP_FEE_BPS) as u128;
+                let out = (in_after_fee * r_out as u128
+                    / (r_in as u128 * 10_000 + in_after_fee)) as u64;
+                if out == 0 || out < *min_out {
+                    return Err(LedgerError::SlippageExceeded);
+                }
+                let new_r_in =
+                    r_in.checked_add(*amount_in).ok_or(LedgerError::InsufficientLiquidity)?;
+                // Debit the input leg + the LAT miner fee, credit the output leg.
+                let out_token = if *lat_in { *token } else { LAT_TOKEN };
+                let lat_debit = if *lat_in {
+                    amount_in.checked_add(*fee).ok_or(LedgerError::InsufficientPublicBalance)?
+                } else {
+                    *fee
+                };
+                let tok_debit = if *lat_in { 0 } else { *amount_in };
+                if acct.public(LAT_TOKEN) < lat_debit || acct.public(*token) < tok_debit {
+                    return Err(LedgerError::InsufficientPublicBalance);
+                }
+                acct.set_public(LAT_TOKEN, acct.public(LAT_TOKEN) - lat_debit);
+                if !*lat_in {
+                    acct.set_public(*token, acct.public(*token) - tok_debit);
+                }
+                acct.set_public(out_token, acct.public(out_token).saturating_add(out));
+                acct.nonce += 1;
+                if *lat_in {
+                    p.lat = new_r_in;
+                    p.tok = r_out - out;
+                } else {
+                    p.tok = new_r_in;
+                    p.lat = r_out - out;
+                }
+                self.put_account(trader, acct);
+                self.put_pool(&p);
+                Ok(())
+            }
+
+            Transaction::CurveTrade { token, trader, is_buy, amount, min_out, fee, nonce, sig } => {
+                check_sig(trader, tx, sig)?;
+                if *amount == 0 {
+                    return Err(LedgerError::ZeroAmount);
+                }
+                // The curve pairs a token against native LAT — LAT itself has no
+                // curve.
+                if *token == LAT_TOKEN {
+                    return Err(LedgerError::BadPoolToken);
+                }
+                // The token must exist; its creator earns the 1% curve fee.
+                let creator =
+                    self.token_by_id(*token).ok_or(LedgerError::BadPoolToken)?.creator;
+
+                let mut acct = self.account(trader).ok_or(LedgerError::SenderNotRegistered)?;
+                if *nonce != acct.nonce {
+                    return Err(LedgerError::BadNonce);
+                }
+
+                // Load the curve, or open a fresh one on the first buy. A sell
+                // into a curve that was never opened has nothing to price.
+                let cp = match self.curve(*token) {
+                    Some(c) => c,
+                    None if *is_buy => CurvePool::genesis(*token),
+                    None => return Err(LedgerError::CurveNotFound),
+                };
+                if cp.graduated {
+                    return Err(LedgerError::CurveGraduated);
+                }
+                let mut math = cp.math();
+
+                if *is_buy {
+                    // Price the buy: `amount` LAT in → tokens out, 1% fee withheld.
+                    // (None here means the curve rejected it — over MAX_TRADE.)
+                    let fill = math.apply_buy(*amount).ok_or(LedgerError::SlippageExceeded)?;
+                    if fill.out == 0 || fill.out < *min_out {
+                        return Err(LedgerError::SlippageExceeded);
+                    }
+                    // Debit the trader `amount` LAT (net → curve, fee → creator)
+                    // plus the miner fee.
+                    let lat_debit =
+                        amount.checked_add(*fee).ok_or(LedgerError::InsufficientPublicBalance)?;
+                    if acct.public(LAT_TOKEN) < lat_debit {
+                        return Err(LedgerError::InsufficientPublicBalance);
+                    }
+                    acct.set_public(LAT_TOKEN, acct.public(LAT_TOKEN) - lat_debit);
+                    // Mint the bought tokens to the trader's public balance.
+                    acct.set_public(*token, acct.public(*token).saturating_add(fill.out));
+                    acct.nonce += 1;
+                    self.put_account(trader, acct);
+                    // The curve fee (LAT) goes to the token's creator.
+                    self.credit_public(&creator, LAT_TOKEN, fill.fee);
+                    self.put_curve(&CurvePool::from_math(*token, math));
+                    Ok(())
+                } else {
+                    // Sell tokens: cannot sell more than the trader holds.
+                    let held = acct.public(*token);
+                    if held < *amount {
+                        return Err(LedgerError::InsufficientPublicBalance);
+                    }
+                    let reserve = math.real_lat;
+                    let fill = math
+                        .apply_sell(*amount, held)
+                        .ok_or(LedgerError::SlippageExceeded)?;
+                    // Total LAT leaving the curve (seller payout + creator fee).
+                    let gross = fill.out.checked_add(fill.fee).ok_or(LedgerError::CurveInsolvent)?;
+                    // The curve can never pay out more LAT than it holds.
+                    if gross > reserve {
+                        return Err(LedgerError::CurveInsolvent);
+                    }
+                    if fill.out < *min_out {
+                        return Err(LedgerError::SlippageExceeded);
+                    }
+                    // The miner fee is paid in LAT from the trader.
+                    if acct.public(LAT_TOKEN) < *fee {
+                        return Err(LedgerError::InsufficientPublicBalance);
+                    }
+                    acct.set_public(LAT_TOKEN, acct.public(LAT_TOKEN) - *fee);
+                    // Burn the sold tokens; pay the seller their LAT out.
+                    acct.set_public(*token, held - *amount);
+                    acct.set_public(LAT_TOKEN, acct.public(LAT_TOKEN).saturating_add(fill.out));
+                    acct.nonce += 1;
+                    self.put_account(trader, acct);
+                    // The curve fee (LAT) goes to the token's creator.
+                    self.credit_public(&creator, LAT_TOKEN, fill.fee);
+                    self.put_curve(&CurvePool::from_math(*token, math));
+                    Ok(())
+                }
+            }
+
+            Transaction::HtlcLock { token, from, to, amount, hashlock, expiry, fee, nonce, sig } => {
+                check_sig(from, tx, sig)?;
+                if *amount == 0 {
+                    return Err(LedgerError::ZeroAmount);
+                }
+                // A lock born at-or-past its own expiry could never be claimed.
+                if *expiry <= height {
+                    return Err(LedgerError::HtlcExpired);
+                }
+                let mut acct = self.account(from).ok_or(LedgerError::SenderNotRegistered)?;
+                if *nonce != acct.nonce {
+                    return Err(LedgerError::BadNonce);
+                }
+                let id = lat_types::htlc_id(*token, from, to, *amount, hashlock, *expiry, *nonce);
+                if self.htlc(&id).is_some() {
+                    return Err(LedgerError::HtlcExists);
+                }
+                // Escrow the amount (of `token`) + the LAT miner fee.
+                let lat_debit = if *token == LAT_TOKEN {
+                    amount.checked_add(*fee).ok_or(LedgerError::InsufficientPublicBalance)?
+                } else {
+                    *fee
+                };
+                let tok_debit = if *token == LAT_TOKEN { 0 } else { *amount };
+                if acct.public(LAT_TOKEN) < lat_debit || acct.public(*token) < tok_debit {
+                    return Err(LedgerError::InsufficientPublicBalance);
+                }
+                acct.set_public(LAT_TOKEN, acct.public(LAT_TOKEN) - lat_debit);
+                if *token != LAT_TOKEN {
+                    acct.set_public(*token, acct.public(*token) - tok_debit);
+                }
+                acct.nonce += 1;
+                self.put_account(from, acct);
+                self.store.put(
+                    Column::Objects,
+                    rec_key(REC_HTLC, &id),
+                    encode_htlc(&Htlc {
+                        token: *token,
+                        from: *from,
+                        to: *to,
+                        amount: *amount,
+                        hashlock: *hashlock,
+                        expiry: *expiry,
+                    }),
+                );
+                Ok(())
+            }
+
+            Transaction::HtlcClaim { id, preimage } => {
+                // Self-authenticating: the preimage is the authority, and the
+                // funds can only go to the recipient the lock recorded. Replay
+                // finds the record already deleted.
+                let h = self.htlc(id).ok_or(LedgerError::HtlcNotFound)?;
+                if height >= h.expiry {
+                    return Err(LedgerError::HtlcExpired);
+                }
+                use sha2::{Digest, Sha256};
+                let hash: [u8; 32] = Sha256::digest(preimage).into();
+                if hash != h.hashlock {
+                    return Err(LedgerError::BadPreimage);
+                }
+                self.store.delete(Column::Objects, rec_key(REC_HTLC, id));
+                // credit_public registers the recipient if needed and marks it
+                // dirty (the claim's dirty_keys_for can't know this account).
+                self.credit_public(&h.to, h.token, h.amount);
+                Ok(())
+            }
+
+            Transaction::HtlcRefund { id } => {
+                let h = self.htlc(id).ok_or(LedgerError::HtlcNotFound)?;
+                if height < h.expiry {
+                    return Err(LedgerError::HtlcNotExpired);
+                }
+                self.store.delete(Column::Objects, rec_key(REC_HTLC, id));
+                self.credit_public(&h.from, h.token, h.amount);
+                Ok(())
+            }
         }
     }
 
@@ -1528,6 +2115,22 @@ impl Ledger {
                 trie_key_validator(id),
                 self.validator(id).map(|v| validator_leaf_preimage(id, &v)),
             ),
+            DirtyKey::Pool(token) => {
+                (trie_key_pool(*token), self.pool(*token).map(|p| pool_leaf_preimage(&p)))
+            }
+            DirtyKey::Curve(token) => {
+                (trie_key_curve(*token), self.curve(*token).map(|c| curve_leaf_preimage(&c)))
+            }
+            DirtyKey::Lp(token, provider) => {
+                let shares = self.lp_shares(*token, provider);
+                (
+                    trie_key_lp(*token, provider),
+                    (shares > 0).then(|| lp_leaf_preimage(*token, provider, shares)),
+                )
+            }
+            DirtyKey::Htlc(id) => {
+                (trie_key_htlc(id), self.htlc(id).map(|h| htlc_leaf_preimage(id, &h)))
+            }
             DirtyKey::Meta => (trie_key_meta(), Some(self.next_token_id.to_le_bytes().to_vec())),
         }
     }
@@ -1577,6 +2180,55 @@ fn trie_key_meta() -> [u8; 32] {
 }
 fn trie_key_validator(id: &[u8; 32]) -> [u8; 32] {
     trie_key(b"val", id)
+}
+fn trie_key_pool(token: u32) -> [u8; 32] {
+    trie_key(b"pool", &token.to_le_bytes())
+}
+fn trie_key_curve(token: u32) -> [u8; 32] {
+    trie_key(b"curv", &token.to_le_bytes())
+}
+fn trie_key_lp(token: u32, provider: &[u8; 32]) -> [u8; 32] {
+    let mut body = Vec::with_capacity(4 + 32);
+    body.extend_from_slice(&token.to_le_bytes());
+    body.extend_from_slice(provider);
+    trie_key(b"lp", &body)
+}
+fn trie_key_htlc(id: &[u8; 32]) -> [u8; 32] {
+    trie_key(b"htlc", id)
+}
+
+/// Canonical byte preimage of a pool leaf, so headers commit the DEX reserves.
+fn pool_leaf_preimage(p: &Pool) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(b"LAT-state-pool");
+    b.extend_from_slice(&encode_pool(p));
+    b
+}
+
+/// Canonical byte preimage of a bonding-curve leaf, so headers commit the
+/// curve reserves (a light client can trust a token's price from the root).
+fn curve_leaf_preimage(c: &CurvePool) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(b"LAT-state-curve");
+    b.extend_from_slice(&encode_curve(c));
+    b
+}
+
+fn lp_leaf_preimage(token: u32, provider: &[u8; 32], shares: u64) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(b"LAT-state-lp");
+    b.extend_from_slice(&token.to_le_bytes());
+    b.extend_from_slice(provider);
+    b.extend_from_slice(&shares.to_le_bytes());
+    b
+}
+
+fn htlc_leaf_preimage(id: &[u8; 32], h: &Htlc) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(b"LAT-state-htlc");
+    b.extend_from_slice(id);
+    b.extend_from_slice(&encode_htlc(h));
+    b
 }
 
 /// Canonical byte preimage of a validator leaf (tag + id + record body), so
@@ -1668,8 +2320,94 @@ const REC_CONTRACT: u8 = b'c';
 const REC_NULLIFIER: u8 = b'n';
 /// Validator staking records (T13).
 const REC_VALIDATOR: u8 = b'v';
+/// DEX liquidity pools, keyed by BIG-endian paired-token id (scan order).
+const REC_POOL: u8 = b'p';
+/// Native bonding-curve pools, keyed by BIG-endian token id (scan order).
+const REC_CURVE: u8 = b'C';
+/// LP-share balances, keyed by BIG-endian token id + provider account id.
+const REC_LP: u8 = b'l';
+/// Open HTLC escrows, keyed by lock id.
+const REC_HTLC: u8 = b'h';
 /// The single `next_token_id` meta record.
 const REC_META: u8 = b'm';
+
+/// Record key of one provider's LP shares in one pool.
+fn lp_key(token: u32, provider: &[u8; 32]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(1 + 4 + 32);
+    k.push(REC_LP);
+    k.extend_from_slice(&token.to_be_bytes());
+    k.extend_from_slice(provider);
+    k
+}
+
+/// Pool record body: token id + reserves + LP supply (id included, like token
+/// records, so the body can be emitted into a snapshot verbatim).
+fn encode_pool(p: &Pool) -> Vec<u8> {
+    let mut v = Vec::with_capacity(4 + 8 + 8 + 8);
+    v.extend_from_slice(&p.token.to_le_bytes());
+    v.extend_from_slice(&p.lat.to_le_bytes());
+    v.extend_from_slice(&p.tok.to_le_bytes());
+    v.extend_from_slice(&p.lp_supply.to_le_bytes());
+    v
+}
+
+fn decode_pool(b: &[u8]) -> Option<Pool> {
+    let mut r = Reader { b, off: 0 };
+    let token = r.u32()?;
+    let lat = r.u64()?;
+    let tok = r.u64()?;
+    let lp_supply = r.u64()?;
+    (r.off == b.len()).then_some(Pool { token, lat, tok, lp_supply })
+}
+
+/// Bonding-curve record body: token id + virtual reserves + real LAT + a
+/// graduation flag (id included so the body goes into a snapshot verbatim).
+fn encode_curve(c: &CurvePool) -> Vec<u8> {
+    let mut v = Vec::with_capacity(4 + 8 + 8 + 8 + 1);
+    v.extend_from_slice(&c.token.to_le_bytes());
+    v.extend_from_slice(&c.vlat.to_le_bytes());
+    v.extend_from_slice(&c.vtok.to_le_bytes());
+    v.extend_from_slice(&c.real_lat.to_le_bytes());
+    v.push(c.graduated as u8);
+    v
+}
+
+fn decode_curve(b: &[u8]) -> Option<CurvePool> {
+    let mut r = Reader { b, off: 0 };
+    let token = r.u32()?;
+    let vlat = r.u64()?;
+    let vtok = r.u64()?;
+    let real_lat = r.u64()?;
+    let graduated = match r.take(1)?[0] {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    (r.off == b.len()).then_some(CurvePool { token, vlat, vtok, real_lat, graduated })
+}
+
+/// HTLC record body (the id is the record key).
+fn encode_htlc(h: &Htlc) -> Vec<u8> {
+    let mut v = Vec::with_capacity(4 + 32 + 32 + 8 + 32 + 8);
+    v.extend_from_slice(&h.token.to_le_bytes());
+    v.extend_from_slice(&h.from);
+    v.extend_from_slice(&h.to);
+    v.extend_from_slice(&h.amount.to_le_bytes());
+    v.extend_from_slice(&h.hashlock);
+    v.extend_from_slice(&h.expiry.to_le_bytes());
+    v
+}
+
+fn decode_htlc(b: &[u8]) -> Option<Htlc> {
+    let mut r = Reader { b, off: 0 };
+    let token = r.u32()?;
+    let from = r.arr32()?;
+    let to = r.arr32()?;
+    let amount = r.u64()?;
+    let hashlock = r.arr32()?;
+    let expiry = r.u64()?;
+    (r.off == b.len()).then_some(Htlc { token, from, to, amount, hashlock, expiry })
+}
 
 fn rec_key(tag: u8, body: &[u8]) -> Vec<u8> {
     let mut k = Vec::with_capacity(1 + body.len());
@@ -1817,10 +2555,11 @@ pub fn verify_account_proof(root: &[u8; 32], proof: &AccountProof) -> bool {
 // chain layer enforces this (see lat-chain).
 
 /// Version tag heading every ledger snapshot encoding. Bumped to 2 when the
-/// anonymous-spend nullifier set joined the encoding, and to 3 when validator
-/// staking records (T13) did; an old snapshot no longer decodes, which simply
+/// anonymous-spend nullifier set joined the encoding, to 3 when validator
+/// staking records (T13) did, and to 5 when the native DEX (pools + LP shares)
+/// and HTLC escrows did; an old snapshot no longer decodes, which simply
 /// costs one full replay on the next boot.
-const LEDGER_MAGIC: &[u8; 8] = b"LATLEDG4";
+const LEDGER_MAGIC: &[u8; 8] = b"LATLEDG6";
 
 impl Ledger {
     /// Canonical snapshot encoding of the full ledger (see the section note).
@@ -1863,6 +2602,32 @@ impl Ledger {
         for (key, body) in validators {
             v.extend_from_slice(&key[1..]); // validator id
             v.extend_from_slice(&body); // staked + unbonding entries
+        }
+
+        let pools = self.store.scan_prefix(Column::Objects, &[REC_POOL]);
+        v.extend_from_slice(&(pools.len() as u32).to_le_bytes());
+        for (_key, body) in pools {
+            v.extend_from_slice(&body); // token + reserves + lp_supply
+        }
+
+        let lps = self.store.scan_prefix(Column::Objects, &[REC_LP]);
+        v.extend_from_slice(&(lps.len() as u32).to_le_bytes());
+        for (key, body) in lps {
+            v.extend_from_slice(&key[1..]); // token (BE) + provider id
+            v.extend_from_slice(&body); // shares
+        }
+
+        let htlcs = self.store.scan_prefix(Column::Objects, &[REC_HTLC]);
+        v.extend_from_slice(&(htlcs.len() as u32).to_le_bytes());
+        for (key, body) in htlcs {
+            v.extend_from_slice(&key[1..]); // lock id
+            v.extend_from_slice(&body); // token + parties + amount + hashlock + expiry
+        }
+
+        let curves = self.store.scan_prefix(Column::Objects, &[REC_CURVE]);
+        v.extend_from_slice(&(curves.len() as u32).to_le_bytes());
+        for (_key, body) in curves {
+            v.extend_from_slice(&body); // token + vlat + vtok + real_lat + graduated
         }
         v
     }
@@ -1939,6 +2704,57 @@ impl Ledger {
             ledger.mark(DirtyKey::Validator(id));
         }
 
+        for _ in 0..r.u32()? {
+            let token = r.u32()?;
+            let lat = r.u64()?;
+            let tok = r.u64()?;
+            let lp_supply = r.u64()?;
+            if lp_supply == 0 {
+                return None; // a drained pool is deleted, never encoded
+            }
+            ledger.put_pool(&Pool { token, lat, tok, lp_supply });
+            ledger.mark(DirtyKey::Pool(token));
+        }
+
+        for _ in 0..r.u32()? {
+            let token = u32::from_be_bytes(r.take(4)?.try_into().ok()?);
+            let provider = r.arr32()?;
+            let shares = r.u64()?;
+            if shares == 0 {
+                return None; // zero-share records are deleted, never encoded
+            }
+            ledger.put_lp(token, &provider, shares);
+            ledger.mark(DirtyKey::Lp(token, provider));
+        }
+
+        for _ in 0..r.u32()? {
+            let id = r.arr32()?;
+            let token = r.u32()?;
+            let from = r.arr32()?;
+            let to = r.arr32()?;
+            let amount = r.u64()?;
+            let hashlock = r.arr32()?;
+            let expiry = r.u64()?;
+            let h = Htlc { token, from, to, amount, hashlock, expiry };
+            ledger.store.put(Column::Objects, rec_key(REC_HTLC, &id), encode_htlc(&h));
+            ledger.mark(DirtyKey::Htlc(id));
+        }
+
+        for _ in 0..r.u32()? {
+            let token = r.u32()?;
+            let vlat = r.u64()?;
+            let vtok = r.u64()?;
+            let real_lat = r.u64()?;
+            let graduated = match r.take(1)?[0] {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            let c = CurvePool { token, vlat, vtok, real_lat, graduated };
+            ledger.put_curve(&c);
+            ledger.mark(DirtyKey::Curve(token));
+        }
+
         // Reject trailing garbage — an encoding is exactly its contents.
         if r.off != b.len() {
             return None;
@@ -2008,10 +2824,403 @@ mod tests {
             | Transaction::Unshield { sig, .. }
             | Transaction::ShieldStealth { sig, .. }
             | Transaction::Stake { sig, .. }
-            | Transaction::Unstake { sig, .. } => *sig = sig_bytes,
+            | Transaction::Unstake { sig, .. }
+            | Transaction::AddLiquidity { sig, .. }
+            | Transaction::RemoveLiquidity { sig, .. }
+            | Transaction::Swap { sig, .. }
+            | Transaction::CurveTrade { sig, .. }
+            | Transaction::HtlcLock { sig, .. } => *sig = sig_bytes,
             _ => {}
         }
         tx
+    }
+
+    /// Ledger with one registered account holding public LAT and a created
+    /// token `TKN` (id 1) with a public token balance — the DEX test fixture.
+    fn dex_ledger(rng: &mut OsRng) -> (Ledger, SecretKey, [u8; 32], u32) {
+        let sk = SecretKey::random(rng);
+        let id = sk.public_key().to_bytes();
+        let mut ledger = Ledger::new();
+        ledger.register(id).unwrap();
+        ledger.credit_public(&id, LAT_TOKEN, 10_000_000);
+        let tx = signed(
+            Transaction::CreateToken { ticker: "TKN".into(), creator: id, supply: 1_000_000, sig: [0u8; 64] },
+            &sk,
+        );
+        ledger.apply(&tx).unwrap();
+        let token = ledger.token("TKN").unwrap().id;
+        ledger.credit_public(&id, token, 5_000_000);
+        (ledger, sk, id, token)
+    }
+
+    #[test]
+    fn amm_pool_lifecycle_add_swap_remove() {
+        let mut rng = OsRng;
+        let (mut ledger, sk, id, token) = dex_ledger(&mut rng);
+        let nonce = ledger.nonce(&id).unwrap();
+
+        // Create the pool: 1_000_000 LAT + 4_000_000 TKN.
+        let tx = signed(
+            Transaction::AddLiquidity { token, provider: id, lat_amount: 1_000_000, tok_amount: 4_000_000, fee: 1_000, nonce, sig: [0u8; 64] },
+            &sk,
+        );
+        ledger.apply(&tx).unwrap();
+        let p = ledger.pool(token).unwrap();
+        assert_eq!((p.lat, p.tok), (1_000_000, 4_000_000));
+        assert_eq!(p.lp_supply, 2_000_000, "geometric mean");
+        let shares = ledger.lp_shares(token, &id);
+        assert_eq!(shares, 2_000_000 - MIN_POOL_LIQUIDITY, "minimum burned");
+
+        // Swap 100_000 LAT → TKN and check the constant-product output.
+        let nonce = ledger.nonce(&id).unwrap();
+        let tok_before = ledger.public_balance(&id, token).unwrap();
+        let tx = signed(
+            Transaction::Swap { token, trader: id, lat_in: true, amount_in: 100_000, min_out: 1, fee: 1_000, nonce, sig: [0u8; 64] },
+            &sk,
+        );
+        ledger.apply(&tx).unwrap();
+        let p2 = ledger.pool(token).unwrap();
+        let expected_out = (100_000u128 * 9_970 * 4_000_000
+            / (1_000_000u128 * 10_000 + 100_000u128 * 9_970)) as u64;
+        assert_eq!(ledger.public_balance(&id, token).unwrap(), tok_before + expected_out);
+        assert_eq!(p2.lat, 1_100_000);
+        assert_eq!(p2.tok, 4_000_000 - expected_out);
+        // The invariant only ever grows (the fee stays in the reserves).
+        assert!(p2.lat as u128 * p2.tok as u128 >= 1_000_000u128 * 4_000_000);
+
+        // A swap whose output undershoots min_out is rejected whole.
+        let nonce = ledger.nonce(&id).unwrap();
+        let tx = signed(
+            Transaction::Swap { token, trader: id, lat_in: true, amount_in: 1_000, min_out: u64::MAX, fee: 1_000, nonce, sig: [0u8; 64] },
+            &sk,
+        );
+        assert_eq!(ledger.apply(&tx), Err(LedgerError::SlippageExceeded));
+
+        // Remove all shares: proportional payout, pool record survives on the
+        // burned minimum.
+        let nonce = ledger.nonce(&id).unwrap();
+        let tx = signed(
+            Transaction::RemoveLiquidity { token, provider: id, lp_amount: shares, fee: 1_000, nonce, sig: [0u8; 64] },
+            &sk,
+        );
+        ledger.apply(&tx).unwrap();
+        assert_eq!(ledger.lp_shares(token, &id), 0);
+        let p3 = ledger.pool(token).unwrap();
+        assert_eq!(p3.lp_supply, MIN_POOL_LIQUIDITY);
+        assert!(p3.lat > 0 && p3.tok > 0, "burned minimum keeps reserves nonzero");
+    }
+
+    #[test]
+    fn amm_rejects_bad_pools_and_replays() {
+        let mut rng = OsRng;
+        let (mut ledger, sk, id, token) = dex_ledger(&mut rng);
+        let nonce = ledger.nonce(&id).unwrap();
+        // No LAT/LAT pool; no pool for a token that was never created.
+        let tx = signed(
+            Transaction::AddLiquidity { token: LAT_TOKEN, provider: id, lat_amount: 1_000, tok_amount: 1_000, fee: 1_000, nonce, sig: [0u8; 64] },
+            &sk,
+        );
+        assert_eq!(ledger.apply(&tx), Err(LedgerError::BadPoolToken));
+        let tx = signed(
+            Transaction::AddLiquidity { token: 77, provider: id, lat_amount: 1_000, tok_amount: 1_000, fee: 1_000, nonce, sig: [0u8; 64] },
+            &sk,
+        );
+        assert_eq!(ledger.apply(&tx), Err(LedgerError::BadPoolToken));
+        // Swapping against a nonexistent pool fails.
+        let tx = signed(
+            Transaction::Swap { token, trader: id, lat_in: true, amount_in: 1_000, min_out: 0, fee: 1_000, nonce, sig: [0u8; 64] },
+            &sk,
+        );
+        assert_eq!(ledger.apply(&tx), Err(LedgerError::PoolNotFound));
+        // Nonce-bound: a replayed AddLiquidity is rejected.
+        let tx = signed(
+            Transaction::AddLiquidity { token, provider: id, lat_amount: 100_000, tok_amount: 400_000, fee: 1_000, nonce, sig: [0u8; 64] },
+            &sk,
+        );
+        ledger.apply(&tx).unwrap();
+        assert_eq!(ledger.apply(&tx), Err(LedgerError::BadNonce));
+    }
+
+    /// Ledger with a token creator (id, holds LAT for the create fee) and a
+    /// separate well-funded buyer, plus a token `MEME` with **no** premine — the
+    /// native bonding curve is its sole minter. Returns
+    /// `(ledger, creator_sk, creator_id, buyer_sk, buyer_id, token)`.
+    fn curve_ledger(rng: &mut OsRng) -> (Ledger, SecretKey, [u8; 32], SecretKey, [u8; 32], u32) {
+        let csk = SecretKey::random(rng);
+        let cid = csk.public_key().to_bytes();
+        let bsk = SecretKey::random(rng);
+        let bid = bsk.public_key().to_bytes();
+        let mut ledger = Ledger::new();
+        ledger.register(cid).unwrap();
+        ledger.register(bid).unwrap();
+        ledger.credit_public(&cid, LAT_TOKEN, 1_000_000);
+        ledger.credit_public(&bid, LAT_TOKEN, 100_000_000);
+        let tx = signed(
+            Transaction::CreateToken { ticker: "MEME".into(), creator: cid, supply: 0, sig: [0u8; 64] },
+            &csk,
+        );
+        ledger.apply(&tx).unwrap();
+        let token = ledger.token("MEME").unwrap().id;
+        (ledger, csk, cid, bsk, bid, token)
+    }
+
+    #[test]
+    fn curve_buy_and_sell_settle_atomically() {
+        use lat_contracts::bonding_curve::Curve as RefCurve;
+        let mut rng = OsRng;
+        let (mut ledger, _csk, cid, bsk, bid, token) = curve_ledger(&mut rng);
+
+        // --- BUY: 1 LAT worth. LAT out of the buyer, tokens minted in, curve fee
+        // to the creator — all in one applied transaction.
+        let buyer_lat0 = ledger.public_balance(&bid, LAT_TOKEN).unwrap();
+        let creator_lat0 = ledger.public_balance(&cid, LAT_TOKEN).unwrap();
+        let mut refc = RefCurve::default();
+        let buy = refc.apply_buy(100_000).unwrap();
+
+        let nonce = ledger.nonce(&bid).unwrap();
+        let tx = signed(
+            Transaction::CurveTrade { token, trader: bid, is_buy: true, amount: 100_000, min_out: 1, fee: 1_000, nonce, sig: [0u8; 64] },
+            &bsk,
+        );
+        ledger.apply(&tx).unwrap();
+
+        // Buyer paid amount + miner fee; received exactly the minted tokens.
+        assert_eq!(ledger.public_balance(&bid, LAT_TOKEN).unwrap(), buyer_lat0 - 100_000 - 1_000);
+        assert_eq!(ledger.public_balance(&bid, token).unwrap(), buy.out);
+        // Creator earned exactly the 1% curve fee, in LAT.
+        assert_eq!(ledger.public_balance(&cid, LAT_TOKEN).unwrap(), creator_lat0 + buy.fee);
+        // On-chain curve equals the reference math.
+        let c = ledger.curve(token).unwrap();
+        assert_eq!((c.vlat, c.vtok, c.real_lat, c.graduated), (refc.vlat, refc.vtok, refc.real_lat, refc.graduated));
+
+        // --- SELL: give half the tokens back for LAT.
+        let held = ledger.public_balance(&bid, token).unwrap();
+        let sell_amt = held / 2;
+        let buyer_lat1 = ledger.public_balance(&bid, LAT_TOKEN).unwrap();
+        let creator_lat1 = ledger.public_balance(&cid, LAT_TOKEN).unwrap();
+        let sell = refc.apply_sell(sell_amt, held).unwrap();
+
+        let nonce = ledger.nonce(&bid).unwrap();
+        let tx = signed(
+            Transaction::CurveTrade { token, trader: bid, is_buy: false, amount: sell_amt, min_out: 1, fee: 1_000, nonce, sig: [0u8; 64] },
+            &bsk,
+        );
+        ledger.apply(&tx).unwrap();
+
+        // Tokens burned; seller received the payout net of the miner fee.
+        assert_eq!(ledger.public_balance(&bid, token).unwrap(), held - sell_amt);
+        assert_eq!(ledger.public_balance(&bid, LAT_TOKEN).unwrap(), buyer_lat1 - 1_000 + sell.out);
+        // Creator earned the sell-side curve fee too.
+        assert_eq!(ledger.public_balance(&cid, LAT_TOKEN).unwrap(), creator_lat1 + sell.fee);
+        let c2 = ledger.curve(token).unwrap();
+        assert_eq!((c2.vlat, c2.vtok, c2.real_lat), (refc.vlat, refc.vtok, refc.real_lat));
+    }
+
+    #[test]
+    fn curve_round_trip_conserves_lat_and_stays_solvent() {
+        // Buy, then sell every token back: the curve pays out only LAT it holds,
+        // and the buyer's net loss is exactly the fees (curve + miner), never
+        // more — the curve can't be drained.
+        let mut rng = OsRng;
+        let (mut ledger, cid_sk, cid, bsk, bid, token) = curve_ledger(&mut rng);
+        let _ = (cid_sk, cid);
+
+        let buyer_lat0 = ledger.public_balance(&bid, LAT_TOKEN).unwrap();
+
+        let nonce = ledger.nonce(&bid).unwrap();
+        ledger
+            .apply(&signed(
+                Transaction::CurveTrade { token, trader: bid, is_buy: true, amount: 5_000_000, min_out: 1, fee: 1_000, nonce, sig: [0u8; 64] },
+                &bsk,
+            ))
+            .unwrap();
+        let held = ledger.public_balance(&bid, token).unwrap();
+        let reserve_after_buy = ledger.curve(token).unwrap().real_lat;
+
+        // Sell everything back.
+        let nonce = ledger.nonce(&bid).unwrap();
+        ledger
+            .apply(&signed(
+                Transaction::CurveTrade { token, trader: bid, is_buy: false, amount: held, min_out: 1, fee: 1_000, nonce, sig: [0u8; 64] },
+                &bsk,
+            ))
+            .unwrap();
+
+        assert_eq!(ledger.public_balance(&bid, token).unwrap(), 0, "all tokens burned");
+        let curve = ledger.curve(token).unwrap();
+        // A full round trip returns the curve's real LAT to (near) zero — it never
+        // paid out more than it took in.
+        assert!(curve.real_lat <= reserve_after_buy);
+        // The creator collected fees; the buyer's loss equals the total fees paid
+        // plus what the creator now holds — LAT is conserved, none minted.
+        let buyer_lat_end = ledger.public_balance(&bid, LAT_TOKEN).unwrap();
+        assert!(buyer_lat_end < buyer_lat0, "buyer paid fees over the round trip");
+        // The curve holds a tiny dust remainder at most (integer rounding).
+        assert!(curve.real_lat < 1_000, "reserve drains to dust on a full round trip");
+    }
+
+    #[test]
+    fn curve_rejects_sell_before_open_and_oversell() {
+        let mut rng = OsRng;
+        let (mut ledger, _csk, _cid, bsk, bid, token) = curve_ledger(&mut rng);
+
+        // Selling into a curve no buy ever opened.
+        let nonce = ledger.nonce(&bid).unwrap();
+        let tx = signed(
+            Transaction::CurveTrade { token, trader: bid, is_buy: false, amount: 1, min_out: 0, fee: 1_000, nonce, sig: [0u8; 64] },
+            &bsk,
+        );
+        assert_eq!(ledger.apply(&tx), Err(LedgerError::CurveNotFound));
+
+        // Open it with a buy, then try to sell more than held.
+        let nonce = ledger.nonce(&bid).unwrap();
+        ledger
+            .apply(&signed(
+                Transaction::CurveTrade { token, trader: bid, is_buy: true, amount: 100_000, min_out: 1, fee: 1_000, nonce, sig: [0u8; 64] },
+                &bsk,
+            ))
+            .unwrap();
+        let held = ledger.public_balance(&bid, token).unwrap();
+        let nonce = ledger.nonce(&bid).unwrap();
+        let tx = signed(
+            Transaction::CurveTrade { token, trader: bid, is_buy: false, amount: held + 1, min_out: 0, fee: 1_000, nonce, sig: [0u8; 64] },
+            &bsk,
+        );
+        assert_eq!(ledger.apply(&tx), Err(LedgerError::InsufficientPublicBalance));
+    }
+
+    #[test]
+    fn curve_min_out_slippage_rejects_whole_trade() {
+        let mut rng = OsRng;
+        let (mut ledger, _csk, _cid, bsk, bid, token) = curve_ledger(&mut rng);
+        let lat0 = ledger.public_balance(&bid, LAT_TOKEN).unwrap();
+        let nonce = ledger.nonce(&bid).unwrap();
+        let tx = signed(
+            Transaction::CurveTrade { token, trader: bid, is_buy: true, amount: 100_000, min_out: u64::MAX, fee: 1_000, nonce, sig: [0u8; 64] },
+            &bsk,
+        );
+        assert_eq!(ledger.apply(&tx), Err(LedgerError::SlippageExceeded));
+        // Rejected whole — no balance moved, no curve opened.
+        assert_eq!(ledger.public_balance(&bid, LAT_TOKEN).unwrap(), lat0);
+        assert!(ledger.curve(token).is_none());
+    }
+
+    #[test]
+    fn curve_graduation_locks_further_trades() {
+        let mut rng = OsRng;
+        let (mut ledger, _csk, _cid, bsk, bid, token) = curve_ledger(&mut rng);
+        // One large buy crosses the graduation threshold (500 LAT).
+        let nonce = ledger.nonce(&bid).unwrap();
+        ledger
+            .apply(&signed(
+                Transaction::CurveTrade { token, trader: bid, is_buy: true, amount: 60_000_000, min_out: 1, fee: 1_000, nonce, sig: [0u8; 64] },
+                &bsk,
+            ))
+            .unwrap();
+        assert!(ledger.curve(token).unwrap().graduated, "curve graduated");
+        // A post-graduation trade is refused.
+        let nonce = ledger.nonce(&bid).unwrap();
+        let tx = signed(
+            Transaction::CurveTrade { token, trader: bid, is_buy: true, amount: 100_000, min_out: 1, fee: 1_000, nonce, sig: [0u8; 64] },
+            &bsk,
+        );
+        assert_eq!(ledger.apply(&tx), Err(LedgerError::CurveGraduated));
+    }
+
+    #[test]
+    fn curve_survives_snapshot_roundtrip() {
+        let mut rng = OsRng;
+        let (mut ledger, _csk, _cid, bsk, bid, token) = curve_ledger(&mut rng);
+        let nonce = ledger.nonce(&bid).unwrap();
+        ledger
+            .apply(&signed(
+                Transaction::CurveTrade { token, trader: bid, is_buy: true, amount: 250_000, min_out: 1, fee: 1_000, nonce, sig: [0u8; 64] },
+                &bsk,
+            ))
+            .unwrap();
+        let root = ledger.state_root();
+        let curve = ledger.curve(token).unwrap();
+
+        // Encode → decode reproduces the exact curve and the exact state root.
+        let bytes = ledger.encode();
+        let restored = Ledger::decode(&bytes).expect("snapshot decodes");
+        assert_eq!(restored.state_root(), root, "root committed the curve");
+        assert_eq!(restored.curve(token), Some(curve));
+    }
+
+    #[test]
+    fn htlc_lock_claim_refund_lifecycle() {
+        use sha2::{Digest, Sha256};
+        let mut rng = OsRng;
+        let (mut ledger, sk, id, _token) = dex_ledger(&mut rng);
+        let recipient = SecretKey::random(&mut rng).public_key().to_bytes();
+        let preimage = [42u8; 32];
+        let hashlock: [u8; 32] = Sha256::digest(preimage).into();
+
+        // Lock 50_000 LAT for `recipient`, expiring at height 100.
+        let nonce = ledger.nonce(&id).unwrap();
+        let lat_before = ledger.public_balance(&id, LAT_TOKEN).unwrap();
+        let tx = signed(
+            Transaction::HtlcLock { token: LAT_TOKEN, from: id, to: recipient, amount: 50_000, hashlock, expiry: 100, fee: 1_000, nonce, sig: [0u8; 64] },
+            &sk,
+        );
+        ledger.apply_at(&tx, 10).unwrap();
+        let lock_id = lat_types::htlc_id(LAT_TOKEN, &id, &recipient, 50_000, &hashlock, 100, nonce);
+        assert!(ledger.htlc(&lock_id).is_some());
+        assert_eq!(ledger.public_balance(&id, LAT_TOKEN).unwrap(), lat_before - 51_000);
+
+        // A wrong preimage is rejected; a refund before expiry is rejected.
+        let bad = Transaction::HtlcClaim { id: lock_id, preimage: [1u8; 32] };
+        assert_eq!(ledger.apply_at(&bad, 20), Err(LedgerError::BadPreimage));
+        let refund = Transaction::HtlcRefund { id: lock_id };
+        assert_eq!(ledger.apply_at(&refund, 20), Err(LedgerError::HtlcNotExpired));
+
+        // The right preimage claims it (auto-registering the recipient);
+        // a replay finds the lock gone.
+        let claim = Transaction::HtlcClaim { id: lock_id, preimage };
+        ledger.apply_at(&claim, 20).unwrap();
+        assert_eq!(ledger.public_balance(&recipient, LAT_TOKEN), Some(50_000));
+        assert_eq!(ledger.apply_at(&claim, 21), Err(LedgerError::HtlcNotFound));
+
+        // Second lock: expire it and refund; a claim after expiry is rejected.
+        let nonce = ledger.nonce(&id).unwrap();
+        let tx = signed(
+            Transaction::HtlcLock { token: LAT_TOKEN, from: id, to: recipient, amount: 7_000, hashlock, expiry: 100, fee: 1_000, nonce, sig: [0u8; 64] },
+            &sk,
+        );
+        ledger.apply_at(&tx, 10).unwrap();
+        let lock2 = lat_types::htlc_id(LAT_TOKEN, &id, &recipient, 7_000, &hashlock, 100, nonce);
+        let claim2 = Transaction::HtlcClaim { id: lock2, preimage };
+        assert_eq!(ledger.apply_at(&claim2, 100), Err(LedgerError::HtlcExpired));
+        let before = ledger.public_balance(&id, LAT_TOKEN).unwrap();
+        ledger.apply_at(&Transaction::HtlcRefund { id: lock2 }, 100).unwrap();
+        assert_eq!(ledger.public_balance(&id, LAT_TOKEN).unwrap(), before + 7_000);
+    }
+
+    #[test]
+    fn dex_and_htlc_state_survive_snapshot_roundtrip() {
+        use sha2::{Digest, Sha256};
+        let mut rng = OsRng;
+        let (mut ledger, sk, id, token) = dex_ledger(&mut rng);
+        let nonce = ledger.nonce(&id).unwrap();
+        let tx = signed(
+            Transaction::AddLiquidity { token, provider: id, lat_amount: 500_000, tok_amount: 500_000, fee: 1_000, nonce, sig: [0u8; 64] },
+            &sk,
+        );
+        ledger.apply(&tx).unwrap();
+        let hashlock: [u8; 32] = Sha256::digest([9u8; 32]).into();
+        let nonce = ledger.nonce(&id).unwrap();
+        let tx = signed(
+            Transaction::HtlcLock { token, from: id, to: [3u8; 32], amount: 1_234, hashlock, expiry: 999, fee: 1_000, nonce, sig: [0u8; 64] },
+            &sk,
+        );
+        ledger.apply_at(&tx, 1).unwrap();
+
+        let decoded = Ledger::decode(&ledger.encode()).expect("snapshot decodes");
+        assert_eq!(decoded.state_root(), ledger.state_root(), "same committed root");
+        assert_eq!(decoded.pool(token), ledger.pool(token));
+        assert_eq!(decoded.lp_shares(token, &id), ledger.lp_shares(token, &id));
+        assert_eq!(decoded.htlcs(), ledger.htlcs());
     }
 
     /// Ledger with `n` registered accounts each holding `amount` confidential LAT.

@@ -10,9 +10,12 @@ name = "lat-wallet-web"
 path = "src/main.rs"
 
 [dependencies]
+lat-chain.workspace = true
 lat-crypto.workspace = true
 lat-types.workspace = true
 lat-wallet.workspace = true
+lat-bridge.workspace = true
 lat-p2p.workspace = true
 rand = "0.8"
 hex = "0.4"
+sha2.workspace = true

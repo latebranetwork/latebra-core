@@ -416,6 +416,13 @@ fn tx_involves(tx: &Transaction, id: &[u8; 32]) -> bool {
         Transaction::Stake { validator, .. }
         | Transaction::Unstake { validator, .. }
         | Transaction::SlashEvidence { validator, .. } => validator == id,
+        Transaction::AddLiquidity { provider, .. }
+        | Transaction::RemoveLiquidity { provider, .. } => provider == id,
+        Transaction::Swap { trader, .. } => trader == id,
+        Transaction::CurveTrade { trader, .. } => trader == id,
+        Transaction::HtlcLock { from, to, .. } => from == id || to == id,
+        // Claim/refund name only the lock id; the parties live in state.
+        Transaction::HtlcClaim { .. } | Transaction::HtlcRefund { .. } => false,
     }
 }
 
@@ -575,6 +582,13 @@ fn tag(tx: &Transaction) -> (&'static str, &'static str) {
         Transaction::Stake { .. } => ("stake", "Stake"),
         Transaction::Unstake { .. } => ("stake", "Unstake"),
         Transaction::SlashEvidence { .. } => ("stake", "Slash"),
+        Transaction::AddLiquidity { .. } => ("tok", "Add Liquidity"),
+        Transaction::RemoveLiquidity { .. } => ("tok", "Remove Liquidity"),
+        Transaction::Swap { .. } => ("xfer", "Swap"),
+        Transaction::CurveTrade { is_buy, .. } => ("xfer", if *is_buy { "Curve Buy" } else { "Curve Sell" }),
+        Transaction::HtlcLock { .. } => ("ct", "Bridge Lock"),
+        Transaction::HtlcClaim { .. } => ("ct", "Bridge Claim"),
+        Transaction::HtlcRefund { .. } => ("ct", "Bridge Refund"),
     }
 }
 
@@ -628,6 +642,42 @@ fn tx_detail(tx: &Transaction) -> (String, String) {
         Transaction::SlashEvidence { validator, height, .. } => (
             format!("{} slashed", short(validator)),
             format!("equivocation at height {height} — stake burned"),
+        ),
+        Transaction::AddLiquidity { token, provider, lat_amount, .. } => (
+            format!("{} adds liquidity", short(provider)),
+            format!("<span class='pill-amt'>{}</span> LAT + token {token}", commafy(*lat_amount)),
+        ),
+        Transaction::RemoveLiquidity { token, provider, lp_amount, .. } => (
+            format!("{} removes liquidity", short(provider)),
+            format!("<span class='pill-amt'>{}</span> LP · token {token}", commafy(*lp_amount)),
+        ),
+        Transaction::Swap { token, trader, lat_in, amount_in, .. } => (
+            format!("{} swaps", short(trader)),
+            if *lat_in {
+                format!("<span class='pill-amt'>{}</span> LAT → token {token}", commafy(*amount_in))
+            } else {
+                format!("<span class='pill-amt'>{}</span> token {token} → LAT", commafy(*amount_in))
+            },
+        ),
+        Transaction::CurveTrade { token, trader, is_buy, amount, .. } => (
+            format!("{} {}", short(trader), if *is_buy { "buys on curve" } else { "sells on curve" }),
+            if *is_buy {
+                format!("<span class='pill-amt'>{}</span> LAT → token {token}", commafy(*amount))
+            } else {
+                format!("<span class='pill-amt'>{}</span> token {token} → LAT", commafy(*amount))
+            },
+        ),
+        Transaction::HtlcLock { token, from, to, amount, expiry, .. } => (
+            format!("{} locks for {}", short(from), short(to)),
+            format!("<span class='pill-amt'>{}</span> · token {token} · expires #{expiry}", commafy(*amount)),
+        ),
+        Transaction::HtlcClaim { id, .. } => (
+            format!("claim {}", short(id)),
+            "preimage revealed — escrow released".to_string(),
+        ),
+        Transaction::HtlcRefund { id } => (
+            format!("refund {}", short(id)),
+            "expired — escrow returned".to_string(),
         ),
     }
 }
@@ -784,6 +834,13 @@ fn feed_badge(tx: &Transaction) -> (&'static str, &'static str) {
         Transaction::Stake { .. } => ("b-pub", "Stake"),
         Transaction::Unstake { .. } => ("b-pub", "Unstake"),
         Transaction::SlashEvidence { .. } => ("b-reg", "Slash"),
+        Transaction::AddLiquidity { .. } => ("b-tk", "Add LP"),
+        Transaction::RemoveLiquidity { .. } => ("b-tk", "Remove LP"),
+        Transaction::Swap { .. } => ("b-pub", "Swap"),
+        Transaction::CurveTrade { is_buy, .. } => ("b-pub", if *is_buy { "Curve Buy" } else { "Curve Sell" }),
+        Transaction::HtlcLock { .. } => ("b-ct", "Bridge"),
+        Transaction::HtlcClaim { .. } => ("b-ct", "Claim"),
+        Transaction::HtlcRefund { .. } => ("b-ct", "Refund"),
     }
 }
 
@@ -807,6 +864,30 @@ fn feed_amount(tx: &Transaction) -> String {
             format!("<span class='tamt'>{} LAT</span>", fmt_lat(*amount))
         }
         Transaction::SlashEvidence { .. } => "<span class='tamt muted'>slashed</span>".to_string(),
+        Transaction::AddLiquidity { lat_amount, .. } => {
+            format!("<span class='tamt'>{} LAT</span>", fmt_lat(*lat_amount))
+        }
+        Transaction::RemoveLiquidity { lp_amount, .. } => {
+            format!("<span class='tamt'>{} LP</span>", commafy(*lp_amount))
+        }
+        Transaction::Swap { lat_in, amount_in, .. } if *lat_in => {
+            format!("<span class='tamt'>{} LAT</span>", fmt_lat(*amount_in))
+        }
+        Transaction::Swap { amount_in, .. } => {
+            format!("<span class='tamt'>{}</span>", commafy(*amount_in))
+        }
+        Transaction::CurveTrade { is_buy, amount, .. } if *is_buy => {
+            format!("<span class='tamt'>{} LAT</span>", fmt_lat(*amount))
+        }
+        Transaction::CurveTrade { amount, .. } => {
+            format!("<span class='tamt'>{}</span>", commafy(*amount))
+        }
+        Transaction::HtlcLock { amount, .. } => {
+            format!("<span class='tamt'>{}</span>", commafy(*amount))
+        }
+        Transaction::HtlcClaim { .. } | Transaction::HtlcRefund { .. } => {
+            "<span class='tamt muted'>escrow</span>".to_string()
+        }
     }
 }
 

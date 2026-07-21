@@ -14,12 +14,15 @@
 //!     on-chain: token image/description, community chat, governance
 //!     proposals/votes, and the creator's fee tally (the VM cannot pay it out).
 //!
-//! ## Honest boundary
-//! Pricing and token accounting are consensus-enforced. **LAT settlement is not**:
-//! the VM cannot move value, so the LAT leg of a trade is a separate transfer and
-//! the two are not atomic. See D4 in PROJECT_CHECKPOINT.md and THREAT_MODEL §2.6.
-//! latfun is also **custodial** — callers post their seed — which is testnet-only
-//! posture, not a launch posture.
+//! ## Settlement (D4 closed)
+//! Trades now settle as a native `CurveTrade` consensus transaction: a buy debits
+//! LAT and mints tokens, a sell burns tokens and pays out LAT, atomically in one
+//! step, with both the 1% curve fee (to the creator) and the miner fee enforced
+//! by consensus. (Previously the curve was a VM contract that could only move
+//! *notional* accounting, since the VM cannot transfer value.) latfun reads the
+//! curve from native ledger state over RPC, so it still cannot fake a price.
+//! latfun remains **custodial** — callers post their seed — which is a
+//! testnet-only posture, not a launch posture.
 //!
 //! Run:
 //!   latfun --node 127.0.0.1:4040 --listen 127.0.0.1:5180 --frontend latebra-launchpad/frontend
@@ -217,46 +220,22 @@ fn account_id(hex: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// Read a token's curve straight from the chain's contract storage — the
-/// authoritative state, as consensus applied it. `None` if the curve isn't
-/// deployed yet or the node is unreachable.
+/// Read a token's native bonding curve straight from the ledger over RPC — the
+/// authoritative state, as consensus applied it. `None` if no curve has opened
+/// yet (no buy) or the node is unreachable.
 ///
 /// This is what makes the curve checkable: the numbers come from the ledger, not
 /// from latfun's JSON, so the operator cannot quote a price the chain disagrees
-/// with. Slot 4 (`SLOT_INIT`) is 0 until the first trade initializes the
-/// reserves, in which case the contract is deployed but still at its defaults.
-fn read_curve(node: &str, contract: [u8; 32]) -> Option<Curve> {
-    use lat_contracts::bonding_curve::{SLOT_GRADUATED, SLOT_INIT, SLOT_REAL_LAT, SLOT_VLAT, SLOT_VTOK};
-    let slot = |k: u64| lat_p2p::get_contract_storage(node, contract, k).ok();
-    if slot(SLOT_INIT)? == 0 {
-        // Deployed but never traded: the contract initializes on first call, so
-        // its storage is empty and the defaults are the honest answer.
-        return Some(Curve::default());
-    }
-    Some(Curve {
-        vlat: slot(SLOT_VLAT)?,
-        vtok: slot(SLOT_VTOK)?,
-        real_lat: slot(SLOT_REAL_LAT)?,
-        graduated: slot(SLOT_GRADUATED)? != 0,
-    })
+/// with. The curve now lives in native consensus state (not a VM contract), so a
+/// trade settles LAT and tokens atomically — see `lat_state`'s `CurveTrade`.
+fn read_curve_native(node: &str, token: u32) -> Option<Curve> {
+    let (vlat, vtok, real_lat, graduated) = lat_p2p::get_curve(node, token).ok()??;
+    Some(Curve { vlat, vtok, real_lat, graduated })
 }
 
-/// Read one account's on-chain holdings of a token's curve.
-fn read_holdings(node: &str, contract: [u8; 32], who: &[u8; 32]) -> Option<u64> {
-    lat_p2p::get_contract_storage(node, contract, lat_contracts::bonding_curve::holdings_key(who)).ok()
-}
-
-/// Which indexed token, if any, owns `contract` as its curve.
-///
-/// Derived rather than stored: a curve id is `hash(creator ‖ salted code)`, so
-/// recomputing it per token is the same check a trader would run. Contracts the
-/// launchpad didn't deploy simply don't match, which is what keeps an unrelated
-/// contract from being indexed as somebody's curve.
-fn curve_owner(s: &Store, contract: &[u8; 32]) -> Option<String> {
-    s.tokens.iter().find_map(|(norm, t)| {
-        let creator = account_id(&t.creator_id)?;
-        (&lat_contracts::bonding_curve::curve_id(&creator, norm) == contract).then(|| norm.clone())
-    })
+/// Which indexed token, if any, has this on-chain `token_id`.
+fn token_by_id(s: &Store, id: u32) -> Option<String> {
+    s.tokens.iter().find_map(|(norm, t)| (t.token_id == id).then(|| norm.clone()))
 }
 
 impl App {
@@ -335,21 +314,22 @@ fn index_chain(app: &App) {
             // makes the books honest: a submitted trade that the chain rejects
             // (bad nonce, reverted by the curve) never reaches a block, so it can
             // never reach the ledger below either.
-            if let Transaction::CallContract { contract, caller, input, .. } = tx {
-                let Some(norm) = curve_owner(&s, contract) else { continue };
-                let (is_buy, amount) = lat_contracts::bonding_curve::decode_trade(*input);
+            if let Transaction::CurveTrade { token, trader, is_buy, amount, .. } = tx {
+                let is_buy = *is_buy;
+                let amount = *amount;
+                let Some(norm) = token_by_id(&s, *token) else { continue };
                 let Some(t) = s.tokens.get_mut(&norm) else { continue };
 
-                // Replay the trade through the contract's own math, from the
-                // state we last agreed with the chain on. The curve is
-                // deterministic and blocks arrive in order, so this tracks it
-                // exactly — and read_curve() re-anchors us to the ledger anyway.
+                // Replay the trade through the curve's own math, from the state we
+                // last agreed with the chain on. The curve is deterministic and
+                // blocks arrive in order, so this tracks it exactly — and
+                // read_curve_native() re-anchors us to the ledger anyway.
                 let mut curve: Curve = t.curve.into();
-                let who = hex_id(caller);
+                let who = hex_id(trader);
                 let held = t.holdings.get(&who).copied().unwrap_or(0);
                 let Some(fill) = (if is_buy { curve.apply_buy(amount) } else { curve.apply_sell(amount, held) })
                 else {
-                    continue; // The contract reverted; consensus changed nothing.
+                    continue; // The trade reverted; consensus changed nothing.
                 };
                 if is_buy {
                     *t.holdings.entry(who.clone()).or_insert(0) += fill.out;
@@ -915,30 +895,33 @@ fn trade(app: &App, body: &serde_json::Value) -> (&'static str, String) {
         Err(_) => return err("connect a wallet first"),
     };
 
-    // Derive the curve from public data (creator + ticker) — never from a
-    // client-supplied id, or the caller could point us at their own contract.
-    let creator_hex = {
+    // The token's on-chain id — its native bonding curve is keyed by it.
+    let token_id = {
         let s = app.store.lock().unwrap();
         let Some(t) = s.tokens.get(&norm) else { return err("no such token") };
-        t.creator_id.clone()
+        if t.token_id == 0 {
+            return err("that token hasn't mined yet — wait for the next block");
+        }
+        t.token_id
     };
-    let Some(creator) = account_id(&creator_hex) else {
-        return err("that token hasn't mined yet — wait for the next block");
-    };
-    let contract = lat_contracts::bonding_curve::curve_id(&creator, &norm);
+    let is_buy = side == "buy";
 
-    // Authoritative state: the ledger's, not ours.
-    let Some(mut curve) = read_curve(&app.node, contract) else {
-        return err("the curve isn't on-chain yet (or the node is offline) — retry shortly");
+    // Authoritative state: the ledger's native curve, not ours. A curve opens
+    // lazily on the first buy, so "no curve yet" is only an error for a sell.
+    let mut curve = match read_curve_native(&app.node, token_id) {
+        Some(c) => c,
+        None if is_buy => Curve::default(),
+        None => return err("the curve hasn't opened yet — be the first to buy"),
     };
     if curve.graduated {
         return err("token graduated — trade on the DEX (coming soon)");
     }
-    let held = read_holdings(&app.node, contract, &w.id()).unwrap_or(0);
+    // Holdings consensus will price a sell against: the trader's real public
+    // token balance (the curve mints/burns public tokens).
+    let held = lat_p2p::get_public_balance(&app.node, w.id(), token_id).ok().flatten().unwrap_or(0);
 
-    // Dry-run the contract's own math so a doomed trade costs no transaction, and
-    // so we can quote what it will produce. The chain re-runs this for real.
-    let is_buy = side == "buy";
+    // Dry-run the curve's own math so a doomed trade costs no transaction, and so
+    // we can quote what it will produce. The chain re-runs this for real.
     let quote = if is_buy { curve.apply_buy(amount) } else { curve.apply_sell(amount, held) };
     let Some(fill) = quote else {
         return err(if !is_buy && amount > held {
@@ -956,10 +939,12 @@ fn trade(app: &App, body: &serde_json::Value) -> (&'static str, String) {
         }
         Err(_) => return err("node offline"),
     };
-    let input = lat_contracts::bonding_curve::encode_trade(is_buy, amount);
-    match lat_p2p::submit_tx(&app.node, &w.call_contract(contract, input, nonce).encode()) {
+    // Submit the atomic on-chain CurveTrade. min_out = 0: the curve is
+    // deterministic and re-quoted here; consensus enforces the reserve math.
+    let fee = lat_wallet::MIN_TRANSFER_FEE;
+    match lat_p2p::submit_tx(&app.node, &w.curve_trade(token_id, is_buy, amount, 0, fee, nonce).encode()) {
         Ok(true) => {}
-        Ok(false) => return err("the node rejected the trade (duplicate nonce, or too little LAT for the fee)"),
+        Ok(false) => return err("the node rejected the trade (nonce, or too little LAT for amount + fee)"),
         Err(_) => return err("node offline"),
     }
 
@@ -976,7 +961,7 @@ fn trade(app: &App, body: &serde_json::Value) -> (&'static str, String) {
         "quoted_out": fill.out,
         "quoted_fee": fill.fee,
         "note": note,
-        "curve_id": hex_id(&contract),
+        "token_id": token_id,
         "price": CurveState::from(curve).price(),
         "market_cap": CurveState::from(curve).market_cap(),
         "progress": CurveState::from(curve).progress(),

@@ -9,6 +9,7 @@ members = [
     "crates/lat-state",
     "crates/lat-chain",
     "crates/lat-wallet",
+    "crates/lat-bridge",
     "crates/lat-net",
     "crates/lat-p2p",
     "crates/lat-node",
@@ -41,6 +42,7 @@ lat-types = { path = "crates/lat-types" }
 lat-state = { path = "crates/lat-state" }
 lat-chain = { path = "crates/lat-chain" }
 lat-wallet = { path = "crates/lat-wallet" }
+lat-bridge = { path = "crates/lat-bridge" }
 lat-p2p = { path = "crates/lat-p2p" }
 lat-vm = { path = "crates/lat-vm" }
 lat-contracts = { path = "crates/lat-contracts" }

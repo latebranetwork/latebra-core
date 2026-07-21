@@ -28,7 +28,9 @@ use lat_types::Transaction;
 /// simple guard so an incompatible wire format can't corrupt a sync. Bump it on
 /// any breaking change to the [`Msg`] codec or sync semantics.
 /// v2: finality gossip (T14/T16) + tx gossip and compact block announces (T17).
-pub const PROTOCOL_VERSION: u32 = 2;
+/// v3: native DEX + HTLC bridge — new transaction tags (0x0F–0x14), new state
+/// records in snapshots/fast-sync, and the pool/HTLC read RPCs (tags 38–44).
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Consecutive contact failures before a peer is evicted from the set. Keeps the
 /// peer list self-healing: a node that goes offline is forgotten instead of
@@ -415,6 +417,26 @@ enum Msg {
     GetStake([u8; 32]),
     /// Reply: `(bonded stake, unbonding entries as (amount, release height))`.
     StakeReply(u64, Vec<(u64, u64)>),
+    /// RPC: ask for the DEX pool of `token`.
+    GetPool(u32),
+    /// Reply: `(lat reserve, token reserve, LP supply)`, or `None` if no pool.
+    PoolReply(Option<(u64, u64, u64)>),
+    /// RPC: ask for an account's LP shares in the pool of `token`. Replied
+    /// with `PublicBalanceReply` (shares are a public u64, same shape).
+    GetLpShares { token: u32, id: [u8; 32] },
+    /// RPC: ask for the open HTLC with this id.
+    GetHtlc([u8; 32]),
+    /// Reply: `(token, from, to, amount, hashlock, expiry)`, or `None`.
+    HtlcReply(Option<(u32, [u8; 32], [u8; 32], u64, [u8; 32], u64)>),
+    /// RPC: ask for every open HTLC (bridge UIs filter client-side; testnet
+    /// scale — a paginated form can come later).
+    GetHtlcs,
+    /// Reply: `(id, token, from, to, amount, hashlock, expiry)` per lock.
+    HtlcsReply(Vec<([u8; 32], u32, [u8; 32], [u8; 32], u64, [u8; 32], u64)>),
+    /// RPC: ask for `token`'s native bonding curve.
+    GetCurve(u32),
+    /// Reply: `(vlat, vtok, real_lat, graduated)`, or `None` if no curve.
+    CurveReply(Option<(u64, u64, u64, bool)>),
     /// T17 tx gossip: an encoded transaction, flooding node-to-node so a tx
     /// submitted anywhere reaches every miner's mempool. Replied with `Ack`
     /// (whether it was newly added); newly added txs flood on.
@@ -669,6 +691,77 @@ impl Msg {
                     v.extend_from_slice(value);
                 }
             }
+            Msg::GetPool(token) => {
+                v.push(38);
+                v.extend_from_slice(&token.to_le_bytes());
+            }
+            Msg::PoolReply(opt) => {
+                v.push(39);
+                match opt {
+                    Some((lat, tok, lp)) => {
+                        v.push(1);
+                        v.extend_from_slice(&lat.to_le_bytes());
+                        v.extend_from_slice(&tok.to_le_bytes());
+                        v.extend_from_slice(&lp.to_le_bytes());
+                    }
+                    None => v.push(0),
+                }
+            }
+            Msg::GetLpShares { token, id } => {
+                v.push(40);
+                v.extend_from_slice(&token.to_le_bytes());
+                v.extend_from_slice(id);
+            }
+            Msg::GetHtlc(id) => {
+                v.push(41);
+                v.extend_from_slice(id);
+            }
+            Msg::HtlcReply(opt) => {
+                v.push(42);
+                match opt {
+                    Some((token, from, to, amount, hashlock, expiry)) => {
+                        v.push(1);
+                        v.extend_from_slice(&token.to_le_bytes());
+                        v.extend_from_slice(from);
+                        v.extend_from_slice(to);
+                        v.extend_from_slice(&amount.to_le_bytes());
+                        v.extend_from_slice(hashlock);
+                        v.extend_from_slice(&expiry.to_le_bytes());
+                    }
+                    None => v.push(0),
+                }
+            }
+            Msg::GetHtlcs => v.push(43),
+            Msg::HtlcsReply(locks) => {
+                v.push(44);
+                v.extend_from_slice(&(locks.len() as u32).to_le_bytes());
+                for (id, token, from, to, amount, hashlock, expiry) in locks {
+                    v.extend_from_slice(id);
+                    v.extend_from_slice(&token.to_le_bytes());
+                    v.extend_from_slice(from);
+                    v.extend_from_slice(to);
+                    v.extend_from_slice(&amount.to_le_bytes());
+                    v.extend_from_slice(hashlock);
+                    v.extend_from_slice(&expiry.to_le_bytes());
+                }
+            }
+            Msg::GetCurve(token) => {
+                v.push(45);
+                v.extend_from_slice(&token.to_le_bytes());
+            }
+            Msg::CurveReply(opt) => {
+                v.push(46);
+                match opt {
+                    Some((vlat, vtok, real_lat, graduated)) => {
+                        v.push(1);
+                        v.extend_from_slice(&vlat.to_le_bytes());
+                        v.extend_from_slice(&vtok.to_le_bytes());
+                        v.extend_from_slice(&real_lat.to_le_bytes());
+                        v.push(*graduated as u8);
+                    }
+                    None => v.push(0),
+                }
+            }
         }
         v
     }
@@ -868,6 +961,70 @@ impl Msg {
                 }
                 Msg::StateChunk(records)
             }
+            38 => Msg::GetPool(u32::from_le_bytes(rest.get(0..4)?.try_into().ok()?)),
+            39 => match rest.first()? {
+                0 => Msg::PoolReply(None),
+                1 => Msg::PoolReply(Some((
+                    u64::from_le_bytes(rest.get(1..9)?.try_into().ok()?),
+                    u64::from_le_bytes(rest.get(9..17)?.try_into().ok()?),
+                    u64::from_le_bytes(rest.get(17..25)?.try_into().ok()?),
+                ))),
+                _ => return None,
+            },
+            40 => Msg::GetLpShares {
+                token: u32::from_le_bytes(rest.get(0..4)?.try_into().ok()?),
+                id: rest.get(4..36)?.try_into().ok()?,
+            },
+            41 => Msg::GetHtlc(rest.get(0..32)?.try_into().ok()?),
+            42 => match rest.first()? {
+                0 => Msg::HtlcReply(None),
+                1 => Msg::HtlcReply(Some((
+                    u32::from_le_bytes(rest.get(1..5)?.try_into().ok()?),
+                    rest.get(5..37)?.try_into().ok()?,
+                    rest.get(37..69)?.try_into().ok()?,
+                    u64::from_le_bytes(rest.get(69..77)?.try_into().ok()?),
+                    rest.get(77..109)?.try_into().ok()?,
+                    u64::from_le_bytes(rest.get(109..117)?.try_into().ok()?),
+                ))),
+                _ => return None,
+            },
+            43 => Msg::GetHtlcs,
+            44 => {
+                let count = u32::from_le_bytes(rest.get(0..4)?.try_into().ok()?) as usize;
+                let mut locks = Vec::with_capacity(count.min(1 << 12));
+                let mut off = 4;
+                for _ in 0..count {
+                    locks.push((
+                        rest.get(off..off + 32)?.try_into().ok()?,
+                        u32::from_le_bytes(rest.get(off + 32..off + 36)?.try_into().ok()?),
+                        rest.get(off + 36..off + 68)?.try_into().ok()?,
+                        rest.get(off + 68..off + 100)?.try_into().ok()?,
+                        u64::from_le_bytes(rest.get(off + 100..off + 108)?.try_into().ok()?),
+                        rest.get(off + 108..off + 140)?.try_into().ok()?,
+                        u64::from_le_bytes(rest.get(off + 140..off + 148)?.try_into().ok()?),
+                    ));
+                    off += 148;
+                }
+                if off != rest.len() {
+                    return None;
+                }
+                Msg::HtlcsReply(locks)
+            }
+            45 => Msg::GetCurve(u32::from_le_bytes(rest.get(0..4)?.try_into().ok()?)),
+            46 => match rest.first()? {
+                0 => Msg::CurveReply(None),
+                1 => Msg::CurveReply(Some((
+                    u64::from_le_bytes(rest.get(1..9)?.try_into().ok()?),
+                    u64::from_le_bytes(rest.get(9..17)?.try_into().ok()?),
+                    u64::from_le_bytes(rest.get(17..25)?.try_into().ok()?),
+                    match rest.get(25)? {
+                        0 => false,
+                        1 => true,
+                        _ => return None,
+                    },
+                ))),
+                _ => return None,
+            },
             _ => return None,
         })
     }
@@ -1113,6 +1270,31 @@ fn handle_conn(mut stream: TcpStream, node: SharedNode) -> io::Result<()> {
             Msg::GetPublicBalance { id, token } => {
                 let b = lock_node(&node).chain.public_balance(&id, token);
                 Msg::PublicBalanceReply(b)
+            }
+            Msg::GetPool(token) => {
+                let p = lock_node(&node).chain.pool(token);
+                Msg::PoolReply(p.map(|p| (p.lat, p.tok, p.lp_supply)))
+            }
+            Msg::GetLpShares { token, id } => {
+                let shares = lock_node(&node).chain.lp_shares(token, &id);
+                Msg::PublicBalanceReply(Some(shares))
+            }
+            Msg::GetHtlc(id) => {
+                let h = lock_node(&node).chain.htlc(&id);
+                Msg::HtlcReply(h.map(|h| (h.token, h.from, h.to, h.amount, h.hashlock, h.expiry)))
+            }
+            Msg::GetHtlcs => {
+                let locks = lock_node(&node)
+                    .chain
+                    .htlcs()
+                    .into_iter()
+                    .map(|(id, h)| (id, h.token, h.from, h.to, h.amount, h.hashlock, h.expiry))
+                    .collect();
+                Msg::HtlcsReply(locks)
+            }
+            Msg::GetCurve(token) => {
+                let c = lock_node(&node).chain.curve(token);
+                Msg::CurveReply(c.map(|c| (c.vlat, c.vtok, c.real_lat, c.graduated)))
             }
             Msg::GetPending { id, token } => {
                 let b = lock_node(&node).chain.pending(&id, token).map(|c| c.to_bytes().to_vec());
@@ -1514,6 +1696,54 @@ pub fn has_contract<A: ToSocketAddrs>(addr: A, id: [u8; 32]) -> io::Result<bool>
     match rpc(addr, &Msg::HasContract(id))? {
         Msg::Ack(ok) => Ok(ok),
         _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected ack")),
+    }
+}
+
+/// RPC: the DEX pool of `token` as `(lat reserve, token reserve, LP supply)`,
+/// or `None` if no pool exists.
+pub fn get_pool<A: ToSocketAddrs>(addr: A, token: u32) -> io::Result<Option<(u64, u64, u64)>> {
+    match rpc(addr, &Msg::GetPool(token))? {
+        Msg::PoolReply(p) => Ok(p),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected pool")),
+    }
+}
+
+/// RPC: an account's LP shares in the pool of `token` (0 if none).
+pub fn get_lp_shares<A: ToSocketAddrs>(addr: A, token: u32, id: [u8; 32]) -> io::Result<u64> {
+    match rpc(addr, &Msg::GetLpShares { token, id })? {
+        Msg::PublicBalanceReply(n) => Ok(n.unwrap_or(0)),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected lp shares")),
+    }
+}
+
+/// RPC: `token`'s native bonding curve as `(vlat, vtok, real_lat, graduated)`,
+/// or `None` if none has opened.
+pub fn get_curve<A: ToSocketAddrs>(addr: A, token: u32) -> io::Result<Option<(u64, u64, u64, bool)>> {
+    match rpc(addr, &Msg::GetCurve(token))? {
+        Msg::CurveReply(c) => Ok(c),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected curve")),
+    }
+}
+
+/// RPC: the open HTLC with this id as `(token, from, to, amount, hashlock,
+/// expiry)`, or `None` (never existed, claimed, or refunded).
+pub fn get_htlc<A: ToSocketAddrs>(
+    addr: A,
+    id: [u8; 32],
+) -> io::Result<Option<(u32, [u8; 32], [u8; 32], u64, [u8; 32], u64)>> {
+    match rpc(addr, &Msg::GetHtlc(id))? {
+        Msg::HtlcReply(h) => Ok(h),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected htlc")),
+    }
+}
+
+/// RPC: every open HTLC as `(id, token, from, to, amount, hashlock, expiry)`.
+pub fn get_htlcs<A: ToSocketAddrs>(
+    addr: A,
+) -> io::Result<Vec<([u8; 32], u32, [u8; 32], [u8; 32], u64, [u8; 32], u64)>> {
+    match rpc(addr, &Msg::GetHtlcs)? {
+        Msg::HtlcsReply(locks) => Ok(locks),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected htlcs")),
     }
 }
 
@@ -2265,6 +2495,18 @@ mod tests {
             Msg::HandshakeAck { version: 2, genesis: [9; 32], accepted: true },
             Msg::GetContractStorage { contract: [10; 32], key: 5 },
             Msg::ContractStorageReply(77),
+            Msg::GetPool(3),
+            Msg::PoolReply(Some((1_000, 2_000, 1_414))),
+            Msg::PoolReply(None),
+            Msg::GetLpShares { token: 3, id: [11; 32] },
+            Msg::GetHtlc([12; 32]),
+            Msg::HtlcReply(Some((0, [1; 32], [2; 32], 777, [13; 32], 99))),
+            Msg::HtlcReply(None),
+            Msg::GetHtlcs,
+            Msg::HtlcsReply(vec![([12; 32], 0, [1; 32], [2; 32], 777, [13; 32], 99)]),
+            Msg::GetCurve(7),
+            Msg::CurveReply(Some((3_000_000, 1_000_000_000, 500_000, false))),
+            Msg::CurveReply(None),
             Msg::HasContract([11; 32]),
             Msg::FinalityVote(vec![12; 80]),
             Msg::FinalityCert(vec![13; 120]),

@@ -1,0 +1,33 @@
+[package]
+name = "lat-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "lat_bridge"
+path = "src/lib.rs"
+
+[dependencies]
+sha2.workspace = true
+bech32.workspace = true
+hex.workspace = true
+rand.workspace = true
+curve25519-dalek.workspace = true
+tiny-keccak = { version = "2", features = ["keccak"] }
+
+# The `node` feature adds a live-node watcher (reads HTLC state + scans blocks
+# for a revealed preimage). Kept optional so the core crypto crate stays light.
+lat-p2p = { workspace = true, optional = true }
+lat-types = { workspace = true, optional = true }
+lat-chain = { workspace = true, optional = true }
+
+[features]
+node = ["dep:lat-p2p", "dep:lat-types", "dep:lat-chain"]
+
+[[example]]
+name = "watch"
+required-features = ["node"]
+
+[dev-dependencies]

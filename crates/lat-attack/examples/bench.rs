@@ -150,7 +150,12 @@ fn main() {
         code.push(asm::STOP);
         let cid = lat_vm::contract_id(&sender.id(), &code);
 
-        let mut prod = Blockchain::genesis(&premine, DEFAULT_DIFFICULTY);
+        // Deploy and call each charge FLAT_TX_FEE from the PUBLIC balance (C-1),
+        // which the confidential premine above does not fund.
+        let public_premine: Vec<([u8; 32], u64)> = vec![(sender.id(), PREMINE)];
+
+        let mut prod =
+            Blockchain::genesis_with_public(&premine, &public_premine, DEFAULT_DIFFICULTY);
         let dep = prod.mine(vec![sender.deploy_contract(code.clone())]);
         let deploy_bytes = dep.encode();
         prod.apply_block(&dep).unwrap();
@@ -164,7 +169,8 @@ fn main() {
             prod.apply_block(&blk).unwrap();
         }
 
-        let mut cons = Blockchain::genesis(&premine, DEFAULT_DIFFICULTY);
+        let mut cons =
+            Blockchain::genesis_with_public(&premine, &public_premine, DEFAULT_DIFFICULTY);
         cons.apply_block(&lat_chain::Block::decode(&deploy_bytes).unwrap()).unwrap();
         let mut ci = 0usize;
         let per_call = bench(n_calls, 0, || {

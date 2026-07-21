@@ -470,7 +470,7 @@ mod tests {
             Err(VmError::OutOfGas),
             "a store must not execute below its gas price"
         );
-        assert!(s.get(&0).is_none(), "the failed store leaves no state");
+        assert!(!s.contains_key(&0), "the failed store leaves no state");
 
         // With exactly the full program cost (2 pushes + store + STOP) it succeeds.
         let mut s = Storage::new();

@@ -618,6 +618,124 @@ fn rpc_handle(node: &SharedNode, body: &[u8]) -> serde_json::Value {
             }
             None => Err((-32602, "params: [tx_hash_hex]")),
         },
+        // -- DEX / bridge reads -----------------------------------------------
+        "lat_getPools" => {
+            let n = lock_node(node);
+            let pools: Vec<Value> = n
+                .chain
+                .pools()
+                .into_iter()
+                .map(|p| {
+                    json!({
+                        "token": p.token,
+                        "latReserve": p.lat,
+                        "tokReserve": p.tok,
+                        "lpSupply": p.lp_supply,
+                    })
+                })
+                .collect();
+            Ok(json!(pools))
+        }
+        "lat_getPool" => match p_u64(0) {
+            Some(token) => {
+                let n = lock_node(node);
+                Ok(n.chain
+                    .pool(token as u32)
+                    .map(|p| {
+                        json!({
+                            "token": p.token,
+                            "latReserve": p.lat,
+                            "tokReserve": p.tok,
+                            "lpSupply": p.lp_supply,
+                        })
+                    })
+                    .unwrap_or(Value::Null))
+            }
+            None => Err((-32602, "params: [token_id]")),
+        },
+        "lat_getCurves" => {
+            let n = lock_node(node);
+            let curves: Vec<Value> = n
+                .chain
+                .curves()
+                .into_iter()
+                .map(|c| {
+                    json!({
+                        "token": c.token,
+                        "vlat": c.vlat,
+                        "vtok": c.vtok,
+                        "realLat": c.real_lat,
+                        "graduated": c.graduated,
+                    })
+                })
+                .collect();
+            Ok(json!(curves))
+        }
+        "lat_getCurve" => match p_u64(0) {
+            Some(token) => {
+                let n = lock_node(node);
+                Ok(n.chain
+                    .curve(token as u32)
+                    .map(|c| {
+                        json!({
+                            "token": c.token,
+                            "vlat": c.vlat,
+                            "vtok": c.vtok,
+                            "realLat": c.real_lat,
+                            "graduated": c.graduated,
+                        })
+                    })
+                    .unwrap_or(Value::Null))
+            }
+            None => Err((-32602, "params: [token_id]")),
+        },
+        "lat_getLpShares" => match (p_u64(0), p_id(1)) {
+            (Some(token), Some(provider)) => {
+                let n = lock_node(node);
+                Ok(json!(n.chain.lp_shares(token as u32, &provider)))
+            }
+            _ => Err((-32602, "params: [token_id, provider_hex]")),
+        },
+        "lat_getHtlc" => match p_id(0) {
+            Some(hid) => {
+                let n = lock_node(node);
+                Ok(n.chain
+                    .htlc(&hid)
+                    .map(|h| {
+                        json!({
+                            "id": hex::encode(hid),
+                            "token": h.token,
+                            "from": hex::encode(h.from),
+                            "to": hex::encode(h.to),
+                            "amount": h.amount,
+                            "hashlock": hex::encode(h.hashlock),
+                            "expiry": h.expiry,
+                        })
+                    })
+                    .unwrap_or(Value::Null))
+            }
+            None => Err((-32602, "params: [htlc_id_hex]")),
+        },
+        "lat_getHtlcs" => {
+            let n = lock_node(node);
+            let locks: Vec<Value> = n
+                .chain
+                .htlcs()
+                .into_iter()
+                .map(|(hid, h)| {
+                    json!({
+                        "id": hex::encode(hid),
+                        "token": h.token,
+                        "from": hex::encode(h.from),
+                        "to": hex::encode(h.to),
+                        "amount": h.amount,
+                        "hashlock": hex::encode(h.hashlock),
+                        "expiry": h.expiry,
+                    })
+                })
+                .collect();
+            Ok(json!(locks))
+        }
         // -- decoded, developer-friendly reads (Solana-style) ----------------
         "lat_getBlock" => match p_u64(0) {
             Some(h) => {
@@ -868,6 +986,38 @@ fn tx_summary(tx: &lat_types::Transaction) -> serde_json::Value {
             "hash": hash, "type": "slash_evidence",
             "validator": hex::encode(validator), "beneficiary": hex::encode(beneficiary),
             "height": height,
+        }),
+        AddLiquidity { token, provider, lat_amount, tok_amount, fee, .. } => json!({
+            "hash": hash, "type": "add_liquidity", "token": token,
+            "provider": hex::encode(provider), "latAmount": lat_amount,
+            "tokAmountMax": tok_amount, "fee": fee,
+        }),
+        RemoveLiquidity { token, provider, lp_amount, fee, .. } => json!({
+            "hash": hash, "type": "remove_liquidity", "token": token,
+            "provider": hex::encode(provider), "lpAmount": lp_amount, "fee": fee,
+        }),
+        Swap { token, trader, lat_in, amount_in, min_out, fee, .. } => json!({
+            "hash": hash, "type": "swap", "token": token,
+            "trader": hex::encode(trader), "latIn": lat_in,
+            "amountIn": amount_in, "minOut": min_out, "fee": fee,
+        }),
+        CurveTrade { token, trader, is_buy, amount, min_out, fee, .. } => json!({
+            "hash": hash, "type": "curve_trade", "token": token,
+            "trader": hex::encode(trader), "isBuy": is_buy,
+            "amount": amount, "minOut": min_out, "fee": fee,
+        }),
+        HtlcLock { token, from, to, amount, hashlock, expiry, fee, nonce, .. } => json!({
+            "hash": hash, "type": "htlc_lock", "token": token,
+            "from": hex::encode(from), "to": hex::encode(to), "amount": amount,
+            "hashlock": hex::encode(hashlock), "expiry": expiry, "fee": fee,
+            "htlcId": hex::encode(lat_types::htlc_id(*token, from, to, *amount, hashlock, *expiry, *nonce)),
+        }),
+        HtlcClaim { id, preimage } => json!({
+            "hash": hash, "type": "htlc_claim",
+            "htlcId": hex::encode(id), "preimage": hex::encode(preimage),
+        }),
+        HtlcRefund { id } => json!({
+            "hash": hash, "type": "htlc_refund", "htlcId": hex::encode(id),
         }),
     }
 }

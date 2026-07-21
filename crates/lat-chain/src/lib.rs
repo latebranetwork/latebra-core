@@ -79,7 +79,14 @@ pub fn tx_fee(tx: &Transaction) -> u64 {
         Transaction::AnonTransfer { xfer, .. } => xfer.fee,
         Transaction::PublicTransfer { fee, .. }
         | Transaction::Shield { fee, .. }
-        | Transaction::ShieldStealth { fee, .. } => *fee,
+        | Transaction::ShieldStealth { fee, .. }
+        | Transaction::AddLiquidity { fee, .. }
+        | Transaction::RemoveLiquidity { fee, .. }
+        | Transaction::Swap { fee, .. }
+        | Transaction::CurveTrade { fee, .. }
+        | Transaction::HtlcLock { fee, .. } => *fee,
+        // HtlcClaim / HtlcRefund are fee-less by design, like SlashEvidence:
+        // each consumes an existing lock record, so they can't be spammed.
         // Flat-fee types (C-1): no fee field, a fixed cost charged in apply.
         Transaction::CreateToken { .. }
         | Transaction::DeployContract { .. }
@@ -147,7 +154,12 @@ pub fn check_tx(tx: &Transaction) -> Result<(), ChainError> {
         // never allowed to diverge (the registration-PoW lesson from SPEC.md).
         Transaction::PublicTransfer { fee, .. }
         | Transaction::Shield { fee, .. }
-        | Transaction::ShieldStealth { fee, .. } => {
+        | Transaction::ShieldStealth { fee, .. }
+        | Transaction::AddLiquidity { fee, .. }
+        | Transaction::RemoveLiquidity { fee, .. }
+        | Transaction::Swap { fee, .. }
+        | Transaction::CurveTrade { fee, .. }
+        | Transaction::HtlcLock { fee, .. } => {
             if *fee < MIN_TRANSFER_FEE {
                 return Err(ChainError::FeeTooLow);
             }
@@ -1101,6 +1113,41 @@ impl Blockchain {
         self.active_state.public_balance(id, token)
     }
 
+    /// The DEX pool for `token` on the active chain, if one exists.
+    pub fn pool(&self, token: u32) -> Option<lat_state::Pool> {
+        self.active_state.pool(token)
+    }
+
+    /// Every live DEX pool on the active chain.
+    pub fn pools(&self) -> Vec<lat_state::Pool> {
+        self.active_state.pools()
+    }
+
+    /// A token's native bonding curve, or `None` if none has opened.
+    pub fn curve(&self, token: u32) -> Option<lat_state::CurvePool> {
+        self.active_state.curve(token)
+    }
+
+    /// Every live bonding curve (launchpad listing).
+    pub fn curves(&self) -> Vec<lat_state::CurvePool> {
+        self.active_state.curves()
+    }
+
+    /// A provider's LP shares in the pool for `token` (0 if none).
+    pub fn lp_shares(&self, token: u32, provider: &[u8; 32]) -> u64 {
+        self.active_state.lp_shares(token, provider)
+    }
+
+    /// An open HTLC by id on the active chain.
+    pub fn htlc(&self, id: &[u8; 32]) -> Option<lat_state::Htlc> {
+        self.active_state.htlc(id)
+    }
+
+    /// Every open HTLC as `(id, lock)` on the active chain.
+    pub fn htlcs(&self) -> Vec<([u8; 32], lat_state::Htlc)> {
+        self.active_state.htlcs()
+    }
+
     /// Whether an anonymous-spend nullifier is already spent on the active chain.
     pub fn nullifier_seen(&self, nullifier: &[u8; 32]) -> bool {
         self.active_state.nullifier_seen(nullifier)
@@ -1515,6 +1562,17 @@ fn apply_txs_and_reward(
             }
             Transaction::ShieldStealth { token, fee, .. } if *fee > 0 => {
                 public_fees.push((*token, *fee));
+            }
+            // DEX + HTLC fees are always denominated in native LAT and debited
+            // from the signer's public LAT balance in the ledger's apply arm.
+            Transaction::AddLiquidity { fee, .. }
+            | Transaction::RemoveLiquidity { fee, .. }
+            | Transaction::Swap { fee, .. }
+            | Transaction::CurveTrade { fee, .. }
+            | Transaction::HtlcLock { fee, .. }
+                if *fee > 0 =>
+            {
+                public_fees.push((lat_state::LAT_TOKEN, *fee));
             }
             // Flat-fee, fee-less-field types (C-1): the ledger debited
             // `FLAT_TX_FEE` in LAT from the signer's public balance, so the

@@ -9,8 +9,10 @@ authors.workspace = true
 lat-crypto.workspace = true
 lat-types.workspace = true
 lat-vm.workspace = true
+lat-contracts.workspace = true
 lat-store.workspace = true
 blake3.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 rand.workspace = true

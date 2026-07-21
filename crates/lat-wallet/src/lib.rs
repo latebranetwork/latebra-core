@@ -132,10 +132,142 @@ impl Wallet {
             | Transaction::Unshield { sig, .. }
             | Transaction::ShieldStealth { sig, .. }
             | Transaction::Stake { sig, .. }
-            | Transaction::Unstake { sig, .. } => *sig = sig_bytes,
+            | Transaction::Unstake { sig, .. }
+            | Transaction::AddLiquidity { sig, .. }
+            | Transaction::RemoveLiquidity { sig, .. }
+            | Transaction::Swap { sig, .. }
+            | Transaction::CurveTrade { sig, .. }
+            | Transaction::HtlcLock { sig, .. } => *sig = sig_bytes,
             _ => {}
         }
         tx
+    }
+
+    // -- native DEX (AMM) + bridge (HTLC) builders ----------------------------
+
+    /// Build + sign an `AddLiquidity` deposit into the pool for `token`:
+    /// exactly `lat_amount` LAT plus up to `tok_amount` of the token (the
+    /// ratio-matched amount is what consensus actually debits).
+    pub fn add_liquidity(
+        &self,
+        token: u32,
+        lat_amount: u64,
+        tok_amount: u64,
+        fee: u64,
+        nonce: u64,
+    ) -> Transaction {
+        self.sign_tx(Transaction::AddLiquidity {
+            token,
+            provider: self.id(),
+            lat_amount,
+            tok_amount,
+            fee,
+            nonce,
+            sig: [0u8; 64],
+        })
+    }
+
+    /// Build + sign a `RemoveLiquidity` burning `lp_amount` of this wallet's
+    /// LP shares in the pool for `token`.
+    pub fn remove_liquidity(&self, token: u32, lp_amount: u64, fee: u64, nonce: u64) -> Transaction {
+        self.sign_tx(Transaction::RemoveLiquidity {
+            token,
+            provider: self.id(),
+            lp_amount,
+            fee,
+            nonce,
+            sig: [0u8; 64],
+        })
+    }
+
+    /// Build + sign a `Swap` against the pool for `token`. `lat_in` picks the
+    /// direction (LAT → token or token → LAT); `min_out` is the slippage bound.
+    pub fn swap(
+        &self,
+        token: u32,
+        lat_in: bool,
+        amount_in: u64,
+        min_out: u64,
+        fee: u64,
+        nonce: u64,
+    ) -> Transaction {
+        self.sign_tx(Transaction::Swap {
+            token,
+            trader: self.id(),
+            lat_in,
+            amount_in,
+            min_out,
+            fee,
+            nonce,
+            sig: [0u8; 64],
+        })
+    }
+
+    /// Build + sign a `CurveTrade` against `token`'s native bonding curve. A buy
+    /// (`is_buy`) pays `amount` LAT for tokens; a sell offers `amount` tokens for
+    /// LAT. `min_out` is the slippage bound.
+    pub fn curve_trade(
+        &self,
+        token: u32,
+        is_buy: bool,
+        amount: u64,
+        min_out: u64,
+        fee: u64,
+        nonce: u64,
+    ) -> Transaction {
+        self.sign_tx(Transaction::CurveTrade {
+            token,
+            trader: self.id(),
+            is_buy,
+            amount,
+            min_out,
+            fee,
+            nonce,
+            sig: [0u8; 64],
+        })
+    }
+
+    /// Build + sign an `HtlcLock` escrowing `amount` of `token` for `to` under
+    /// a SHA-256 `hashlock`, refundable to this wallet from block `expiry` on.
+    /// Returns the transaction and the lock's deterministic id (needed to
+    /// claim or refund it).
+    pub fn htlc_lock(
+        &self,
+        token: u32,
+        to: &Address,
+        amount: u64,
+        hashlock: [u8; 32],
+        expiry: u64,
+        fee: u64,
+        nonce: u64,
+    ) -> (Transaction, [u8; 32]) {
+        let to = to.key.to_bytes();
+        let id = lat_types::htlc_id(token, &self.id(), &to, amount, &hashlock, expiry, nonce);
+        let tx = self.sign_tx(Transaction::HtlcLock {
+            token,
+            from: self.id(),
+            to,
+            amount,
+            hashlock,
+            expiry,
+            fee,
+            nonce,
+            sig: [0u8; 64],
+        });
+        (tx, id)
+    }
+
+    /// Build an `HtlcClaim` revealing `preimage` for the lock `id`. No
+    /// signature needed — the preimage is the authority, and funds can only go
+    /// to the recipient the lock recorded.
+    pub fn htlc_claim(id: [u8; 32], preimage: [u8; 32]) -> Transaction {
+        Transaction::HtlcClaim { id, preimage }
+    }
+
+    /// Build an `HtlcRefund` for the expired lock `id` (permissionless; funds
+    /// return to the lock's original sender).
+    pub fn htlc_refund(id: [u8; 32]) -> Transaction {
+        Transaction::HtlcRefund { id }
     }
 
     /// Build a signed transaction creating a new token under `ticker`, with the
@@ -416,6 +548,25 @@ impl Wallet {
         rng: &mut R,
     ) -> Option<Transaction> {
         let current = self.secret.decrypt(balance_ct, BALANCE_BITS)?;
+        self.build_unshield_with_balance(to, token, amount, fee, current, balance_ct, nonce, rng)
+    }
+
+    /// [`build_unshield`](Self::build_unshield) for a caller that already knows
+    /// the decrypted balance, skipping the discrete-log decrypt (which costs
+    /// minutes for balances near 2^40 — e.g. a market-maker's inventory). If
+    /// `current` is wrong the proof simply fails verification on-chain.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_unshield_with_balance<R: rand::RngCore + rand::CryptoRng>(
+        &self,
+        to: &Address,
+        token: u32,
+        amount: u64,
+        fee: u64,
+        current: u64,
+        balance_ct: &lat_crypto::Ciphertext,
+        nonce: u64,
+        rng: &mut R,
+    ) -> Option<Transaction> {
         let xfer = SolventTransfer::create(
             &self.secret,
             &lat_crypto::unshield_view_key(),

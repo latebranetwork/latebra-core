@@ -4,23 +4,27 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Latebra Wallet</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><defs><mask id='latm'><rect width='512' height='512' fill='%23000'/><rect x='108' y='104' width='230' height='304' rx='52' fill='%23fff'/><path fill='%23000' d='M192 180H362V292a24 24 0 0 1-24 24H216a24 24 0 0 1-24-24Z'/><rect x='192' y='104' width='34' height='80' fill='%23000'/></mask></defs><g mask='url(%23latm)'><rect width='512' height='512' fill='%23FFB43C'/></g><g fill='%23FFB43C'><rect x='410' y='150' width='30' height='30' rx='5'/><rect x='360' y='182' width='24' height='24' rx='4'/><rect x='404' y='216' width='22' height='22' rx='4'/><rect x='356' y='238' width='18' height='18' rx='3'/><rect x='392' y='262' width='30' height='30' rx='5'/><rect x='352' y='298' width='16' height='16' rx='3'/><rect x='404' y='300' width='14' height='14' rx='3'/><rect x='368' y='330' width='18' height='18' rx='3'/></g></svg>">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' fill='%230F172A'/><path d='M20 12v34h26v-6H27V12h-7z' fill='%238B5CF6'/><rect x='20' y='50' width='26' height='2' fill='%231E1B4B'/></svg>">
+<!-- GENERATED FILE — do not edit. Source of truth is
+     latebra-web/wallet-extension/{popup.html,popup.css,popup.js};
+     regenerate with latebra-core/scripts/build-wallet-html.sh -->
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
-/* Latscan design language: near-black canvas, Space Grotesk display +
-   JetBrains Mono for all numbers/addresses, one amber accent,
+/* ===== LATEBRA VAULT — identical theme to lat-wallet-web (wallet.html) =====
+   Latscan design language: near-black canvas, Space Grotesk display +
+   JetBrains Mono for all numbers/addresses, one violet accent (site palette),
    violet = private, blue = public. Matches lat-explorer + launchpad. */
 :root{
-  --bg:#08080a; --surface:#0f0f12; --surface2:#151519; --surface3:#1c1c22;
-  --purple:#FFB43C; --purple-d:#e69a28; --grad1:#ffc25e; --grad2:#e69a28;
-  --ink:#fafafc; --muted:#6f6f7b; --faint:#4c4c56;
-  --green:#35d07f; --red:#ff5d6c; --line:rgba(255,255,255,.08); --line2:rgba(255,255,255,.15);
+  --bg:#0f172a; --surface:#141c31; --surface2:#1a2340; --surface3:#232e52;
+  --purple:#8b5cf6; --purple-d:#7c3aed; --grad1:#a78bfa; --grad2:#7c3aed;
+  --ink:#ffffff; --muted:#94a3b8; --faint:#64748b;
+  --green:#35d07f; --red:#ff5d6c; --line:rgba(148,163,184,.16); --line2:rgba(139,92,246,.22);
   --bl:#4c9bf5; --vi:#b98cf6;
 }
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{height:100%}
 body{margin:0;background:
-  radial-gradient(900px 420px at 50% -12%, #171019 0%, rgba(5,5,6,0) 62%),
+  radial-gradient(900px 420px at 50% -12%, #1e1b4b 0%, rgba(15,23,42,0) 62%),
   var(--bg);
   color:var(--ink);font:15px/1.5 'Space Grotesk',system-ui,-apple-system,Segoe UI,sans-serif;
   -webkit-font-smoothing:antialiased;
@@ -29,12 +33,18 @@ body{margin:0;background:
 .phone{width:100%;max-width:430px;min-height:100vh;background:var(--bg);
   position:relative;display:flex;flex-direction:column;
   box-shadow:0 0 0 1px var(--line), 0 30px 80px rgba(0,0,0,.5)}
+/* extension popup: fixed Phantom-size window (body.ext set in popup.html) */
+body.ext{width:375px;height:600px;overflow:hidden}
+body.ext .phone{max-width:none;min-height:0;height:100%;box-shadow:none}
+body.ext .nav{max-width:none}
 .scroll{flex:1;overflow-y:auto;padding-bottom:84px}
+.scroll::-webkit-scrollbar{width:6px}
+.scroll::-webkit-scrollbar-thumb{background:var(--surface3);border-radius:3px}
 
 /* header */
 .hdr{display:flex;align-items:center;gap:10px;padding:16px 18px 6px}
 .iconbtn{width:38px;height:38px;border-radius:50%;background:var(--surface2);border:0;
-  display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--ink);flex:0 0 auto}
+  display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--ink);flex:0 0 auto;padding:0}
 .iconbtn:hover{background:var(--surface3)}
 .iconbtn svg{width:18px;height:18px}
 .acct{flex:1;display:flex;align-items:center;justify-content:center;gap:9px;cursor:pointer;
@@ -49,20 +59,28 @@ body{margin:0;background:
 .hero .amt{font-size:42px;font-weight:600;letter-spacing:-1px;line-height:1.1;
   font-family:'JetBrains Mono',ui-monospace,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
 .hero .amt small{font-size:20px;font-weight:500;color:var(--muted);margin-left:6px;font-family:'Space Grotesk',system-ui,sans-serif}
-.hero .chg{display:inline-flex;align-items:center;gap:6px;margin-top:10px;font-size:14px;font-weight:600;
+.hero .sub{margin-top:7px;font-size:14px;color:var(--muted);font-weight:500}
+.hero .chg{display:inline-flex;align-items:center;gap:6px;margin-top:10px;font-size:13.5px;font-weight:600;
   color:var(--green);background:rgba(47,212,127,.12);padding:4px 11px;border-radius:999px}
+.hero .chg.dn{color:var(--red);background:rgba(255,93,108,.12)}
 .hero .chg.flat{color:var(--muted);background:var(--surface2)}
+/* inline price-change chip (token rows) */
+.pc{font-weight:600}
+.pc.up{color:var(--green)}
+.pc.dn{color:var(--red)}
+.up{color:var(--green)}
 
 /* action row */
-.actions{display:flex;justify-content:center;gap:22px;padding:20px 10px 22px}
-.act{display:flex;flex-direction:column;align-items:center;gap:8px;background:none;border:0;cursor:pointer;color:var(--ink);font:inherit}
-.act .circ{width:56px;height:56px;border-radius:50%;background:rgba(255,180,60,.13);
+.actions{display:flex;justify-content:center;gap:6px;padding:20px 12px 22px}
+.act{flex:1;min-width:0;padding:0;display:flex;flex-direction:column;align-items:center;gap:8px;background:none;border:0;cursor:pointer;color:var(--ink);font:inherit}
+.act span{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.act .circ{width:56px;height:56px;border-radius:50%;background:rgba(139,92,246,.13);
   display:flex;align-items:center;justify-content:center;transition:.15s}
-.act:hover .circ{background:rgba(255,180,60,.22)}
+.act:hover .circ{background:rgba(139,92,246,.22)}
 .act .circ svg{width:23px;height:23px;color:var(--purple)}
 .act span{font-size:12.5px;font-weight:600;color:var(--muted)}
 .act[disabled]{opacity:.4;cursor:default}
-.act[disabled]:hover .circ{background:rgba(255,180,60,.13)}
+.act[disabled]:hover .circ{background:rgba(139,92,246,.13)}
 
 /* cards / token list */
 .pad{padding:0 14px}
@@ -70,11 +88,14 @@ body{margin:0;background:
 .tok{display:flex;align-items:center;gap:13px;padding:15px 16px;cursor:pointer;border-bottom:1px solid var(--line)}
 .tok:last-child{border-bottom:0}
 .tok:hover{background:var(--surface2)}
-.tok .logo{width:42px;height:42px;border-radius:50%;flex:0 0 auto;display:flex;align-items:center;justify-content:center;
-  background:rgba(185,140,246,.10);border:1px solid rgba(185,140,246,.25);position:relative}
-.tok .logo b{font-size:16px;font-weight:700;color:var(--vi)}
-.tok .logo.pub{background:rgba(76,155,245,.10);border-color:rgba(76,155,245,.25)}
-.tok .logo.pub b{color:var(--bl)}
+.tok .tico{width:42px;height:42px;flex:0 0 auto;display:flex;align-items:center;justify-content:center}
+.tok .tico svg{border-radius:12px}
+/* activity row icon bubble */
+.aic{width:40px;height:40px;border-radius:50%;flex:0 0 auto;display:flex;align-items:center;justify-content:center;
+  background:var(--surface2);color:var(--muted)}
+.aic svg{width:18px;height:18px}
+.aic.in{background:rgba(47,212,127,.12);color:var(--green)}
+.aic.prv{background:rgba(139,92,246,.14);color:var(--purple)}
 .tok .meta{flex:1;min-width:0}
 .tok .meta .n{font-weight:600}
 .tok .meta .s{font-size:12.5px;color:var(--muted);margin-top:1px}
@@ -89,17 +110,17 @@ body{margin:0;background:
 .section-t{color:var(--faint);font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin:20px 6px 9px}
 
 /* pending / activate banners */
-.banner{display:flex;align-items:center;gap:12px;background:linear-gradient(135deg,rgba(255,180,60,.16),rgba(230,154,40,.10));
-  border:1px solid rgba(255,180,60,.28);border-radius:16px;padding:14px 15px;margin:14px}
-.banner .bi{width:40px;height:40px;border-radius:50%;background:rgba(255,180,60,.2);display:flex;align-items:center;justify-content:center;flex:0 0 auto}
+.banner{display:flex;align-items:center;gap:12px;background:linear-gradient(135deg,rgba(139,92,246,.16),rgba(124,58,237,.10));
+  border:1px solid rgba(139,92,246,.28);border-radius:16px;padding:14px 15px;margin:14px}
+.banner .bi{width:40px;height:40px;border-radius:50%;background:rgba(139,92,246,.2);display:flex;align-items:center;justify-content:center;flex:0 0 auto}
 .banner .bi svg{width:19px;height:19px;color:var(--purple)}
 .banner .bt{flex:1}.banner .bt .t{font-weight:600;font-size:14px}.banner .bt .d{color:var(--muted);font-size:12.5px}
 .banner button{width:auto;padding:9px 16px;font-size:13.5px;flex:0 0 auto}
 
 /* bottom nav */
-.nav{position:fixed;bottom:0;left:50%;transform:translateX(-50%);width:100%;max-width:430px;
-  background:rgba(19,19,22,.9);backdrop-filter:blur(14px);border-top:1px solid var(--line);
-  display:flex;justify-content:space-around;padding:9px 8px calc(9px + env(safe-area-inset-bottom))}
+.nav{position:fixed;bottom:0;left:0;width:100%;
+  background:rgba(15,23,42,.9);backdrop-filter:blur(14px);border-top:1px solid var(--line);
+  display:flex;justify-content:space-around;padding:9px 8px}
 .nav a{background:none;border:0;cursor:pointer;color:var(--faint);display:flex;flex-direction:column;align-items:center;gap:3px;padding:5px 12px;font:inherit;font-size:10.5px;font-weight:600}
 .nav a svg{width:22px;height:22px}
 .nav a.on{color:var(--purple)}
@@ -107,7 +128,7 @@ body{margin:0;background:
 /* buttons + inputs (shared) */
 button{font:inherit;font-weight:600;border-radius:13px;border:0;background:var(--surface2);color:var(--ink);padding:14px 16px;cursor:pointer;width:100%}
 button:hover{background:var(--surface3)}
-button.primary{background:var(--purple);color:#1a1206}button.primary:hover{background:var(--purple-d)}
+button.primary{background:var(--purple);color:#ffffff}button.primary:hover{background:var(--purple-d)}
 button.ghost{background:transparent;border:1px solid var(--line)}button.ghost:hover{background:var(--surface2)}
 button.danger{background:transparent;border:1px solid rgba(240,97,109,.4);color:var(--red)}button.danger:hover{background:rgba(240,97,109,.1)}
 .row{display:flex;gap:11px}.row button{width:auto;flex:1}
@@ -127,13 +148,13 @@ input:focus{border-color:var(--purple);background:var(--surface3)}
 /* onboarding */
 .onb{flex:1;display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;padding:34px 26px}
 .ghost-logo{width:96px;height:96px;border-radius:28px;background:linear-gradient(150deg,var(--grad1),var(--grad2));
-  display:flex;align-items:center;justify-content:center;margin-bottom:26px;box-shadow:0 18px 50px rgba(230,154,40,.45)}
+  display:flex;align-items:center;justify-content:center;margin-bottom:26px;box-shadow:0 18px 50px rgba(124,58,237,.45)}
 .ghost-logo svg{width:56px;height:56px;color:#fff}
 .onb h1{font-size:26px;margin:0 0 8px;font-weight:700}
 .onb p{color:var(--muted);margin:0 0 30px;max-width:300px}
 .onb .full{width:100%;max-width:320px}
 .onb .full button{margin-bottom:12px}
-.seedbox{font-family:'JetBrains Mono',ui-monospace,Menlo,Consolas,monospace;font-size:13px;color:#dcdce6;word-break:break-all;
+.seedbox{font-family:'JetBrains Mono',ui-monospace,Menlo,Consolas,monospace;font-size:13px;color:#cbd5e1;word-break:break-all;
   background:var(--surface2);border:1px solid var(--line);border-radius:14px;padding:15px;text-align:left;line-height:1.7}
 .warn{display:flex;gap:11px;text-align:left;background:rgba(240,97,109,.08);border:1px solid rgba(240,97,109,.28);
   color:#f4a3a9;border-radius:14px;padding:13px 14px;font-size:13px;margin-bottom:18px}
@@ -142,15 +163,15 @@ input:focus{border-color:var(--purple);background:var(--surface3)}
 /* sheet */
 .backdrop{position:fixed;inset:0;background:rgba(0,0,0,.55);opacity:0;pointer-events:none;transition:.2s;z-index:40}
 .backdrop.show{opacity:1;pointer-events:auto}
-.sheet{position:fixed;left:50%;bottom:0;transform:translate(-50%,100%);width:100%;max-width:430px;
-  background:var(--surface);border-radius:24px 24px 0 0;padding:8px 20px calc(26px + env(safe-area-inset-bottom));
+.sheet{position:fixed;left:0;bottom:0;transform:translateY(100%);width:100%;max-height:560px;overflow-y:auto;
+  background:var(--surface);border-radius:24px 24px 0 0;padding:8px 20px 26px;
   transition:transform .26s cubic-bezier(.2,.8,.2,1);z-index:50;border:1px solid var(--line)}
-.sheet.show{transform:translate(-50%,0)}
+.sheet.show{transform:translateY(0)}
 .grip{width:38px;height:4px;border-radius:2px;background:var(--surface3);margin:8px auto 16px}
 .sheet h3{margin:0 0 4px;font-size:19px}
 .sheet .sub{color:var(--muted);font-size:13.5px;margin:0 0 18px}
 .qr{width:170px;height:170px;margin:6px auto 16px;border-radius:16px;background:#fff;display:flex;align-items:center;justify-content:center;padding:12px}
-.addrbox{font-family:'JetBrains Mono',ui-monospace,Menlo,Consolas,monospace;font-size:13px;color:#dcdce6;word-break:break-all;
+.addrbox{font-family:'JetBrains Mono',ui-monospace,Menlo,Consolas,monospace;font-size:13px;color:#cbd5e1;word-break:break-all;
   background:var(--surface2);border:1px solid var(--line);border-radius:14px;padding:14px;text-align:center;margin-bottom:14px}
 .set-row{display:flex;align-items:center;gap:13px;padding:15px 4px;border-bottom:1px solid var(--line);cursor:pointer}
 .set-row:last-child{border-bottom:0}
@@ -167,65 +188,93 @@ input:focus{border-color:var(--purple);background:var(--surface3)}
 .seg button{flex:1;padding:10px 6px;border-radius:10px;background:transparent;font-size:13px;color:var(--muted);
   transition:background .18s,color .18s,transform .3s cubic-bezier(.34,1.56,.64,1)}
 .seg button:hover{background:var(--surface3)}
-.seg button.on,.seg button.on:hover{background:var(--purple);color:#1a1206;transform:scale(1.03)}
+.seg button.on,.seg button.on:hover{background:var(--purple);color:#ffffff;transform:scale(1.03)}
 .hint{font-size:12.5px;color:var(--muted);background:var(--surface2);border:1px solid var(--line);
   border-radius:12px;padding:11px 13px;margin:0 0 15px;line-height:1.55}
 .hint b{color:var(--ink)}
 
+/* swap view */
+.scard{background:var(--surface);border:1px solid var(--line);border-radius:18px;padding:14px 16px}
+.scard .lbl{display:flex;justify-content:space-between;font-size:12px;font-weight:600;color:var(--muted)}
+.scard .balhint{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:11px}
+.scard .in{display:flex;align-items:center;gap:10px;margin-top:8px}
+.scard input{margin:0;border:0;background:none;padding:0;flex:1;min-width:0;font-size:24px;font-weight:600}
+.scard input:focus{border:0;background:none}
+.tchip{display:inline-flex;align-items:center;gap:7px;background:var(--surface2);border:1px solid var(--line);
+  border-radius:999px;padding:5px 12px 5px 6px;font-size:14px;flex:0 0 auto}
+.tchip svg{border-radius:7px}
+.flip{width:40px;height:40px;border-radius:50%;background:var(--surface2);border:4px solid var(--bg);
+  display:flex;align-items:center;justify-content:center;margin:-13px auto;position:relative;z-index:2;
+  padding:0;color:var(--purple);transition:transform .3s cubic-bezier(.34,1.56,.64,1)}
+.flip:hover{background:var(--surface3);transform:rotate(180deg)}
+.flip svg{width:17px;height:17px}
+.maxb{width:auto;font-size:11px;font-weight:700;color:var(--purple);background:rgba(139,92,246,.12);
+  border-radius:7px;padding:4px 8px;letter-spacing:.05em;flex:0 0 auto}
+.maxb:hover{background:rgba(139,92,246,.22)}
+.rate{text-align:center;font-size:12.5px;color:var(--muted);margin-top:12px}
+.subhint{font-size:12px;color:var(--faint);line-height:1.6;margin:14px 4px 0;text-align:center}
+.subhint b{color:var(--muted)}
+
+/* discover cards */
+.dcard{display:flex;align-items:center;gap:13px;background:var(--surface);border:1px solid var(--line);
+  border-radius:18px;padding:16px;margin-bottom:10px;text-decoration:none;color:inherit;cursor:pointer}
+.dcard:hover{background:var(--surface2)}
+.dcard .meta{flex:1;min-width:0}
+.dcard .n{font-weight:600}
+.dcard .s{font-size:12.5px;color:var(--muted);margin-top:1px;line-height:1.45}
+.dico{width:44px;height:44px;border-radius:13px;background:rgba(139,92,246,.13);color:var(--purple);
+  display:flex;align-items:center;justify-content:center;flex:0 0 auto}
+.dico svg{width:20px;height:20px}
+.dext{color:var(--faint)}.dext svg{width:15px;height:15px}
+.dcard:hover .dext{color:var(--purple)}
+.dcard.soon{border-style:dashed;cursor:default;opacity:.75}
+.dcard.soon:hover{background:var(--surface)}
+.dcard.soon .dico{background:var(--surface2);color:var(--faint)}
+
+/* in-wallet dapp browser (Discover) */
+.bbar{display:flex;align-items:center;gap:10px;padding:10px 12px 10px 8px;border-bottom:1px solid var(--line)}
+.bbar .bt{flex:1;min-width:0}
+.bbar .bt .t{font-weight:600;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bbar .bt .u{font-size:11px;color:var(--faint);font-family:'JetBrains Mono',ui-monospace,monospace;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bframe{display:block;width:100%;border:0;background:var(--bg);height:calc(100vh - 128px)}
+body.ext .bframe{height:calc(600px - 128px)}
+
+/* settings page */
+.setcard{background:var(--surface);border:1px solid var(--line);border-radius:18px;padding:2px 16px;margin-bottom:4px}
+.verline{text-align:center;color:var(--faint);font-size:10.5px;letter-spacing:.18em;margin:22px 0 6px}
+
 /* toast */
-.toast{position:fixed;left:50%;bottom:96px;transform:translateX(-50%);background:#2a2a33;color:#fff;
+.toast{position:fixed;left:50%;bottom:96px;transform:translateX(-50%);background:#232e52;color:#fff;
   padding:12px 18px;border-radius:12px;font-size:14px;font-weight:500;opacity:0;transition:.25s;pointer-events:none;
   max-width:90%;text-align:center;z-index:60;border:1px solid var(--line);box-shadow:0 12px 40px rgba(0,0,0,.5)}
 .toast.show{opacity:1}
 .toast.err{background:#3a2226;border-color:rgba(240,97,109,.4)}
 
 /* welcome + splash logo */
-.welcome-mark{width:104px;height:104px;margin-bottom:24px;filter:drop-shadow(0 14px 34px rgba(255,180,60,.4))}
+.welcome-mark{width:104px;height:104px;margin-bottom:24px;filter:drop-shadow(0 14px 34px rgba(139,92,246,.4))}
 .splash{position:fixed;inset:0;z-index:200;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:24px;
-  background:radial-gradient(900px 420px at 50% -12%, #171019 0%, rgba(5,5,6,0) 62%), var(--bg);
+  background:radial-gradient(900px 420px at 50% -12%, #1e1b4b 0%, rgba(15,23,42,0) 62%), var(--bg);
   transition:opacity .55s ease}
 .splash.hide{opacity:0;pointer-events:none}
-.splash .mark{width:128px;height:128px;filter:drop-shadow(0 12px 34px rgba(255,180,60,.42));
+.splash .mark{width:128px;height:128px;filter:drop-shadow(0 12px 34px rgba(139,92,246,.42));
   animation:markin .8s cubic-bezier(.2,.9,.25,1) both}
-.splash .mark .px rect{transform-box:fill-box;transform-origin:center;opacity:0;transform:scale(0);
-  animation:pxin .5s cubic-bezier(.2,.9,.25,1) forwards}
-.splash .mark .px rect:nth-child(1){animation-delay:.5s}
-.splash .mark .px rect:nth-child(2){animation-delay:.58s}
-.splash .mark .px rect:nth-child(3){animation-delay:.66s}
-.splash .mark .px rect:nth-child(4){animation-delay:.74s}
-.splash .mark .px rect:nth-child(5){animation-delay:.82s}
-.splash .mark .px rect:nth-child(6){animation-delay:.9s}
-.splash .mark .px rect:nth-child(7){animation-delay:.98s}
-.splash .mark .px rect:nth-child(8){animation-delay:1.06s}
+.splash .mark .ell{transform-box:fill-box;transform-origin:center;opacity:0;transform:scale(.6);
+  animation:pxin .5s cubic-bezier(.2,.9,.25,1) .45s forwards}
 .splash .name{font-size:14px;font-weight:700;letter-spacing:.5em;text-indent:.5em;color:var(--muted);
   opacity:0;animation:namein .6s ease .55s forwards}
 @keyframes markin{from{opacity:0;transform:scale(.55)}to{opacity:1;transform:scale(1)}}
 @keyframes pxin{from{opacity:0;transform:scale(0) translateX(-10px)}to{opacity:1;transform:scale(1) translateX(0)}}
 @keyframes namein{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
-@media(prefers-reduced-motion:reduce){.splash .mark,.splash .mark .px rect,.splash .name{animation:none;opacity:1;transform:none}}
+@media(prefers-reduced-motion:reduce){.splash .mark,.splash .mark .ell,.splash .name{animation:none;opacity:1;transform:none}}
 </style>
 </head>
 <body>
 <div class="splash" id="splash">
   <div class="mark">
-    <svg viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg" width="128" height="128">
-      <defs><mask id="latm">
-        <rect width="512" height="512" fill="#000"/>
-        <rect x="108" y="104" width="230" height="304" rx="52" fill="#fff"/>
-        <path fill="#000" d="M192 180H362V292a24 24 0 0 1-24 24H216a24 24 0 0 1-24-24Z"/>
-        <rect x="192" y="104" width="34" height="80" fill="#000"/>
-      </mask></defs>
-      <g mask="url(#latm)"><rect width="512" height="512" fill="#FFB43C"/></g>
-      <g class="px" fill="#FFB43C">
-        <rect x="410" y="150" width="30" height="30" rx="5"/>
-        <rect x="360" y="182" width="24" height="24" rx="4"/>
-        <rect x="404" y="216" width="22" height="22" rx="4"/>
-        <rect x="356" y="238" width="18" height="18" rx="3"/>
-        <rect x="392" y="262" width="30" height="30" rx="5"/>
-        <rect x="352" y="298" width="16" height="16" rx="3"/>
-        <rect x="404" y="300" width="14" height="14" rx="3"/>
-        <rect x="368" y="330" width="18" height="18" rx="3"/>
-      </g>
+    <svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" width="128" height="128">
+      <rect width="64" height="64" rx="14" fill="#1e1b4b"/>
+      <path class="ell" d="M20 12v34h26v-6H27V12h-7z" fill="#8b5cf6"/>
     </svg>
   </div>
   <div class="name">LATEBRA</div>
@@ -233,84 +282,152 @@ input:focus{border-color:var(--purple);background:var(--surface3)}
 <div class="phone">
   <div class="scroll" id="app"></div>
 </div>
-<div class="backdrop" id="backdrop" onclick="closeSheet()"></div>
+<div class="backdrop" id="backdrop"></div>
 <div class="sheet" id="sheet"></div>
 <div class="toast" id="toast"></div>
-
 <script>
-const $=(id)=>document.getElementById(id);
-let NODE=localStorage.getItem('lat_node')||'127.0.0.1:4040';
-let SEED=localStorage.getItem('lat_seed')||'';
-let ADDR=localStorage.getItem('lat_addr')||'';
-let LAST={registered:false,spendable:'0.00000',pending:'0.00000',public:'0.00000',total:'0.00000'};
-let poll=null;
-const LOGO="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><defs><mask id='latm2'><rect width='512' height='512' fill='%23000'/><rect x='108' y='104' width='230' height='304' rx='52' fill='%23fff'/><path fill='%23000' d='M192 180H362V292a24 24 0 0 1-24 24H216a24 24 0 0 1-24-24Z'/><rect x='192' y='104' width='34' height='80' fill='%23000'/></mask></defs><g mask='url(%23latm2)'><rect width='512' height='512' fill='%23FFB43C'/></g><g fill='%23FFB43C'><rect x='410' y='150' width='30' height='30' rx='5'/><rect x='360' y='182' width='24' height='24' rx='4'/><rect x='404' y='216' width='22' height='22' rx='4'/><rect x='356' y='238' width='18' height='18' rx='3'/><rect x='392' y='262' width='30' height='30' rx='5'/><rect x='352' y='298' width='16' height='16' rx='3'/><rect x='404' y='300' width='14' height='14' rx='3'/><rect x='368' y='330' width='18' height='18' rx='3'/></g></svg>";
+/* Latebra Vault — canonical wallet app, shared 1:1 by the Chrome extension
+   popup and the lat-wallet-web page (wallet.html embeds this exact file; run
+   latebra-core/scripts/build-wallet-html.sh after editing it or popup.css).
+   MV3 forbids inline handlers, so ALL clicks go through one delegated
+   listener keyed on data-act/data-arg. Talks to the lat-wallet-web HTTP API,
+   which signs natively and forwards to a latebrad node. */
+
+const IS_EXT = typeof chrome !== 'undefined' && !!(chrome.runtime && chrome.runtime.id);
+
+const $ = (id) => document.getElementById(id);
+let API = IS_EXT ? (localStorage.getItem('lat_api') || 'http://127.0.0.1:8090') : '';
+let NODE = localStorage.getItem('lat_node') || '127.0.0.1:4040';
+let SEED = localStorage.getItem('lat_seed') || '';
+let ADDR = localStorage.getItem('lat_addr') || '';
+let LAST = { registered: false, spendable: '0.00000', pending: '0.00000', public: '0.00000', total: '0.00000', usdc: '0.00000' };
+let MKT = { lat: 0, chg: 0, usdc: 1, usdc_live: false };
+let VIEW = 'home';
+let poll = null;
+
+/* Network: 'testnet' until launch; at mainnet flip lat_net (or the default).
+   On mainnet the USDC token is real bridged USD Coin; on testnet it is the
+   faucet-minted test asset, labelled so nobody mistakes it for real money. */
+const NET = localStorage.getItem('lat_net') || 'testnet';
+const IS_MAINNET = NET === 'mainnet';
+const USDC_NAME = IS_MAINNET ? 'USD Coin' : 'USDC (Testnet)';
+
+/* Where Discover points. Repoint to production domains at launch. */
+const EXPLORER_URL = 'http://127.0.0.1:8080';
+const SITE_URL = 'http://127.0.0.1:5174';
+const LAUNCHPAD_URL = 'http://127.0.0.1:5180';
+
+const LOGO = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='14' fill='%231e1b4b'/><path d='M20 12v34h26v-6H27V12h-7z' fill='%238b5cf6'/></svg>";
 
 /* ---- icons ---- */
-const I={
-  ghost:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C7.6 2 4 5.6 4 10v10.2c0 .8.9 1.2 1.5.7l1.6-1.3 1.7 1.4c.3.3.8.3 1.1 0l1.7-1.4 1.7 1.4c.3.3.8.3 1.1 0l1.7-1.4 1.6 1.3c.6.5 1.5.1 1.5-.7V10c0-4.4-3.6-8-8-8zm-3 9a1.4 1.4 0 110-2.8A1.4 1.4 0 019 11zm6 0a1.4 1.4 0 110-2.8A1.4 1.4 0 0115 11z"/></svg>',
-  recv:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M6 13l6 6 6-6"/></svg>',
-  send:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M6 11l6-6 6 6"/></svg>',
-  roll:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 11-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>',
-  gear:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.6 1.6 0 00-2.7.7 1.6 1.6 0 01-3.2 0 1.6 1.6 0 00-2.7-.7l-.1.1a2 2 0 11-2.8-2.8l.1-.1A1.6 1.6 0 004.6 15a1.6 1.6 0 00-1.5-1H3a2 2 0 010-4h.1A1.6 1.6 0 004.6 9a1.6 1.6 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.6 1.6 0 001.8.3H9a1.6 1.6 0 001-1.5V3a2 2 0 014 0v.1a1.6 1.6 0 001 1.5 1.6 1.6 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.6 1.6 0 00-.3 1.8V9a1.6 1.6 0 001.5 1H21a2 2 0 010 4h-.1a1.6 1.6 0 00-1.5 1z"/></svg>',
-  copy:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M5 15V5a2 2 0 012-2h10"/></svg>',
-  chev:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>',
-  chevr:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>',
-  home:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5L12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/></svg>',
-  swap:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3l4 4-4 4"/><path d="M21 7H7"/><path d="M7 21l-4-4 4-4"/><path d="M3 17h14"/></svg>',
-  disc:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M15.5 8.5l-2 5-5 2 2-5 5-2z"/></svg>',
-  act:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
-  key:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="4"/><path d="M10.8 12.2L21 2m-4 4l3 3m-6 0l3 3"/></svg>',
-  net:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.7 2.5 15.3 0 18M12 3c-2.5 2.7-2.5 15.3 0 18"/></svg>',
-  out:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 4h3a2 2 0 012 2v12a2 2 0 01-2 2h-3"/><path d="M10 17l5-5-5-5M15 12H3"/></svg>',
-  warn:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9L2 18a2 2 0 001.7 3h16.6a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z"/></svg>',
-  spark:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l2.4 6.4L21 11l-6.6 2.6L12 20l-2.4-6.4L3 11l6.6-2.6z"/></svg>',
-  drop:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3s6 6.5 6 10.5a6 6 0 11-12 0C6 9.5 12 3 12 3z"/></svg>',
+const I = {
+  recv: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M6 13l6 6 6-6"/></svg>',
+  send: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M6 11l6-6 6 6"/></svg>',
+  roll: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 11-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>',
+  gear: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.6 1.6 0 00-2.7.7 1.6 1.6 0 01-3.2 0 1.6 1.6 0 00-2.7-.7l-.1.1a2 2 0 11-2.8-2.8l.1-.1A1.6 1.6 0 004.6 15a1.6 1.6 0 00-1.5-1H3a2 2 0 010-4h.1A1.6 1.6 0 004.6 9a1.6 1.6 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.6 1.6 0 001.8.3H9a1.6 1.6 0 001-1.5V3a2 2 0 014 0v.1a1.6 1.6 0 001 1.5 1.6 1.6 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.6 1.6 0 00-.3 1.8V9a1.6 1.6 0 001.5 1H21a2 2 0 010 4h-.1a1.6 1.6 0 00-1.5 1z"/></svg>',
+  copy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M5 15V5a2 2 0 012-2h10"/></svg>',
+  chev: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>',
+  chevr: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>',
+  back: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>',
+  home: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5L12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/></svg>',
+  swap: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3l4 4-4 4"/><path d="M21 7H7"/><path d="M7 21l-4-4 4-4"/><path d="M3 17h14"/></svg>',
+  disc: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M15.5 8.5l-2 5-5 2 2-5 5-2z"/></svg>',
+  act: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
+  key: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="4"/><path d="M10.8 12.2L21 2m-4 4l3 3m-6 0l3 3"/></svg>',
+  net: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.7 2.5 15.3 0 18M12 3c-2.5 2.7-2.5 15.3 0 18"/></svg>',
+  out: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 4h3a2 2 0 012 2v12a2 2 0 01-2 2h-3"/><path d="M10 17l5-5-5-5M15 12H3"/></svg>',
+  warn: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9L2 18a2 2 0 001.7 3h16.6a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z"/></svg>',
+  spark: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l2.4 6.4L21 11l-6.6 2.6L12 20l-2.4-6.4L3 11l6.6-2.6z"/></svg>',
+  drop: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3s6 6.5 6 10.5a6 6 0 11-12 0C6 9.5 12 3 12 3z"/></svg>',
+  upr: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17L17 7M9 7h8v8"/></svg>',
+  dnl: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 7L7 17M15 17H7V9"/></svg>',
+  lock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2.5"/><path d="M8 11V8a4 4 0 018 0v3"/></svg>',
+  unlock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2.5"/><path d="M8 11V8a4 4 0 017.8-1.2"/></svg>',
+  eyeoff: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3l18 18"/><path d="M10.6 5.1A9.8 9.8 0 0121 12a15.9 15.9 0 01-3.3 3.9M6.6 6.6A15.6 15.6 0 003 12s3.5 6 9 6a8.9 8.9 0 003.9-.9"/><path d="M9.9 9.9a3 3 0 004.2 4.2"/></svg>',
+  ext: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"/><path d="M20 4L10 14"/><path d="M20 14v5a1 1 0 01-1 1H5a1 1 0 01-1-1V5a1 1 0 011-1h5"/></svg>',
+  book: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 016.5 17H20V3H6.5A2.5 2.5 0 004 5.5v14z"/><path d="M4 19.5A2.5 2.5 0 006.5 22H20v-2.5"/></svg>',
+  rocket: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 15c-1.5 1.3-2 5-2 5s3.7-.5 5-2M12 15l-3-3c.8-2 2.2-4.7 4-6.5C16 2.5 21 3 21 3s.5 5-2.5 8c-1.8 1.8-4.5 3.2-6.5 4z"/><circle cx="15" cy="9" r="1.6"/></svg>',
+  scan: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 012-2h2M17 3h2a2 2 0 012 2v2M21 17v2a2 2 0 01-2 2h-2M7 21H5a2 2 0 01-2-2v-2"/><path d="M7 12h10"/></svg>',
 };
 
-function toast(m,e){const t=$('toast');t.textContent=m;t.className='toast show'+(e?' err':'');clearTimeout(t._t);t._t=setTimeout(()=>t.className='toast',2600);}
-async function api(path,params){params.node=NODE;const q=Object.entries(params).map(([k,v])=>k+'='+encodeURIComponent(v)).join('&');const r=await fetch('/api/'+path+'?'+q);return r.json();}
-function save(){localStorage.setItem('lat_seed',SEED);localStorage.setItem('lat_addr',ADDR);}
-function copyText(t,m){navigator.clipboard.writeText(t);toast(m||'copied');}
-function shortAddr(a){return a?a.slice(0,8)+'…'+a.slice(-6):'';}
+/* token badges (inline SVG so both wallets render identically, no assets) */
+function tokIcon(kind, size) {
+  const s = size || 42;
+  /* official USDC token mark (Circle): blue disc, white $ + orbit arcs */
+  if (kind === 'usdc') return `<svg viewBox="0 0 32 32" width="${s}" height="${s}"><circle cx="16" cy="16" r="16" fill="#2775CA"/><path fill="#fff" d="M20.022 18.124c0-2.124-1.28-2.852-3.84-3.156-1.828-.243-2.193-.728-2.193-1.578 0-.85.61-1.396 1.828-1.396 1.097 0 1.706.364 2.011 1.275a.458.458 0 00.427.303h.975a.416.416 0 00.427-.425v-.06a3.04 3.04 0 00-2.743-2.489V9.142c0-.243-.183-.425-.487-.486h-.915c-.243 0-.426.182-.487.486v1.396c-1.829.242-2.986 1.456-2.986 2.974 0 2.002 1.218 2.791 3.778 3.095 1.707.303 2.255.668 2.255 1.639 0 .97-.853 1.638-2.011 1.638-1.585 0-2.133-.667-2.316-1.578-.06-.242-.244-.364-.427-.364h-1.036a.416.416 0 00-.426.425v.06c.243 1.518 1.219 2.61 3.23 2.914v1.457c0 .242.183.425.487.485h.915c.243 0 .426-.182.487-.485V21.34c1.828-.303 3.047-1.578 3.047-3.217z"/><path fill="#fff" d="M12.892 24.497c-4.754-1.7-7.192-6.98-5.424-11.653.914-2.549 2.925-4.491 5.424-5.402.244-.121.366-.303.366-.607v-.85c0-.242-.122-.424-.366-.485-.061 0-.183 0-.244.06a12.048 12.048 0 00-7.923 15.174c1.218 3.764 4.145 6.616 7.923 7.83.244.121.488 0 .548-.243.061-.06.061-.122.061-.243v-.85c0-.182-.182-.424-.365-.545zm6.46-18.936c-.244-.122-.488 0-.548.242-.061.06-.061.122-.061.243v.85c0 .242.182.485.365.606 4.754 1.7 7.192 6.98 5.424 11.653-.914 2.55-2.925 4.492-5.424 5.402-.244.121-.366.303-.366.607v.85c0 .242.122.424.366.485.061 0 .183 0 .244-.06a12.048 12.048 0 007.923-15.174 12.093 12.093 0 00-7.923-7.704z"/></svg>`;
+  const bg = kind === 'pub' ? '#12233f' : '#1e1b4b';
+  const fg = kind === 'pub' ? '#4c9bf5' : '#8b5cf6';
+  return `<svg viewBox="0 0 42 42" width="${s}" height="${s}"><rect width="42" height="42" rx="12" fill="${bg}"/><path d="M13.5 8v22h16.5v-4h-12V8h-4.5z" fill="${fg}"/></svg>`;
+}
+
+/* ---- utils ---- */
+function toast(m, e) { const t = $('toast'); t.textContent = m; t.className = 'toast show' + (e ? ' err' : ''); clearTimeout(t._t); t._t = setTimeout(() => t.className = 'toast', 2600); }
+async function api(path, params) {
+  params.node = NODE;
+  const q = Object.entries(params).map(([k, v]) => k + '=' + encodeURIComponent(v)).join('&');
+  try {
+    const r = await fetch(API + '/api/' + path + '?' + q);
+    return await r.json();
+  } catch {
+    return { error: 'cannot reach the wallet server' + (IS_EXT ? ' at ' + API : '') + ' — start lat-wallet-web' };
+  }
+}
+function save() { localStorage.setItem('lat_seed', SEED); localStorage.setItem('lat_addr', ADDR); }
+function copyText(t, m) { navigator.clipboard.writeText(t); toast(m || 'copied'); }
+function shortAddr(a) { return a ? a.slice(0, 8) + '…' + a.slice(-6) : ''; }
+const nf = (n, d) => (n || 0).toLocaleString(undefined, { minimumFractionDigits: d ?? 2, maximumFractionDigits: d ?? 2 });
+const usd = (n) => '$' + nf(n);
+const num = (s) => parseFloat(s || '0') || 0;
+function timeAgo(ts) {
+  const d = Math.max(0, Date.now() / 1000 - ts);
+  if (d < 60) return 'just now';
+  if (d < 3600) return Math.floor(d / 60) + 'm ago';
+  if (d < 86400) return Math.floor(d / 3600) + 'h ago';
+  return Math.floor(d / 86400) + 'd ago';
+}
+function chgChip(chg) {
+  const up = chg >= 0;
+  return `<span class="pc ${up ? 'up' : 'dn'}">${up ? '+' : ''}${nf(chg)}%</span>`;
+}
 
 /* ================= onboarding ================= */
-function showWelcome(){
-  if(poll){clearInterval(poll);poll=null;}
-  $('app').innerHTML=`
+function showWelcome() {
+  if (poll) { clearInterval(poll); poll = null; }
+  $('app').innerHTML = `
     <div class="onb">
       <img class="welcome-mark" src="${LOGO}" alt="Latebra">
-      <h1>Latebra Wallet</h1>
+      <h1>Latebra Vault</h1>
       <p>A private wallet for the Latebra chain. Your keys stay in this browser.</p>
       <div class="full">
-        <button class="primary" onclick="createWallet()">Create a new wallet</button>
-        <button class="ghost" onclick="showImport()">I already have a seed</button>
+        <button class="primary" data-act="createWallet">Create a new wallet</button>
+        <button class="ghost" data-act="showImport">I already have a seed</button>
       </div>
     </div>`;
 }
-function showImport(){
-  $('app').innerHTML=`
-    <div class="hdr"><button class="iconbtn" onclick="showWelcome()">${I.chev}</button><div style="flex:1"></div></div>
+function showImport() {
+  $('app').innerHTML = `
+    <div class="hdr"><button class="iconbtn" data-act="showWelcome">${I.chev}</button><div style="flex:1"></div></div>
     <div class="onb" style="justify-content:flex-start;padding-top:20px">
       <div class="ghost-logo" style="width:70px;height:70px;border-radius:20px;margin-bottom:18px">${I.key}</div>
       <h1 style="font-size:22px">Import wallet</h1>
       <p>Paste your 64-character secret seed.</p>
       <div class="full">
         <input id="imp" placeholder="2a2a2a…" autocomplete="off" spellcheck="false">
-        <button class="primary" onclick="doImport()">Import</button>
+        <button class="primary" data-act="doImport">Import</button>
       </div>
     </div>`;
 }
-async function doImport(){
-  const s=$('imp').value.trim();
-  const r=await api('address',{seed:s,net:'testnet'});
-  if(r.address){SEED=s;ADDR=r.address;save();showWallet();toast('wallet imported');}
-  else toast('invalid seed',true);
+async function doImport() {
+  const s = $('imp').value.trim();
+  const r = await api('address', { seed: s, net: NET });
+  if (r.address) { SEED = s; ADDR = r.address; save(); showView('home'); toast('wallet imported'); }
+  else toast(r.error || 'invalid seed', true);
 }
-async function createWallet(){
-  const r=await api('new',{net:'testnet'});
-  SEED=r.seed;ADDR=r.address;save();
-  $('app').innerHTML=`
+async function createWallet() {
+  const r = await api('new', { net: NET });
+  if (!r.seed) { toast(r.error || 'failed', true); return; }
+  SEED = r.seed; ADDR = r.address; save();
+  $('app').innerHTML = `
     <div class="onb" style="justify-content:flex-start;padding-top:34px">
       <div class="ghost-logo" style="width:70px;height:70px;border-radius:20px;margin-bottom:20px">${I.key}</div>
       <h1 style="font-size:22px">Your secret seed</h1>
@@ -318,34 +435,59 @@ async function createWallet(){
       <div class="full">
         <div class="warn">${I.warn}<div>Anyone with this seed controls your funds. Never share it.</div></div>
         <div class="seedbox" id="seedbox">${SEED}</div>
-        <button class="ghost" style="margin:12px 0" onclick="copyText(SEED,'seed copied')">Copy seed</button>
-        <button class="primary" onclick="showWallet()">I saved it — open wallet</button>
+        <button class="ghost" style="margin:12px 0" data-act="copySeed">Copy seed</button>
+        <button class="primary" data-act="goHome">I saved it — open wallet</button>
       </div>
     </div>`;
 }
 
-/* ================= main wallet ================= */
-function showWallet(){
-  closeSheet();
-  $('app').innerHTML=`
+/* ================= shell: header + nav + view switching ================= */
+function navBar() {
+  const items = [
+    ['home', I.home, 'Home'], ['swap', I.swap, 'Swap'], ['discover', I.disc, 'Discover'],
+    ['activity', I.act, 'Activity'], ['settings', I.gear, 'Settings'],
+  ];
+  return `<div class="nav">` + items.map(([v, ic, t]) =>
+    `<a class="${VIEW === v ? 'on' : ''}" data-act="showView" data-arg="${v}">${ic}<span>${t}</span></a>`).join('') + `</div>`;
+}
+function header() {
+  return `
     <div class="hdr rise r1">
-      <button class="iconbtn" onclick="openReceive()" title="Receive">${I.recv}</button>
-      <button class="acct" onclick="openSettings()">
+      <button class="iconbtn" data-act="openReceive" title="Receive">${I.recv}</button>
+      <button class="acct" data-act="showView" data-arg="settings">
         <span class="avatar"></span><span>Account 1</span><span class="chev">${I.chev}</span>
       </button>
-      <button class="iconbtn" onclick="openSettings()" title="Settings">${I.gear}</button>
-    </div>
+      <button class="iconbtn" data-act="showView" data-arg="settings" title="Settings">${I.gear}</button>
+    </div>`;
+}
+function showView(v) {
+  if (!SEED) { showWelcome(); return; }
+  VIEW = v;
+  closeSheet();
+  if (v === 'home') renderHome();
+  else if (v === 'swap') renderSwap();
+  else if (v === 'discover') { DAPP = null; renderDiscover(); }
+  else if (v === 'activity') renderActivity();
+  else if (v === 'settings') renderSettings();
+  if (!poll) poll = setInterval(refresh, 8000);
+}
 
+/* ================= home ================= */
+function renderHome() {
+  $('app').innerHTML = `
+    ${header()}
     <div class="hero rise r2">
-      <div class="amt" id="hero">0.00<small>LAT</small></div>
+      <div class="amt" id="heroUsd">$0.00</div>
+      <div class="sub mono" id="heroLat">0.00000 LAT</div>
       <div class="chg flat" id="chg">Testnet · Latebra</div>
     </div>
 
     <div class="actions rise r3">
-      <button class="act" onclick="openReceive()"><span class="circ">${I.recv}</span><span>Receive</span></button>
-      <button class="act" onclick="openSend()"><span class="circ">${I.send}</span><span>Send</span></button>
-      <button class="act" onclick="openMove()"><span class="circ">${I.swap}</span><span>Shield</span></button>
-      <button class="act" onclick="faucet()"><span class="circ">${I.drop}</span><span>Faucet</span></button>
+      <button class="act" data-act="openReceive"><span class="circ">${I.recv}</span><span>Receive</span></button>
+      <button class="act" data-act="openSend"><span class="circ">${I.send}</span><span>Send</span></button>
+      <button class="act" data-act="showView" data-arg="swap"><span class="circ">${I.swap}</span><span>Swap</span></button>
+      <button class="act" data-act="openMove"><span class="circ">${I.lock}</span><span>Shield</span></button>
+      <button class="act" data-act="faucet"><span class="circ">${I.drop}</span><span>Faucet</span></button>
     </div>
 
     <div id="regbar"></div>
@@ -354,135 +496,590 @@ function showWallet(){
     <div class="pad rise r4">
       <div class="section-t">Tokens</div>
       <div class="list">
-        <div class="tok" onclick="openMove('unshield')">
-          <div class="logo"><b>L</b></div>
-          <div class="meta"><div class="n">Latebra <span class="tag priv">PRIVATE</span></div><div class="s">Encrypted — only you can read it</div></div>
-          <div class="val"><div class="b" id="spend">0.00000</div><div class="f">LAT</div></div>
+        <div class="tok" data-act="openMove" data-arg="unshield">
+          <div class="tico">${tokIcon('priv')}</div>
+          <div class="meta"><div class="n">Latebra <span class="tag priv">PRIVATE</span></div><div class="s" id="pxLat1">$0.00 · +0.00%</div></div>
+          <div class="val"><div class="b" id="spendUsd">$0.00</div><div class="f mono" id="spend">0.00000 LAT</div></div>
         </div>
-        <div class="tok" onclick="openMove('shield')">
-          <div class="logo pub"><b>L</b></div>
-          <div class="meta"><div class="n">Latebra <span class="tag pubt">PUBLIC</span></div><div class="s">Visible on the explorer</div></div>
-          <div class="val"><div class="b" id="pub">0.00000</div><div class="f">LAT</div></div>
+        <div class="tok" data-act="openMove" data-arg="shield">
+          <div class="tico">${tokIcon('pub')}</div>
+          <div class="meta"><div class="n">Latebra <span class="tag pubt">PUBLIC</span></div><div class="s" id="pxLat2">$0.00 · +0.00%</div></div>
+          <div class="val"><div class="b" id="pubUsd">$0.00</div><div class="f mono" id="pub">0.00000 LAT</div></div>
+        </div>
+        <div class="tok" data-act="showView" data-arg="swap">
+          <div class="tico">${tokIcon('usdc')}</div>
+          <div class="meta"><div class="n">${USDC_NAME} <span class="tag pubt">PUBLIC</span></div><div class="s">$1.00 · stable</div></div>
+          <div class="val"><div class="b" id="usdcUsd">$0.00</div><div class="f mono" id="usdcAmt">0.00000 USDC</div></div>
         </div>
       </div>
     </div>
-
-    <div class="nav">
-      <a class="on" onclick="showWallet()">${I.home}<span>Home</span></a>
-      <a onclick="toast('Swap is coming soon')">${I.swap}<span>Swap</span></a>
-      <a onclick="toast('Discover is coming soon')">${I.disc}<span>Discover</span></a>
-      <a onclick="toast('Activity view is coming soon')">${I.act}<span>Activity</span></a>
-      <a onclick="openSettings()">${I.gear}<span>Settings</span></a>
-    </div>`;
+    ${navBar()}`;
   refresh();
-  if(poll)clearInterval(poll);poll=setInterval(refresh,8000);
 }
 
-async function refresh(){
-  if(!SEED||!$('hero'))return;
-  const r=await api('balance',{seed:SEED,net:'testnet'});
-  if(r.error){toast(r.error,true);return;}
-  if(r.address){ADDR=r.address;save();}
-  LAST=r;
-  const reg=$('regbar'),pend=$('pendbar');
-  if(r.registered===false){
-    HERO_VAL=0;$('hero').innerHTML='0.00<small>LAT</small>';
-    if($('spend'))$('spend').textContent='0.00000';
-    if($('pub'))$('pub').textContent='0.00000';
-    if(reg)reg.innerHTML=`
+async function refresh() {
+  if (!SEED) return;
+  const [r, m] = await Promise.all([
+    api('balance', { seed: SEED, net: NET }),
+    api('market', {}),
+  ]);
+  if (m && m.ok) MKT = m;
+  if (r.error) { toast(r.error, true); return; }
+  if (r.address) { ADDR = r.address; save(); }
+  LAST = r;
+  paintHome();
+  paintSwap();
+}
+
+function paintHome() {
+  if (VIEW !== 'home' || !$('heroUsd')) return;
+  const r = LAST, price = MKT.lat || 0;
+  const reg = $('regbar'), pend = $('pendbar');
+  if (r.registered === false) {
+    setHeroUsd(0);
+    $('heroLat').textContent = '0.00000 LAT';
+    if (reg) reg.innerHTML = `
       <div class="banner">
         <div class="bi">${I.spark}</div>
         <div class="bt"><div class="t">Activate your account</div><div class="d">A one-time on-chain registration.</div></div>
-        <button class="primary" onclick="register()">Activate</button>
+        <button class="primary" data-act="register">Activate</button>
       </div>`;
-    if(pend)pend.innerHTML='';
-    const ra=$('rollact');if(ra)ra.setAttribute('disabled','');
+    if (pend) pend.innerHTML = '';
     return;
   }
-  if(reg)reg.innerHTML='';
-  setHero(r.total);
-  if($('spend'))$('spend').textContent=r.spendable;
-  if($('pub'))$('pub').textContent=r.public;
-  const p=parseFloat(r.pending||'0');
-  const ra=$('rollact');if(ra){if(p>0)ra.removeAttribute('disabled');else ra.setAttribute('disabled','');}
-  if(pend)pend.innerHTML = p>0 ? `
+  if (reg) reg.innerHTML = '';
+  const latTotal = num(r.total), usdcAmt = num(r.usdc);
+  setHeroUsd(latTotal * price + usdcAmt * (MKT.usdc || 1));
+  $('heroLat').textContent = nf(latTotal, 5) + ' LAT';
+  const chg = $('chg');
+  if (chg) {
+    const up = (MKT.chg || 0) >= 0;
+    chg.className = 'chg ' + (up ? '' : 'dn');
+    chg.innerHTML = `${up ? '▲' : '▼'} ${up ? '+' : ''}${nf(MKT.chg)}% · LAT ${usd(price)}`;
+  }
+  const priceLine = `${usd(price)} · ` + chgChip(MKT.chg);
+  if ($('pxLat1')) $('pxLat1').innerHTML = priceLine;
+  if ($('pxLat2')) $('pxLat2').innerHTML = priceLine;
+  if ($('spend')) $('spend').textContent = nf(num(r.spendable), 5) + ' LAT';
+  if ($('pub')) $('pub').textContent = nf(num(r.public), 5) + ' LAT';
+  if ($('usdcAmt')) $('usdcAmt').textContent = nf(usdcAmt, 5) + ' USDC';
+  if ($('spendUsd')) $('spendUsd').textContent = usd(num(r.spendable) * price);
+  if ($('pubUsd')) $('pubUsd').textContent = usd(num(r.public) * price);
+  if ($('usdcUsd')) $('usdcUsd').textContent = usd(usdcAmt * (MKT.usdc || 1));
+  const p = num(r.pending);
+  if (pend) pend.innerHTML = p > 0 ? `
     <div class="banner">
       <div class="bi">${I.roll}</div>
       <div class="bt"><div class="t">${r.pending} LAT pending</div><div class="d">Received funds — roll over to make them spendable.</div></div>
-      <button class="primary" onclick="rollover()">Roll over</button>
+      <button class="primary" data-act="rollover">Roll over</button>
     </div>` : '';
 }
-function fmtHero(total){
-  const [i,f]=String(total||'0.00000').split('.');
-  return `${Number(i).toLocaleString()}.${(f||'00').slice(0,2)}<small>LAT</small>`;
-}
-/* Count the hero balance up/down to its new value instead of snapping. */
-let HERO_VAL=0;
-function setHero(total){
-  const el=$('hero');if(!el)return;
-  const to=parseFloat(total||'0')||0, from=HERO_VAL;HERO_VAL=to;
-  if(from===to || matchMedia('(prefers-reduced-motion:reduce)').matches){el.innerHTML=fmtHero(to.toFixed(5));return;}
-  const t0=performance.now(),dur=650;
-  (function step(now){
-    const p=Math.min(1,(now-t0)/dur), e=1-Math.pow(1-p,3);
-    el.innerHTML=fmtHero((from+(to-from)*e).toFixed(5));
-    if(p<1)requestAnimationFrame(step);
+
+/* Count the hero USD value up/down to its new value instead of snapping. */
+let HERO_VAL = 0;
+function setHeroUsd(to) {
+  const el = $('heroUsd'); if (!el) return;
+  const from = HERO_VAL; HERO_VAL = to;
+  if (from === to || matchMedia('(prefers-reduced-motion:reduce)').matches) { el.textContent = usd(to); return; }
+  const t0 = performance.now(), dur = 650;
+  (function step(now) {
+    const p = Math.min(1, (now - t0) / dur), e = 1 - Math.pow(1 - p, 3);
+    el.textContent = usd(from + (to - from) * e);
+    if (p < 1) requestAnimationFrame(step);
   })(t0);
 }
 
-/* ================= actions ================= */
-async function register(){const r=await api('register',{seed:SEED,net:'testnet'});toast(r.ok?r.msg:(r.error||'failed'),!r.ok);}
-async function rollover(){
-  if(parseFloat(LAST.pending||'0')<=0){toast('nothing pending to roll over');return;}
-  const r=await api('rollover',{seed:SEED,net:'testnet'});toast(r.ok?r.msg:(r.error||'failed'),!r.ok);
+/* ================= swap ================= */
+let SWAPFROM = 'LAT';
+let SWAPMODE = 'pool'; // 'pool' (on-chain DEX) | 'desk' (oracle desk) | 'bridge' (HTLC)
+let POOL = {};         // last /api/dex/pool reply
+function swapTabs() {
+  const t = (m, label) =>
+    `<button class="maxb" style="flex:1;padding:9px 0;border-radius:10px;${SWAPMODE === m ? 'background:rgba(124,92,255,.25)' : ''}" data-act="setSwapMode" data-arg="${m}">${label}</button>`;
+  return `<div style="display:flex;gap:8px;margin:6px 0 12px">${t('pool', 'DEX Pool')}${t('desk', 'Desk')}${t('bridge', 'Bridge')}</div>`;
 }
-async function send(){
-  const to=$('to').value.trim(),amt=$('amt').value.trim();
-  if(!to||!amt){toast('enter recipient and amount',true);return;}
+function setSwapMode(m) { SWAPMODE = m; renderSwap(); }
+function renderSwap() {
+  if (SWAPMODE === 'pool') { renderPool(); return; }
+  if (SWAPMODE === 'bridge') { renderBridge(); return; }
+  $('app').innerHTML = `
+    ${header()}
+    <div class="pad rise r2">
+      <div class="section-t" style="margin-top:6px">Swap</div>
+      ${swapTabs()}
+      <div class="scard">
+        <div class="lbl"><span>You pay</span><span class="balhint" id="payBal"></span></div>
+        <div class="in">
+          <input id="payAmt" class="mono" placeholder="0.0" inputmode="decimal">
+          <button class="maxb" data-act="swapMax">MAX</button>
+          <span class="tchip" id="payChip"></span>
+        </div>
+      </div>
+      <button class="flip" data-act="swapFlip" title="Flip">${I.swap}</button>
+      <div class="scard">
+        <div class="lbl"><span>You receive</span><span class="balhint" id="recvBal"></span></div>
+        <div class="in">
+          <input id="recvAmt" class="mono" placeholder="0.0" readonly>
+          <span class="tchip" id="recvChip"></span>
+        </div>
+      </div>
+      <div class="rate mono" id="rate"></div>
+      <button class="primary" id="swapBtn" data-act="doSwap" style="margin-top:14px">Swap</button>
+      <p class="subhint">Swaps trade your <b>public</b> balances with the Latebra desk at the oracle price. Network fee 0.01 per side. For reserve-priced trades use the DEX Pool tab.</p>
+    </div>
+    ${navBar()}`;
+  $('payAmt').addEventListener('input', paintSwapCalc);
+  paintSwap();
+  refresh();
+}
+function chipHtml(tk) {
+  return `${tokIcon(tk === 'LAT' ? 'pub' : 'usdc', 22)}<b>${tk}</b>`;
+}
+function paintSwap() {
+  if (VIEW !== 'swap' || !$('payChip')) return;
+  const to = SWAPFROM === 'LAT' ? 'USDC' : 'LAT';
+  $('payChip').innerHTML = chipHtml(SWAPFROM);
+  $('recvChip').innerHTML = chipHtml(to);
+  const latBal = nf(num(LAST.public), 5) + ' LAT', usdcBal = nf(num(LAST.usdc), 5) + ' USDC';
+  $('payBal').textContent = 'Balance ' + (SWAPFROM === 'LAT' ? latBal : usdcBal);
+  $('recvBal').textContent = 'Balance ' + (SWAPFROM === 'LAT' ? usdcBal : latBal);
+  const p = MKT.lat || 0;
+  $('rate').textContent = p ? (SWAPFROM === 'LAT'
+    ? `1 LAT ≈ ${nf(p, 4)} USDC`
+    : `1 USDC ≈ ${nf(p ? 1 / p : 0, 4)} LAT`) : 'rate unavailable — node offline?';
+  paintSwapCalc();
+}
+function paintSwapCalc() {
+  if (!$('payAmt')) return;
+  const a = num($('payAmt').value), p = MKT.lat || 0;
+  const out = SWAPFROM === 'LAT' ? a * p : (p ? a / p : 0);
+  $('recvAmt').value = a > 0 && p ? nf(out, 5) : '';
+  $('swapBtn').textContent = a > 0 ? `Swap ${nf(a, 5)} ${SWAPFROM}` : 'Swap';
+}
+function swapFlip() { SWAPFROM = SWAPFROM === 'LAT' ? 'USDC' : 'LAT'; const v = $('payAmt').value; renderSwap(); $('payAmt').value = v; paintSwapCalc(); }
+function swapMax() {
+  const bal = SWAPFROM === 'LAT' ? num(LAST.public) : num(LAST.usdc);
+  $('payAmt').value = Math.max(0, bal - 0.011).toFixed(5);
+  paintSwapCalc();
+}
+async function doSwap() {
+  const a = $('payAmt').value.trim();
+  if (!a || num(a) <= 0) { toast('enter an amount', true); return; }
+  $('swapBtn').disabled = true;
+  toast('swapping…');
+  const r = await api('swap', { seed: SEED, amount: a, from: SWAPFROM, net: NET });
+  $('swapBtn').disabled = false;
+  if (r.ok) { toast(r.msg); $('payAmt').value = ''; paintSwapCalc(); setTimeout(refresh, 1200); }
+  else toast(r.error || 'swap failed', true);
+}
+
+/* ================= on-chain DEX (AMM pool) ================= */
+async function renderPool() {
+  $('app').innerHTML = `
+    ${header()}
+    <div class="pad rise r2">
+      <div class="section-t" style="margin-top:6px">Swap</div>
+      ${swapTabs()}
+      <div class="scard">
+        <div class="lbl"><span>You pay</span><span class="balhint" id="poolBal"></span></div>
+        <div class="in">
+          <input id="poolAmt" class="mono" placeholder="0.0" inputmode="decimal">
+          <span class="tchip" id="poolPayChip"></span>
+        </div>
+      </div>
+      <button class="flip" data-act="poolFlip" title="Flip">${I.swap}</button>
+      <div class="scard">
+        <div class="lbl"><span>You receive (quote)</span></div>
+        <div class="in">
+          <input id="poolOut" class="mono" placeholder="0.0" readonly>
+          <span class="tchip" id="poolRecvChip"></span>
+        </div>
+      </div>
+      <div class="rate mono" id="poolRate">loading pool…</div>
+      <button class="primary" id="poolSwapBtn" data-act="doPoolSwap" style="margin-top:14px">Swap on-chain</button>
+      <p class="subhint">Trades against the chain's own LAT ⇄ USDC constant-product pool. Price comes from the reserves; the 0.3% pool fee goes to liquidity providers. 1% slippage bound.</p>
+
+      <div class="section-t" style="margin-top:18px">Liquidity</div>
+      <div class="scard">
+        <div class="lbl"><span>Add: LAT + USDC (max)</span><span class="balhint mono" id="myLp"></span></div>
+        <div class="in"><input id="lpLat" class="mono" placeholder="LAT" inputmode="decimal"><input id="lpTok" class="mono" placeholder="USDC max" inputmode="decimal"></div>
+        <div class="in" style="margin-top:8px">
+          <button class="maxb" style="flex:1;padding:9px 0" data-act="doPoolAdd">Add liquidity</button>
+          <input id="lpBurn" class="mono" placeholder="LP shares" inputmode="numeric" style="max-width:110px">
+          <button class="maxb" style="padding:9px 12px" data-act="doPoolRemove">Remove</button>
+        </div>
+      </div>
+      <p class="subhint">First add creates the pool and sets the opening price (your LAT : USDC ratio). Later adds match the pool ratio; the USDC field is your ceiling.</p>
+    </div>
+    ${navBar()}`;
+  $('poolAmt').addEventListener('input', paintPoolCalc);
+  paintPoolChips();
+  const r = await api('dex/pool', { seed: SEED, ticker: 'USDC', net: NET });
+  if (r.ok) { POOL = r; paintPoolInfo(); } else $('poolRate') && ($('poolRate').textContent = r.error || 'pool unavailable');
+}
+function paintPoolChips() {
+  if (!$('poolPayChip')) return;
+  const to = SWAPFROM === 'LAT' ? 'USDC' : 'LAT';
+  $('poolPayChip').innerHTML = chipHtml(SWAPFROM);
+  $('poolRecvChip').innerHTML = chipHtml(to);
+  const latBal = nf(num(LAST.public), 5) + ' LAT', usdcBal = nf(num(LAST.usdc), 5) + ' USDC';
+  $('poolBal').textContent = 'Balance ' + (SWAPFROM === 'LAT' ? latBal : usdcBal);
+}
+function paintPoolInfo() {
+  if (!$('poolRate')) return;
+  if (!POOL.exists) {
+    $('poolRate').textContent = 'no pool yet — seed it below to open the market';
+    $('myLp').textContent = '';
+    return;
+  }
+  $('poolRate').textContent = `pool ${nf(num(POOL.lat), 2)} LAT / ${nf(num(POOL.tok), 2)} USDC · 1 USDC ≈ ${nf(POOL.price, 4)} LAT`;
+  $('myLp').textContent = POOL.myLp > 0 ? `my LP: ${POOL.myLp}` : '';
+  paintPoolCalc();
+}
+function paintPoolCalc() {
+  if (!$('poolAmt') || !POOL.exists) return;
+  const a = num($('poolAmt').value);
+  const latR = num(POOL.lat), tokR = num(POOL.tok);
+  const [rin, rout] = SWAPFROM === 'LAT' ? [latR, tokR] : [tokR, latR];
+  const eff = a * 0.997;
+  const out = rin > 0 ? (eff * rout) / (rin + eff) : 0;
+  $('poolOut').value = a > 0 ? nf(out, 5) : '';
+  $('poolSwapBtn').textContent = a > 0 ? `Swap ${nf(a, 5)} ${SWAPFROM} on-chain` : 'Swap on-chain';
+}
+function poolFlip() { SWAPFROM = SWAPFROM === 'LAT' ? 'USDC' : 'LAT'; renderPool(); }
+async function doPoolSwap() {
+  const a = $('poolAmt').value.trim();
+  if (!a || num(a) <= 0) { toast('enter an amount', true); return; }
+  $('poolSwapBtn').disabled = true;
+  toast('submitting swap…');
+  const r = await api('dex/swap', { seed: SEED, amount: a, ticker: 'USDC', from: SWAPFROM, net: NET });
+  $('poolSwapBtn').disabled = false;
+  if (r.ok) { toast(r.msg); $('poolAmt').value = ''; setTimeout(renderPool, 1500); }
+  else toast(r.error || 'swap failed', true);
+}
+async function doPoolAdd() {
+  const l = $('lpLat').value.trim(), t = $('lpTok').value.trim();
+  if (!l || !t || num(l) <= 0 || num(t) <= 0) { toast('enter both amounts', true); return; }
+  toast('adding liquidity…');
+  const r = await api('dex/add', { seed: SEED, amount: l, tok: t, ticker: 'USDC', net: NET });
+  if (r.ok) { toast(r.msg); setTimeout(renderPool, 1500); } else toast(r.error || 'failed', true);
+}
+async function doPoolRemove() {
+  const lp = $('lpBurn').value.trim();
+  if (!lp || !(+lp > 0)) { toast('enter LP shares to burn', true); return; }
+  toast('removing liquidity…');
+  const r = await api('dex/remove', { seed: SEED, lp, ticker: 'USDC', net: NET });
+  if (r.ok) { toast(r.msg); setTimeout(renderPool, 1500); } else toast(r.error || 'failed', true);
+}
+
+/* ================= bridge (HTLC atomic swaps) ================= */
+let LASTLOCK = null; // {htlcId, preimage, expiry} from the most recent lock
+async function renderBridge() {
+  $('app').innerHTML = `
+    ${header()}
+    <div class="pad rise r2">
+      <div class="section-t" style="margin-top:6px">Swap</div>
+      ${swapTabs()}
+      <div class="scard">
+        <div class="lbl"><span>Cross-chain swap</span><span class="balhint">BTC · ETH · SOL → LAT</span></div>
+        <div style="display:flex;gap:6px;margin:8px 0" id="xchainTabs">
+          <button class="maxb" data-act="setXchain" data-arg="btc" style="flex:1;padding:9px 0">BTC</button>
+          <button class="maxb" data-act="setXchain" data-arg="eth" style="flex:1;padding:9px 0">ETH</button>
+          <button class="maxb" data-act="setXchain" data-arg="sol" style="flex:1;padding:9px 0">SOL</button>
+        </div>
+        <div class="in"><input id="xcAmt" class="mono" placeholder="amount (sat / wei / lamport)" inputmode="numeric"></div>
+        <div class="in" style="margin-top:8px"><input id="xcRecipient" class="mono" placeholder="counterparty key hex (optional)"></div>
+        <button class="primary" data-act="doXchainQuote" style="margin-top:12px">Get deposit address</button>
+        <div id="xcOut"></div>
+        <p class="subhint" style="margin-top:10px">Builds the real HTLC on the other chain under a shared SHA-256 hashlock. Fund the deposit there, then lock LAT below with the same hashlock — one secret settles both legs, no custodian.</p>
+      </div>
+      <div class="scard" style="margin-top:12px">
+        <div class="lbl"><span>Lock LAT for a counterparty</span><span class="balhint">Balance ${nf(num(LAST.public), 5)} LAT</span></div>
+        <div class="in"><input id="brTo" class="mono" placeholder="latt1… recipient"></div>
+        <div class="in" style="margin-top:8px">
+          <input id="brAmt" class="mono" placeholder="amount" inputmode="decimal">
+          <input id="brBlocks" class="mono" placeholder="expiry blocks (240)" inputmode="numeric" style="max-width:150px">
+        </div>
+        <div class="in" style="margin-top:8px"><input id="brHashlock" class="mono" placeholder="hashlock hex (blank = new secret)"></div>
+        <button class="primary" data-act="doBridgeLock" style="margin-top:12px">Lock (HTLC)</button>
+      </div>
+      <div id="brSecret"></div>
+      <div class="scard" style="margin-top:12px">
+        <div class="lbl"><span>Claim with preimage</span></div>
+        <div class="in"><input id="brClaimId" class="mono" placeholder="HTLC id hex"></div>
+        <div class="in" style="margin-top:8px"><input id="brPreimage" class="mono" placeholder="preimage hex"></div>
+        <div class="in" style="margin-top:8px">
+          <button class="maxb" style="flex:1;padding:9px 0" data-act="doBridgeClaim">Claim</button>
+          <button class="maxb" style="flex:1;padding:9px 0" data-act="doBridgeRefund">Refund (expired)</button>
+        </div>
+      </div>
+      <div class="section-t" style="margin-top:18px">My open locks</div>
+      <div class="list" id="brList"><div class="subhint">loading…</div></div>
+      <p class="subhint">HTLCs are the atomic-swap bridge primitive: the same SHA-256 secret unlocks a matching contract on Bitcoin, an EVM chain, or Solana. Reveal the preimage only when the counterparty's lock is confirmed.</p>
+    </div>
+    ${navBar()}`;
+  hlXchain();
+  const r = await api('bridge/list', { seed: SEED, net: NET });
+  const box = $('brList');
+  if (!box) return;
+  if (!r.ok) { box.innerHTML = `<div class="subhint">${r.error || 'unavailable'}</div>`; return; }
+  if (!r.locks.length) { box.innerHTML = `<div class="subhint">no open locks</div>`; return; }
+  box.innerHTML = r.locks.map(l => `
+    <div class="tok" data-act="fillClaim" data-arg="${l.id}">
+      <div class="meta"><div class="n">${l.role === 'outgoing' ? 'You locked' : 'Locked for you'} <span class="tag ${l.expired ? 'priv' : 'pubt'}">${l.expired ? 'EXPIRED' : 'OPEN'}</span></div>
+      <div class="s mono">${l.id.slice(0, 16)}… · expires #${l.expiry}</div></div>
+      <div class="val"><div class="b mono">${l.amount}</div><div class="f">token ${l.token}</div></div>
+    </div>`).join('');
+}
+function fillClaim(id) { if ($('brClaimId')) { $('brClaimId').value = id; toast('lock id filled below'); } }
+async function doBridgeLock() {
+  const to = $('brTo').value.trim(), a = $('brAmt').value.trim();
+  if (!to || !a || num(a) <= 0) { toast('recipient and amount required', true); return; }
+  const q = { seed: SEED, to, amount: a, net: NET };
+  const blocks = $('brBlocks').value.trim(); if (blocks) q.blocks = blocks;
+  const hl = $('brHashlock').value.trim(); if (hl) q.hashlock = hl;
+  toast('locking…');
+  const r = await api('bridge/lock', q);
+  if (!r.ok) { toast(r.error || 'lock failed', true); return; }
+  LASTLOCK = r; toast(r.msg);
+  $('brSecret').innerHTML = `
+    <div class="scard" style="margin-top:12px;border-color:rgba(124,92,255,.5)">
+      <div class="lbl"><span>SAVE THIS — needed to claim / prove the swap</span></div>
+      <div class="s mono" style="word-break:break-all;font-size:12px">id: ${r.htlcId}</div>
+      ${r.preimage ? `<div class="s mono" style="word-break:break-all;font-size:12px">secret: ${r.preimage}</div>
+      <button class="maxb" style="margin-top:8px;padding:8px 12px" data-act="copyPreimage">Copy secret</button>` : ''}
+    </div>`;
+  setTimeout(renderBridge, 2500);
+}
+function copyPreimage() { if (LASTLOCK && LASTLOCK.preimage) copyText(LASTLOCK.preimage, 'secret copied — store it safely'); }
+async function doBridgeClaim() {
+  const id = $('brClaimId').value.trim(), pre = $('brPreimage').value.trim();
+  if (!id || !pre) { toast('HTLC id and preimage required', true); return; }
+  toast('claiming…');
+  const r = await api('bridge/claim', { id, preimage: pre, net: NET });
+  if (r.ok) { toast(r.msg); setTimeout(renderBridge, 1500); } else toast(r.error || 'claim failed', true);
+}
+async function doBridgeRefund() {
+  const id = $('brClaimId').value.trim();
+  if (!id) { toast('HTLC id required', true); return; }
+  toast('refunding…');
+  const r = await api('bridge/refund', { id, net: NET });
+  if (r.ok) { toast(r.msg); setTimeout(renderBridge, 1500); } else toast(r.error || 'refund failed', true);
+}
+
+/* ----- cross-chain (BTC/ETH/SOL) HTLC leg ----- */
+let XCHAIN = 'btc';
+function setXchain(c) { XCHAIN = c; hlXchain(); }
+function hlXchain() {
+  document.querySelectorAll('#xchainTabs button').forEach(b => {
+    b.style.background = b.dataset.arg === XCHAIN ? 'rgba(124,92,255,.35)' : '';
+    b.style.borderColor = b.dataset.arg === XCHAIN ? 'rgba(124,92,255,.6)' : '';
+  });
+}
+async function doXchainQuote() {
+  const amt = $('xcAmt').value.trim();
+  if (!amt || num(amt) <= 0) { toast('amount required', true); return; }
+  const q = { chain: XCHAIN, amount: amt, net: NET };
+  const rec = $('xcRecipient').value.trim(); if (rec) q.recipient = rec;
+  toast('building ' + XCHAIN.toUpperCase() + ' HTLC…');
+  const r = await api('bridge/quote', q);
+  if (!r.ok) { toast(r.error || 'quote failed', true); return; }
+  // Share the hashlock with the Latebra leg below, so one secret settles both.
+  if ($('brHashlock')) $('brHashlock').value = r.hashlock;
+  $('xcOut').innerHTML = `
+    <div class="scard" style="margin-top:12px;border-color:rgba(124,92,255,.5)">
+      <div class="lbl"><span>${r.chain} deposit — fund this to open your leg</span></div>
+      <div class="s mono" style="word-break:break-all;font-size:12px;margin-top:4px">${r.deposit}</div>
+      <div class="s" style="margin-top:10px;opacity:.7">shared hashlock (pre-filled into the LAT lock below)</div>
+      <div class="s mono" style="word-break:break-all;font-size:11px">${r.hashlock}</div>
+      ${r.preimage ? `<div class="s" style="margin-top:10px;opacity:.7">your secret — reveal only when claiming</div>
+        <div class="s mono" style="word-break:break-all;font-size:11px">${r.preimage}</div>` : ''}
+      <div class="s" style="margin-top:10px;opacity:.7">redeem script / calldata</div>
+      <div class="s mono" style="word-break:break-all;font-size:10px;max-height:70px;overflow:auto">${r.scriptHex}</div>
+      <p class="subhint" style="margin-top:10px">${r.instructions}</p>
+    </div>`;
+}
+
+/* ================= activity ================= */
+function renderActivity() {
+  $('app').innerHTML = `
+    ${header()}
+    <div class="pad rise r2">
+      <div class="section-t" style="margin-top:6px">Activity</div>
+      <div id="actlist"><div class="empty">Loading…</div></div>
+    </div>
+    ${navBar()}`;
+  loadActivity();
+}
+function actIcon(t) {
+  if (t.dir === 'in') return { ic: I.dnl, cls: 'in' };
+  if (t.label.startsWith('Private')) return { ic: I.eyeoff, cls: 'prv' };
+  if (t.label.includes('Shield') || t.label === 'Shielded') return { ic: I.lock, cls: 'prv' };
+  if (t.label.includes('Unshield')) return { ic: I.unlock, cls: '' };
+  if (t.dir === 'self') return { ic: I.roll, cls: '' };
+  return { ic: I.upr, cls: '' };
+}
+async function loadActivity() {
+  const r = await api('activity', { seed: SEED, net: NET });
+  const el = $('actlist'); if (!el) return;
+  if (!r.ok) { el.innerHTML = `<div class="empty">${r.error || 'failed to load'}</div>`; return; }
+  if (!r.txs.length) { el.innerHTML = '<div class="empty">No activity yet — grab some LAT from the faucet.</div>'; return; }
+  el.innerHTML = `<div class="list">` + r.txs.map((t) => {
+    const { ic, cls } = actIcon(t);
+    const sub = timeAgo(t.ts) + (t.other ? ' · ' + shortAddr(t.other) : ` · block ${t.h}`);
+    let right;
+    if (t.amount === null) right = `<span class="tag priv">HIDDEN</span>`;
+    else {
+      const sign = t.dir === 'in' ? '+' : t.dir === 'out' ? '−' : '';
+      right = `<div class="b mono ${t.dir === 'in' ? 'up' : ''}">${sign}${nf(num(t.amount), 5)}</div><div class="f">${t.token}</div>`;
+    }
+    return `<div class="tok" style="cursor:default">
+      <div class="aic ${cls}">${ic}</div>
+      <div class="meta"><div class="n">${t.label}</div><div class="s">${sub}</div></div>
+      <div class="val">${right}</div>
+    </div>`;
+  }).join('') + `</div>`;
+}
+
+/* ================= discover ================= */
+/* Discover doubles as an in-wallet dapp browser: tapping a card opens the
+   dapp in an embedded frame with a back bar; the list below is the registry
+   third-party dapps join at launch. */
+const DAPPS = [
+  { url: EXPLORER_URL, icon: 'scan', name: 'Latscan Explorer', desc: 'Blocks, transactions and supply — read the chain, never the secrets.' },
+  { url: SITE_URL, icon: 'book', name: 'Latebra', desc: 'The Latebra site — how the dual-mode privacy chain works.' },
+  { url: LAUNCHPAD_URL, icon: 'rocket', name: 'Launchpad', desc: 'Launch and trade tokens on the bonding curve.' },
+  { url: SITE_URL + '/how-it-works', icon: 'net', name: 'How it works', desc: 'The full protocol deep-dive, from ElGamal to finality.' },
+];
+let DAPP = null;
+
+function renderDiscover() {
+  if (DAPP) { renderBrowser(); return; }
+  $('app').innerHTML = `
+    ${header()}
+    <div class="pad rise r2">
+      <div class="section-t" style="margin-top:6px">Discover</div>
+      ${DAPPS.map((d, i) => `
+        <div class="dcard" data-act="openDapp" data-arg="${i}">
+          <div class="dico">${I[d.icon]}</div>
+          <div class="meta"><div class="n">${d.name}</div><div class="s">${d.desc}</div></div>
+          <span class="dext">${I.chevr}</span>
+        </div>`).join('')}
+      <div class="dcard soon">
+        <div class="dico">${I.spark}</div>
+        <div class="meta"><div class="n">More dapps coming</div><div class="s">Building on Latebra? Your dapp gets a spot here at launch.</div></div>
+      </div>
+      <p class="subhint">Dapps open right here in the wallet. Testnet endpoints — these move to latebra.network domains at launch.</p>
+    </div>
+    ${navBar()}`;
+}
+
+function openDapp(i) { DAPP = DAPPS[i]; renderBrowser(); }
+function closeDapp() { DAPP = null; renderDiscover(); }
+
+function renderBrowser() {
+  $('app').innerHTML = `
+    <div class="bbar">
+      <button class="iconbtn" data-act="closeDapp" title="Back to Discover">${I.back}</button>
+      <div class="bt"><div class="t">${DAPP.name}</div><div class="u">${DAPP.url}</div></div>
+      <a class="iconbtn" href="${DAPP.url}" target="_blank" rel="noreferrer" title="Open in new tab">${I.ext}</a>
+    </div>
+    <iframe class="bframe" src="${DAPP.url}"></iframe>
+    ${navBar()}`;
+}
+
+/* ================= settings ================= */
+function renderSettings() {
+  $('app').innerHTML = `
+    ${header()}
+    <div class="pad rise r2">
+      <div class="section-t" style="margin-top:6px">Settings</div>
+      <div class="setcard" style="display:flex;align-items:center;gap:13px;padding:16px">
+        <span class="avatar" style="width:44px;height:44px"></span>
+        <div style="flex:1;min-width:0">
+          <div style="font-weight:700">Account 1</div>
+          <div class="mono" style="font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${ADDR}</div>
+        </div>
+        <button class="iconbtn" data-act="copyAddr" title="Copy address">${I.copy}</button>
+      </div>
+
+      <div class="section-t">Network</div>
+      <div class="setcard">
+        <label style="margin-top:12px">Node RPC endpoint</label>
+        <div class="pillnode"><input id="node" value="${NODE}"><button class="primary" data-act="saveNode">Save</button></div>
+        ${IS_EXT ? `<label>Wallet server (lat-wallet-web)</label>
+        <div class="pillnode" style="margin-bottom:14px"><input id="apiurl" value="${API}"><button class="primary" data-act="saveApi">Save</button></div>` : ''}
+      </div>
+
+      <div class="section-t">Security</div>
+      <div class="setcard">
+        <div class="set-row" data-act="revealSeed">
+          <div class="si">${I.key}</div><div class="st"><div class="t">Reveal secret seed</div><div class="d">Show your recovery phrase</div></div><div class="chev">${I.chevr}</div>
+        </div>
+        <div class="set-row" data-act="logout">
+          <div class="si">${I.out}</div><div class="st"><div class="t" style="color:var(--red)">Log out</div><div class="d">Remove this wallet from the browser</div></div><div class="chev">${I.chevr}</div>
+        </div>
+      </div>
+      <p class="verline mono">LATEBRA VAULT · TESTNET · v0.2</p>
+    </div>
+    ${navBar()}`;
+}
+function saveNode() { NODE = $('node').value.trim(); localStorage.setItem('lat_node', NODE); toast('node saved'); refresh(); }
+function saveApi() { API = $('apiurl').value.trim().replace(/\/+$/, ''); localStorage.setItem('lat_api', API); toast('wallet server saved'); refresh(); }
+
+/* ================= chain actions ================= */
+async function register() { const r = await api('register', { seed: SEED, net: NET }); toast(r.ok ? r.msg : (r.error || 'failed'), !r.ok); }
+async function rollover() {
+  if (num(LAST.pending) <= 0) { toast('nothing pending to roll over'); return; }
+  const r = await api('rollover', { seed: SEED, net: NET }); toast(r.ok ? r.msg : (r.error || 'failed'), !r.ok);
+}
+async function send() {
+  const to = $('to').value.trim(), amt = $('amt').value.trim();
+  if (!to || !amt) { toast('enter recipient and amount', true); return; }
   toast('building transaction…');
-  const r=await api(SENDMODE==='private'?'send':'public-send',{seed:SEED,to:to,amount:amt,net:'testnet'});
-  if(r.ok){toast(r.msg);closeSheet();setTimeout(refresh,1000);}
-  else toast(r.error||'failed',true);
+  const r = await api(SENDMODE === 'private' ? 'send' : 'public-send', { seed: SEED, to: to, amount: amt, net: NET });
+  if (r.ok) { toast(r.msg); closeSheet(); setTimeout(refresh, 1000); }
+  else toast(r.error || 'failed', true);
 }
-async function doMove(){
-  const amt=$('mvamt').value.trim();
-  if(!amt){toast('enter an amount',true);return;}
-  toast(MOVEDIR==='shield'?'shielding…':'building the privacy proof…');
-  const r=await api(MOVEDIR,{seed:SEED,amount:amt,net:'testnet'});
-  if(r.ok){toast(r.msg);closeSheet();setTimeout(refresh,1000);}
-  else toast(r.error||'failed',true);
+async function doMove() {
+  const amt = $('mvamt').value.trim();
+  if (!amt) { toast('enter an amount', true); return; }
+  toast(MOVEDIR === 'shield' ? 'shielding…' : 'building the privacy proof…');
+  const r = await api(MOVEDIR, { seed: SEED, amount: amt, net: NET });
+  if (r.ok) { toast(r.msg); closeSheet(); setTimeout(refresh, 1000); }
+  else toast(r.error || 'failed', true);
 }
-async function faucet(){
-  if(LAST.registered===false){toast('activate your account first',true);return;}
+async function faucet() {
+  if (LAST.registered === false) { toast('activate your account first', true); return; }
   toast('requesting from the faucet…');
-  const r=await api('faucet',{to:ADDR,net:'testnet'});
-  toast(r.ok?r.msg:(r.error||'failed'),!r.ok);
-  if(r.ok)setTimeout(refresh,4000);
+  const r = await api('faucet', { to: ADDR, net: NET });
+  toast(r.ok ? r.msg : (r.error || 'failed'), !r.ok);
+  if (r.ok) setTimeout(refresh, 4000);
 }
 
 /* ================= sheets ================= */
-function openSheet(html){$('sheet').innerHTML='<div class="grip"></div>'+html;$('sheet').classList.add('show');$('backdrop').classList.add('show');}
-function closeSheet(){$('sheet').classList.remove('show');$('backdrop').classList.remove('show');}
+function openSheet(html) { $('sheet').innerHTML = '<div class="grip"></div>' + html; $('sheet').classList.add('show'); $('backdrop').classList.add('show'); }
+function closeSheet() { $('sheet').classList.remove('show'); $('backdrop').classList.remove('show'); }
 
-function openReceive(){
+function openReceive() {
   openSheet(`
-    <h3>Receive LAT</h3>
-    <p class="sub">Share your address to receive funds. Incoming funds arrive as pending.</p>
+    <h3>Receive</h3>
+    <p class="sub">Share your address to receive LAT or USDC. Private funds arrive as pending.</p>
     <div class="qr">${qrSvg(ADDR)}</div>
     <div class="addrbox">${ADDR}</div>
     <div class="row">
-      <button class="ghost" onclick="closeSheet()">Close</button>
-      <button class="primary" onclick="copyText(ADDR,'address copied')">Copy address</button>
+      <button class="ghost" data-act="closeSheet">Close</button>
+      <button class="primary" data-act="copyAddr">Copy address</button>
     </div>`);
 }
-let SENDMODE='private';
-function openSend(mode){
+let SENDMODE = 'private';
+function openSend(mode) {
   openSheet(`
     <h3>Send LAT</h3>
     <p class="sub">Choose which balance to pay from · a small network fee applies.</p>
     <div class="seg">
-      <button id="segP" onclick="setSendMode('private')">🔒 Private</button>
-      <button id="segU" onclick="setSendMode('public')">👁 Public</button>
+      <button id="segP" data-act="setSendMode" data-arg="private">🔒 Private</button>
+      <button id="segU" data-act="setSendMode" data-arg="public">👁 Public</button>
     </div>
     <div class="hint" id="sendhint"></div>
     <label>Recipient address</label>
@@ -490,85 +1087,122 @@ function openSend(mode){
     <label>Amount (LAT)</label>
     <input id="amt" placeholder="0.0" inputmode="decimal">
     <div class="row">
-      <button class="ghost" onclick="closeSheet()">Cancel</button>
-      <button class="primary" onclick="send()">Send</button>
+      <button class="ghost" data-act="closeSheet">Cancel</button>
+      <button class="primary" data-act="send">Send</button>
     </div>`);
-  setSendMode(mode||'private');
+  setSendMode(mode || 'private');
 }
-function setSendMode(m){
-  SENDMODE=m;
-  $('segP').className=m==='private'?'on':'';
-  $('segU').className=m==='public'?'on':'';
-  $('sendhint').innerHTML= m==='private'
-    ? `Pays from your <b>private balance (${LAST.spendable||'0.00000'} LAT)</b>. On the explorer this shows only "proof verified" — <b>no sender, receiver or amount</b>. The recipient rolls it over to spend.`
-    : `Pays from your <b>public balance (${LAST.public||'0.00000'} LAT)</b>. Sender, receiver and amount are <b>fully visible</b> on the explorer — like Ethereum.`;
+function setSendMode(m) {
+  SENDMODE = m;
+  $('segP').className = m === 'private' ? 'on' : '';
+  $('segU').className = m === 'public' ? 'on' : '';
+  $('sendhint').innerHTML = m === 'private'
+    ? `Pays from your <b>private balance (${LAST.spendable || '0.00000'} LAT)</b>. On the explorer this shows only "proof verified" — <b>no sender, receiver or amount</b>. The recipient rolls it over to spend.`
+    : `Pays from your <b>public balance (${LAST.public || '0.00000'} LAT)</b>. Sender, receiver and amount are <b>fully visible</b> on the explorer — like Ethereum.`;
 }
 
-let MOVEDIR='shield';
-function openMove(dir){
+let MOVEDIR = 'shield';
+function openMove(dir) {
   openSheet(`
     <h3>Shield / Unshield</h3>
     <p class="sub">Move LAT between your own public and private balances.</p>
     <div class="seg">
-      <button id="segS" onclick="setMoveDir('shield')">Public → Private</button>
-      <button id="segX" onclick="setMoveDir('unshield')">Private → Public</button>
+      <button id="segS" data-act="setMoveDir" data-arg="shield">Public → Private</button>
+      <button id="segX" data-act="setMoveDir" data-arg="unshield">Private → Public</button>
     </div>
     <div class="hint" id="movehint"></div>
     <label>Amount (LAT)</label>
     <input id="mvamt" placeholder="0.0" inputmode="decimal">
     <div class="row">
-      <button class="ghost" onclick="closeSheet()">Cancel</button>
-      <button class="primary" id="mvbtn" onclick="doMove()">Shield</button>
+      <button class="ghost" data-act="closeSheet">Cancel</button>
+      <button class="primary" id="mvbtn" data-act="doMove">Shield</button>
     </div>`);
-  setMoveDir(dir||'shield');
+  setMoveDir(dir || 'shield');
 }
-function setMoveDir(d){
-  MOVEDIR=d;
-  $('segS').className=d==='shield'?'on':'';
-  $('segX').className=d==='unshield'?'on':'';
-  $('mvbtn').textContent=d==='shield'?'Shield':'Unshield';
-  $('movehint').innerHTML= d==='shield'
-    ? `Makes coins <b>private</b>. Public balance: <b>${LAST.public||'0.00000'} LAT</b>. The amount crossing the boundary is visible once; after that, private transfers hide everything. Shielded funds arrive as <b>pending</b> — roll over to spend them.`
-    : `Makes coins <b>public</b> again. Private balance: <b>${LAST.spendable||'0.00000'} LAT</b>. A zero-knowledge proof spends them; the amount appears in your public balance.`;
+function setMoveDir(d) {
+  MOVEDIR = d;
+  $('segS').className = d === 'shield' ? 'on' : '';
+  $('segX').className = d === 'unshield' ? 'on' : '';
+  $('mvbtn').textContent = d === 'shield' ? 'Shield' : 'Unshield';
+  $('movehint').innerHTML = d === 'shield'
+    ? `Makes coins <b>private</b>. Public balance: <b>${LAST.public || '0.00000'} LAT</b>. The amount crossing the boundary is visible once; after that, private transfers hide everything. Shielded funds arrive as <b>pending</b> — roll over to spend them.`
+    : `Makes coins <b>public</b> again. Private balance: <b>${LAST.spendable || '0.00000'} LAT</b>. A zero-knowledge proof spends them; the amount appears in your public balance.`;
 }
-function openSettings(){
+
+/* confirm()/alert() are unreliable in extension popups — use sheets instead. */
+function revealSeed() {
   openSheet(`
-    <h3>Settings</h3>
-    <p class="sub">${shortAddr(ADDR)} · Testnet</p>
-    <label>Node RPC endpoint</label>
-    <div class="pillnode"><input id="node" value="${NODE}"><button class="primary" onclick="saveNode()">Save</button></div>
-    <div class="set-row" onclick="copyText(ADDR,'address copied')">
-      <div class="si">${I.copy}</div><div class="st"><div class="t">Copy address</div><div class="d">${shortAddr(ADDR)}</div></div><div class="chev">${I.chevr}</div>
-    </div>
-    <div class="set-row" onclick="revealSeed()">
-      <div class="si">${I.key}</div><div class="st"><div class="t">Reveal secret seed</div><div class="d">Show your recovery phrase</div></div><div class="chev">${I.chevr}</div>
-    </div>
-    <div class="set-row" onclick="logout()">
-      <div class="si">${I.out}</div><div class="st"><div class="t" style="color:var(--red)">Log out</div><div class="d">Remove this wallet from the browser</div></div><div class="chev">${I.chevr}</div>
+    <h3>Your secret seed</h3>
+    <p class="sub">Keep it secret. Anyone with it controls this wallet.</p>
+    <div class="warn">${I.warn}<div>Never share this seed or type it into a website.</div></div>
+    <div class="seedbox" style="margin-bottom:14px">${SEED}</div>
+    <div class="row">
+      <button class="ghost" data-act="closeSheet">Close</button>
+      <button class="primary" data-act="copySeed">Copy seed</button>
     </div>`);
 }
-function saveNode(){NODE=$('node').value.trim();localStorage.setItem('lat_node',NODE);toast('node saved');refresh();}
-function revealSeed(){if(confirm('Show your secret seed on screen?'))alert('Your seed:\n\n'+SEED+'\n\nKeep it secret. Anyone with it controls this wallet.');}
-function logout(){if(confirm('Log out? Make sure your seed is saved — it will be removed from this browser.')){localStorage.removeItem('lat_seed');localStorage.removeItem('lat_addr');SEED='';ADDR='';closeSheet();showWelcome();}}
+function logout() {
+  openSheet(`
+    <h3>Log out?</h3>
+    <p class="sub">Make sure your seed is saved — it will be removed from this browser.</p>
+    <div class="warn">${I.warn}<div>Without your seed you cannot recover this wallet.</div></div>
+    <div class="row">
+      <button class="ghost" data-act="closeSheet">Cancel</button>
+      <button class="danger" data-act="doLogout">Log out</button>
+    </div>`);
+}
+function doLogout() {
+  localStorage.removeItem('lat_seed'); localStorage.removeItem('lat_addr');
+  SEED = ''; ADDR = ''; closeSheet(); showWelcome();
+}
 
 /* A lightweight deterministic address glyph (NOT a scannable QR — a visual
    fingerprint so a receive address is recognizable at a glance). */
-function qrSvg(addr){
-  let h=2166136261;for(let i=0;i<(addr||'').length;i++){h^=addr.charCodeAt(i);h=Math.imul(h,16777619);}
-  const n=9,cell=15,pad=6;let rects='';
-  for(let y=0;y<n;y++)for(let x=0;x<Math.ceil(n/2);x++){
-    h^=h<<13;h^=h>>>17;h^=h<<5;
-    if((h&7)>3){const rx=pad+x*cell,ry=pad+y*cell;
-      rects+=`<rect x="${rx}" y="${ry}" width="${cell}" height="${cell}" rx="3"/>`;
-      if(x<Math.floor(n/2))rects+=`<rect x="${pad+(n-1-x)*cell}" y="${ry}" width="${cell}" height="${cell}" rx="3"/>`;}
+function qrSvg(addr) {
+  let h = 2166136261; for (let i = 0; i < (addr || '').length; i++) { h ^= addr.charCodeAt(i); h = Math.imul(h, 16777619); }
+  const n = 9, cell = 15, pad = 6; let rects = '';
+  for (let y = 0; y < n; y++) for (let x = 0; x < Math.ceil(n / 2); x++) {
+    h ^= h << 13; h ^= h >>> 17; h ^= h << 5;
+    if ((h & 7) > 3) {
+      const rx = pad + x * cell, ry = pad + y * cell;
+      rects += `<rect x="${rx}" y="${ry}" width="${cell}" height="${cell}" rx="3"/>`;
+      if (x < Math.floor(n / 2)) rects += `<rect x="${pad + (n - 1 - x) * cell}" y="${ry}" width="${cell}" height="${cell}" rx="3"/>`;
+    }
   }
-  return `<svg viewBox="0 0 ${n*cell+pad*2} ${n*cell+pad*2}" width="146" height="146" fill="#0f0f12">${rects}</svg>`;
+  return `<svg viewBox="0 0 ${n * cell + pad * 2} ${n * cell + pad * 2}" width="146" height="146" fill="#141c31">${rects}</svg>`;
 }
 
-if(SEED)showWallet();else showWelcome();
+/* ================= delegated events (MV3: no inline handlers) ================= */
+const ACTIONS = {
+  showWelcome, showImport, doImport, createWallet,
+  goHome: () => showView('home'),
+  showView: (arg) => showView(arg),
+  openReceive, openSend, openMove: (arg) => openMove(arg),
+  setSendMode: (arg) => setSendMode(arg), setMoveDir: (arg) => setMoveDir(arg),
+  send, doMove, faucet, register, rollover, closeSheet,
+  swapFlip, swapMax, doSwap,
+  setSwapMode: (arg) => setSwapMode(arg),
+  poolFlip, doPoolSwap, doPoolAdd, doPoolRemove,
+  doBridgeLock, doBridgeClaim, doBridgeRefund, copyPreimage,
+  setXchain: (arg) => setXchain(arg), doXchainQuote,
+  fillClaim: (arg) => fillClaim(arg),
+  openDapp: (arg) => openDapp(+arg), closeDapp,
+  saveNode, saveApi, revealSeed, logout, doLogout,
+  copyAddr: () => copyText(ADDR, 'address copied'),
+  copySeed: () => copyText(SEED, 'seed copied'),
+};
+document.addEventListener('click', (e) => {
+  const el = e.target.closest('[data-act]');
+  if (!el) return;
+  const fn = ACTIONS[el.dataset.act];
+  if (fn) fn(el.dataset.arg);
+});
+$('backdrop').addEventListener('click', closeSheet);
+
+if (SEED) showView('home'); else showWelcome();
 
 /* Play the splash, then fade it out to reveal the wallet / welcome screen. */
-setTimeout(()=>{const s=$('splash');if(!s)return;s.classList.add('hide');setTimeout(()=>s.remove(),600);},1900);
+setTimeout(() => { const s = $('splash'); if (!s) return; s.classList.add('hide'); setTimeout(() => s.remove(), 600); }, 1900);
 </script>
 </body>
 </html>

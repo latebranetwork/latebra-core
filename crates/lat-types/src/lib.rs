@@ -265,6 +265,129 @@ pub enum Transaction {
         block_b: [u8; 32],
         sig_b: [u8; 64],
     },
+    /// **Add liquidity** (native DEX): deposit public LAT + public `token` into
+    /// the constant-product pool for `token`, minting LP shares to `provider`.
+    /// The first add creates the pool; later adds must respect the pool ratio
+    /// (`tok_amount` is the upper bound the provider will pay — the ledger
+    /// debits exactly the ratio-matched amount). Transparent auth like
+    /// `PublicTransfer`: Schnorr-signed by `provider`, nonce-bound.
+    AddLiquidity {
+        token: u32,
+        provider: [u8; 32],
+        /// LAT deposited (exact).
+        lat_amount: u64,
+        /// Token deposit ceiling (exact on pool creation; a slippage bound on
+        /// later adds — the ratio-matched amount is what's actually debited).
+        tok_amount: u64,
+        /// Public fee paid to the block's miner, in LAT.
+        fee: u64,
+        nonce: u64,
+        sig: [u8; 64],
+    },
+    /// **Remove liquidity**: burn `lp_amount` of `provider`'s LP shares in the
+    /// pool for `token`, paying out the proportional LAT + token reserves to
+    /// the provider's public balances. Same transparent auth.
+    RemoveLiquidity {
+        token: u32,
+        provider: [u8; 32],
+        lp_amount: u64,
+        fee: u64,
+        nonce: u64,
+        sig: [u8; 64],
+    },
+    /// **Swap** against the pool for `token` (x·y = k, 0.3% pool fee kept by
+    /// the reserves — i.e. by the LPs). `lat_in` chooses the direction:
+    /// LAT → token or token → LAT. `min_out` is the trader's slippage bound;
+    /// consensus rejects the swap if the computed output falls below it.
+    Swap {
+        token: u32,
+        trader: [u8; 32],
+        /// `true`: pay `amount_in` LAT, receive token. `false`: the reverse.
+        lat_in: bool,
+        amount_in: u64,
+        min_out: u64,
+        fee: u64,
+        nonce: u64,
+        sig: [u8; 64],
+    },
+    /// **Bonding-curve trade** — atomic buy/sell against a token's native
+    /// constant-product curve (the launchpad primitive). Unlike the VM-contract
+    /// curve it replaces, this moves *real* value: a buy debits `amount` LAT and
+    /// mints tokens to the trader; a sell burns tokens and pays out LAT — in one
+    /// consensus step, so settlement can never be half-done. `min_out` is the
+    /// slippage bound. Both the 1% curve fee (to the token creator) and the miner
+    /// fee are consensus-enforced. Transparent auth by `trader`.
+    CurveTrade {
+        token: u32,
+        trader: [u8; 32],
+        /// `true`: pay `amount` LAT, receive tokens. `false`: sell `amount`
+        /// tokens for LAT.
+        is_buy: bool,
+        amount: u64,
+        min_out: u64,
+        fee: u64,
+        nonce: u64,
+        sig: [u8; 64],
+    },
+    /// **HTLC lock** (cross-chain bridge primitive): escrow `amount` of `token`
+    /// from `from`'s public balance under a SHA-256 `hashlock`. `to` may claim
+    /// it by revealing the preimage before block `expiry`; after `expiry`,
+    /// anyone may refund it to `from`. SHA-256 (not BLAKE3) so the same secret
+    /// unlocks a matching contract on Bitcoin/EVM chains — this is the
+    /// trustless atomic-swap building block. Transparent auth by `from`.
+    HtlcLock {
+        token: u32,
+        from: [u8; 32],
+        to: [u8; 32],
+        amount: u64,
+        /// SHA-256 hash of the claimant's secret preimage.
+        hashlock: [u8; 32],
+        /// Absolute block height at which the lock becomes refundable.
+        expiry: u64,
+        fee: u64,
+        nonce: u64,
+        sig: [u8; 64],
+    },
+    /// **HTLC claim**: reveal the 32-byte preimage of an open lock's hashlock,
+    /// crediting the escrowed funds to the lock's `to`. Self-authenticating
+    /// (the preimage IS the authority; funds can only go to the recorded
+    /// recipient), so — like `SlashEvidence` — it carries no signature or
+    /// nonce; replay finds the lock already gone.
+    HtlcClaim {
+        /// The lock's id (see `htlc_id`).
+        id: [u8; 32],
+        preimage: [u8; 32],
+    },
+    /// **HTLC refund**: after an open lock's `expiry` height, return the
+    /// escrowed funds to the lock's `from`. Self-authenticating the same way —
+    /// funds can only go back to the recorded sender.
+    HtlcRefund {
+        id: [u8; 32],
+    },
+}
+
+/// The deterministic id of the HTLC a [`Transaction::HtlcLock`] creates:
+/// BLAKE3 over a domain tag and the lock's identifying fields. The `nonce`
+/// makes the id unique even for two otherwise-identical locks by one sender.
+pub fn htlc_id(
+    token: u32,
+    from: &[u8; 32],
+    to: &[u8; 32],
+    amount: u64,
+    hashlock: &[u8; 32],
+    expiry: u64,
+    nonce: u64,
+) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"LAT-htlc-v1");
+    h.update(&token.to_le_bytes());
+    h.update(from);
+    h.update(to);
+    h.update(&amount.to_le_bytes());
+    h.update(hashlock);
+    h.update(&expiry.to_le_bytes());
+    h.update(&nonce.to_le_bytes());
+    *h.finalize().as_bytes()
 }
 
 impl Transaction {
@@ -417,6 +540,82 @@ impl Transaction {
                 v.extend_from_slice(sig_b);
                 v
             }
+            Transaction::AddLiquidity { token, provider, lat_amount, tok_amount, fee, nonce, sig } => {
+                let mut v = Vec::with_capacity(1 + 4 + 32 + 8 + 8 + 8 + 8 + 64);
+                v.push(0x0F);
+                v.extend_from_slice(&token.to_le_bytes());
+                v.extend_from_slice(provider);
+                v.extend_from_slice(&lat_amount.to_le_bytes());
+                v.extend_from_slice(&tok_amount.to_le_bytes());
+                v.extend_from_slice(&fee.to_le_bytes());
+                v.extend_from_slice(&nonce.to_le_bytes());
+                v.extend_from_slice(sig);
+                v
+            }
+            Transaction::RemoveLiquidity { token, provider, lp_amount, fee, nonce, sig } => {
+                let mut v = Vec::with_capacity(1 + 4 + 32 + 8 + 8 + 8 + 64);
+                v.push(0x10);
+                v.extend_from_slice(&token.to_le_bytes());
+                v.extend_from_slice(provider);
+                v.extend_from_slice(&lp_amount.to_le_bytes());
+                v.extend_from_slice(&fee.to_le_bytes());
+                v.extend_from_slice(&nonce.to_le_bytes());
+                v.extend_from_slice(sig);
+                v
+            }
+            Transaction::Swap { token, trader, lat_in, amount_in, min_out, fee, nonce, sig } => {
+                let mut v = Vec::with_capacity(1 + 4 + 32 + 1 + 8 + 8 + 8 + 8 + 64);
+                v.push(0x11);
+                v.extend_from_slice(&token.to_le_bytes());
+                v.extend_from_slice(trader);
+                v.push(*lat_in as u8);
+                v.extend_from_slice(&amount_in.to_le_bytes());
+                v.extend_from_slice(&min_out.to_le_bytes());
+                v.extend_from_slice(&fee.to_le_bytes());
+                v.extend_from_slice(&nonce.to_le_bytes());
+                v.extend_from_slice(sig);
+                v
+            }
+            Transaction::CurveTrade { token, trader, is_buy, amount, min_out, fee, nonce, sig } => {
+                let mut v = Vec::with_capacity(1 + 4 + 32 + 1 + 8 + 8 + 8 + 8 + 64);
+                v.push(0x15);
+                v.extend_from_slice(&token.to_le_bytes());
+                v.extend_from_slice(trader);
+                v.push(*is_buy as u8);
+                v.extend_from_slice(&amount.to_le_bytes());
+                v.extend_from_slice(&min_out.to_le_bytes());
+                v.extend_from_slice(&fee.to_le_bytes());
+                v.extend_from_slice(&nonce.to_le_bytes());
+                v.extend_from_slice(sig);
+                v
+            }
+            Transaction::HtlcLock { token, from, to, amount, hashlock, expiry, fee, nonce, sig } => {
+                let mut v = Vec::with_capacity(1 + 4 + 32 + 32 + 8 + 32 + 8 + 8 + 8 + 64);
+                v.push(0x12);
+                v.extend_from_slice(&token.to_le_bytes());
+                v.extend_from_slice(from);
+                v.extend_from_slice(to);
+                v.extend_from_slice(&amount.to_le_bytes());
+                v.extend_from_slice(hashlock);
+                v.extend_from_slice(&expiry.to_le_bytes());
+                v.extend_from_slice(&fee.to_le_bytes());
+                v.extend_from_slice(&nonce.to_le_bytes());
+                v.extend_from_slice(sig);
+                v
+            }
+            Transaction::HtlcClaim { id, preimage } => {
+                let mut v = Vec::with_capacity(1 + 32 + 32);
+                v.push(0x13);
+                v.extend_from_slice(id);
+                v.extend_from_slice(preimage);
+                v
+            }
+            Transaction::HtlcRefund { id } => {
+                let mut v = Vec::with_capacity(1 + 32);
+                v.push(0x14);
+                v.extend_from_slice(id);
+                v
+            }
         }
     }
 
@@ -437,6 +636,11 @@ impl Transaction {
                 | Transaction::ShieldStealth { .. }
                 | Transaction::Stake { .. }
                 | Transaction::Unstake { .. }
+                | Transaction::AddLiquidity { .. }
+                | Transaction::RemoveLiquidity { .. }
+                | Transaction::Swap { .. }
+                | Transaction::CurveTrade { .. }
+                | Transaction::HtlcLock { .. }
         ) {
             v.truncate(v.len() - 64);
         }
@@ -592,6 +796,106 @@ impl Transaction {
                     sig_a: rest.get(104..168)?.try_into().ok()?,
                     block_b: rest.get(168..200)?.try_into().ok()?,
                     sig_b: rest.get(200..264)?.try_into().ok()?,
+                })
+            }
+            0x0F => {
+                if rest.len() != 4 + 32 + 8 + 8 + 8 + 8 + 64 {
+                    return None;
+                }
+                Some(Transaction::AddLiquidity {
+                    token: u32::from_le_bytes(rest.get(0..4)?.try_into().ok()?),
+                    provider: rest.get(4..36)?.try_into().ok()?,
+                    lat_amount: u64::from_le_bytes(rest.get(36..44)?.try_into().ok()?),
+                    tok_amount: u64::from_le_bytes(rest.get(44..52)?.try_into().ok()?),
+                    fee: u64::from_le_bytes(rest.get(52..60)?.try_into().ok()?),
+                    nonce: u64::from_le_bytes(rest.get(60..68)?.try_into().ok()?),
+                    sig: rest.get(68..132)?.try_into().ok()?,
+                })
+            }
+            0x10 => {
+                if rest.len() != 4 + 32 + 8 + 8 + 8 + 64 {
+                    return None;
+                }
+                Some(Transaction::RemoveLiquidity {
+                    token: u32::from_le_bytes(rest.get(0..4)?.try_into().ok()?),
+                    provider: rest.get(4..36)?.try_into().ok()?,
+                    lp_amount: u64::from_le_bytes(rest.get(36..44)?.try_into().ok()?),
+                    fee: u64::from_le_bytes(rest.get(44..52)?.try_into().ok()?),
+                    nonce: u64::from_le_bytes(rest.get(52..60)?.try_into().ok()?),
+                    sig: rest.get(60..124)?.try_into().ok()?,
+                })
+            }
+            0x11 => {
+                if rest.len() != 4 + 32 + 1 + 8 + 8 + 8 + 8 + 64 {
+                    return None;
+                }
+                // The direction byte is strictly 0/1 — any other value would be
+                // a second encoding of the same transaction (malleability).
+                let lat_in = match rest[36] {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                };
+                Some(Transaction::Swap {
+                    token: u32::from_le_bytes(rest.get(0..4)?.try_into().ok()?),
+                    trader: rest.get(4..36)?.try_into().ok()?,
+                    lat_in,
+                    amount_in: u64::from_le_bytes(rest.get(37..45)?.try_into().ok()?),
+                    min_out: u64::from_le_bytes(rest.get(45..53)?.try_into().ok()?),
+                    fee: u64::from_le_bytes(rest.get(53..61)?.try_into().ok()?),
+                    nonce: u64::from_le_bytes(rest.get(61..69)?.try_into().ok()?),
+                    sig: rest.get(69..133)?.try_into().ok()?,
+                })
+            }
+            0x12 => {
+                if rest.len() != 4 + 32 + 32 + 8 + 32 + 8 + 8 + 8 + 64 {
+                    return None;
+                }
+                Some(Transaction::HtlcLock {
+                    token: u32::from_le_bytes(rest.get(0..4)?.try_into().ok()?),
+                    from: rest.get(4..36)?.try_into().ok()?,
+                    to: rest.get(36..68)?.try_into().ok()?,
+                    amount: u64::from_le_bytes(rest.get(68..76)?.try_into().ok()?),
+                    hashlock: rest.get(76..108)?.try_into().ok()?,
+                    expiry: u64::from_le_bytes(rest.get(108..116)?.try_into().ok()?),
+                    fee: u64::from_le_bytes(rest.get(116..124)?.try_into().ok()?),
+                    nonce: u64::from_le_bytes(rest.get(124..132)?.try_into().ok()?),
+                    sig: rest.get(132..196)?.try_into().ok()?,
+                })
+            }
+            0x13 => {
+                if rest.len() != 64 {
+                    return None;
+                }
+                Some(Transaction::HtlcClaim {
+                    id: rest.get(0..32)?.try_into().ok()?,
+                    preimage: rest.get(32..64)?.try_into().ok()?,
+                })
+            }
+            0x14 => {
+                if rest.len() != 32 {
+                    return None;
+                }
+                Some(Transaction::HtlcRefund { id: rest.get(0..32)?.try_into().ok()? })
+            }
+            0x15 => {
+                if rest.len() != 4 + 32 + 1 + 8 + 8 + 8 + 8 + 64 {
+                    return None;
+                }
+                let is_buy = match rest[36] {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                };
+                Some(Transaction::CurveTrade {
+                    token: u32::from_le_bytes(rest.get(0..4)?.try_into().ok()?),
+                    trader: rest.get(4..36)?.try_into().ok()?,
+                    is_buy,
+                    amount: u64::from_le_bytes(rest.get(37..45)?.try_into().ok()?),
+                    min_out: u64::from_le_bytes(rest.get(45..53)?.try_into().ok()?),
+                    fee: u64::from_le_bytes(rest.get(53..61)?.try_into().ok()?),
+                    nonce: u64::from_le_bytes(rest.get(61..69)?.try_into().ok()?),
+                    sig: rest.get(69..133)?.try_into().ok()?,
                 })
             }
             _ => None,
@@ -762,6 +1066,44 @@ mod tests {
         extra.push(0);
         assert!(Transaction::decode(&extra).is_none(), "trailing garbage rejected");
         assert!(Transaction::decode(&bytes[..bytes.len() - 1]).is_none(), "truncation rejected");
+    }
+
+    #[test]
+    fn dex_and_htlc_encoding_roundtrip() {
+        let signed: Vec<(u8, Transaction)> = vec![
+            (0x0F, Transaction::AddLiquidity { token: 2, provider: [1u8; 32], lat_amount: 5_000, tok_amount: 7_000, fee: 1_000, nonce: 3, sig: [8u8; 64] }),
+            (0x10, Transaction::RemoveLiquidity { token: 2, provider: [1u8; 32], lp_amount: 4_242, fee: 1_000, nonce: 4, sig: [8u8; 64] }),
+            (0x11, Transaction::Swap { token: 2, trader: [1u8; 32], lat_in: true, amount_in: 9_999, min_out: 1, fee: 1_000, nonce: 5, sig: [8u8; 64] }),
+            (0x12, Transaction::HtlcLock { token: 0, from: [1u8; 32], to: [2u8; 32], amount: 777, hashlock: [3u8; 32], expiry: 1_000, fee: 1_000, nonce: 6, sig: [8u8; 64] }),
+            (0x15, Transaction::CurveTrade { token: 2, trader: [1u8; 32], is_buy: true, amount: 9_999, min_out: 1, fee: 1_000, nonce: 7, sig: [8u8; 64] }),
+        ];
+        for (tag, tx) in &signed {
+            let b = tx.encode();
+            assert_eq!(b[0], *tag, "tag byte");
+            assert_eq!(Transaction::decode(&b).expect("decodes").encode(), b, "roundtrip");
+            assert_eq!(tx.signing_bytes(), b[..b.len() - 64].to_vec(), "sig covers all but sig");
+            let mut extra = b.clone();
+            extra.push(0);
+            assert!(Transaction::decode(&extra).is_none(), "trailing garbage rejected");
+            assert!(Transaction::decode(&b[..b.len() - 1]).is_none(), "truncation rejected");
+        }
+        // Claim/refund are self-authenticating: no signature, full encoding signed.
+        for (tag, tx) in [
+            (0x13u8, Transaction::HtlcClaim { id: [7u8; 32], preimage: [9u8; 32] }),
+            (0x14, Transaction::HtlcRefund { id: [7u8; 32] }),
+        ] {
+            let b = tx.encode();
+            assert_eq!(b[0], tag);
+            assert_eq!(Transaction::decode(&b).expect("decodes").encode(), b);
+            assert_eq!(tx.signing_bytes(), b);
+            let mut extra = b.clone();
+            extra.push(0);
+            assert!(Transaction::decode(&extra).is_none());
+        }
+        // A Swap direction byte other than 0/1 is a malleable second encoding.
+        let mut b = signed[2].1.encode();
+        b[1 + 36] = 2;
+        assert!(Transaction::decode(&b).is_none(), "non-canonical bool rejected");
     }
 
     #[test]
