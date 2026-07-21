@@ -11,6 +11,17 @@ after one means starting from a new genesis.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Finality latency was bounded by a 15-second heartbeat, not by the block
+  time.** Adopting a block received over gossip cast no finality vote, so a
+  non-mining validator — which is how every validator except the block's
+  producer learns of a block — did not vote until `latebrad`'s periodic re-vote
+  tick. Quorum therefore took up to ~15s on a 3s chain. Validators now vote the
+  moment they adopt a gossiped tip, and flood the vote (and any certificate it
+  completes) alongside the block, so a quorum converges within the block that
+  produced it. Covered by a regression test that fails without the fix.
+
 ## [0.1.0] — 2026-07-21
 
 First tagged release, and the first with **prebuilt binaries** — running a node

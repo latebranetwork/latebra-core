@@ -1108,14 +1108,34 @@ fn handle_conn(mut stream: TcpStream, node: SharedNode) -> io::Result<()> {
                     .unwrap_or(false);
                 let ok = lock_node(&node).accept_block_bytes(&bytes);
                 if ok && !already_known {
+                    // Vote for the newly adopted tip HERE, not on the node's
+                    // heartbeat. Gossip is how a non-mining validator learns of
+                    // a block, and adopting one used to cast no vote at all —
+                    // so its vote waited for latebrad's 15s re-vote tick, which
+                    // bounded finality at ~15s no matter how fast blocks came.
+                    // The miner already votes on its own block, and the vote
+                    // pool dedups, so this only adds the votes that were late.
+                    let vote = lock_node(&node).cast_vote();
                     let peers = lock_node(&node).peers();
                     let fwd = bytes.clone();
                     thread::spawn(move || {
                         // T17: forward compactly — peers that already hold the
                         // block cost one 40-byte announce, not a whole block.
                         let (id, height) = header.expect("accepted block decodes");
-                        for p in peers {
+                        for p in &peers {
                             let _ = announce_block_compact(p.as_str(), &id, height, &fwd);
+                        }
+                        // Flood the vote (and any certificate it just completed)
+                        // the same way, so the quorum converges within the block.
+                        if let Some((vote_bytes, cert)) = vote {
+                            for p in &peers {
+                                let _ = announce_vote(p.as_str(), &vote_bytes);
+                            }
+                            if let Some(cert) = cert {
+                                for p in &peers {
+                                    let _ = announce_cert(p.as_str(), &cert);
+                                }
+                            }
                         }
                     });
                 }
@@ -1939,6 +1959,75 @@ mod tests {
         assert_eq!(get_finalized(addr).unwrap(), Some((1, tip)), "certified over the wire");
         // The same vote again is not new (gossip dies out).
         assert!(!announce_vote(addr, &vote.encode()).unwrap());
+    }
+
+    #[test]
+    fn adopting_a_gossiped_block_casts_a_vote_immediately() {
+        use lat_chain::MIN_VALIDATOR_STAKE;
+        use lat_crypto::SecretKey;
+
+        // Finality latency regression. A non-mining validator learns of a block
+        // through gossip; if adopting it casts no vote, its vote waits for
+        // latebrad's 15s re-vote heartbeat and finality is bounded at ~15s
+        // regardless of a 3s block time. Here the server is the only validator
+        // (100% of stake), so its own vote alone completes the quorum: if the
+        // block is finalized straight after the announce, the vote was cast on
+        // adoption and not on a timer. Nobody pushes a vote over the wire.
+        let sk = SecretKey::random(&mut OsRng);
+        let id = sk.public_key().to_bytes();
+        // Blockchain is not Clone, so build two from the same genesis and give
+        // both the identical block 1 — the producer then extends the very chain
+        // the server is on.
+        let build = || {
+            Blockchain::genesis_with_public(
+                &[],
+                &[(id, 10 * MIN_VALIDATOR_STAKE)],
+                DEFAULT_DIFFICULTY,
+            )
+        };
+        let mut chain = build();
+        let mut producer = build();
+        let mut tx = Transaction::Stake {
+            validator: id,
+            amount: MIN_VALIDATOR_STAKE,
+            nonce: 0,
+            sig: [0u8; 64],
+        };
+        let sig = sk.sign(&tx.signing_bytes()).to_bytes();
+        if let Transaction::Stake { sig: s, .. } = &mut tx {
+            *s = sig;
+        }
+        let b1 = chain.mine(vec![tx]);
+        chain.apply_block(&b1).unwrap();
+        producer.apply_block(&b1).unwrap();
+
+        // Block 2 is produced elsewhere and only ever reaches the server as gossip.
+        let b2 = producer.mine(vec![]);
+        let b2_id = b2.header.id();
+
+        let server = shared(chain);
+        lock_node(&server).set_validator_key(sk.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        serve(listener, Arc::clone(&server));
+
+        assert_eq!(get_finalized(addr).unwrap(), None, "nothing certified yet");
+        assert!(announce_block(addr, &b2.encode()).unwrap(), "block accepted");
+
+        // The vote is flooded from a spawned thread, so allow it to land.
+        let mut finalized = None;
+        for _ in 0..50 {
+            finalized = get_finalized(addr).unwrap();
+            if finalized.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            finalized,
+            Some((2, b2_id)),
+            "adopting a gossiped block must vote at once, not on the heartbeat",
+        );
     }
 
     fn fresh_chain() -> Blockchain {
