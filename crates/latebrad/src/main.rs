@@ -1078,15 +1078,30 @@ fn mine_one(node: &SharedNode) {
         };
         let reward = emission(height);
         println!("[mine] new block -> height {height}  reward {}.{:05} LAT", reward / 100_000, reward % 100_000);
+        // Sign our own vote for the block BEFORE the forwarding loop, then send
+        // it to each peer right after that peer's block. A vote is dropped by a
+        // receiver that does not yet hold the block (they are not queued), so it
+        // has to trail its own block to the same peer — but announcing to every
+        // peer first and only then voting would put the whole loop, plus each
+        // unreachable peer's 5s connect timeout, in front of finality.
+        let vote = lock_node(node).cast_vote();
         // T17: compact announce — peers that already have the block (e.g. via
         // another peer's relay) cost one 40-byte message, not the whole block.
         if let Some(block) = lat_chain::Block::decode(&bytes) {
             let id = block.header.id();
-            for peer in peers {
+            for peer in &peers {
                 let _ = lat_p2p::announce_block_compact(peer.as_str(), &id, height, &bytes);
+                if let Some((vote_bytes, _)) = &vote {
+                    let _ = lat_p2p::announce_vote(peer.as_str(), vote_bytes);
+                }
             }
         }
-        cast_and_announce_vote(node);
+        if let Some((_, Some(cert))) = &vote {
+            println!("[finality] height {height} finalized (certificate formed)");
+            for peer in &peers {
+                let _ = lat_p2p::announce_cert(peer.as_str(), cert);
+            }
+        }
     }
 }
 

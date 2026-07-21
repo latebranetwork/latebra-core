@@ -21,6 +21,13 @@ after one means starting from a new genesis.
   moment they adopt a gossiped tip, and flood the vote (and any certificate it
   completes) alongside the block, so a quorum converges within the block that
   produced it. Covered by a regression test that fails without the fix.
+- **Votes no longer queue behind the whole block-forwarding loop.** Both the
+  miner and the gossip handler announced the block to every peer and only then
+  sent any vote, so finality waited on the full sequential loop — including a
+  5s `CONNECT_TIMEOUT` for each unreachable peer. Each peer is now sent the
+  block and the vote back to back. The ordering matters and is deliberate: a
+  vote for a block the receiver does not yet hold is dropped rather than
+  queued, so a vote must trail its own block to that same peer.
 
 ## [0.1.0] — 2026-07-21
 

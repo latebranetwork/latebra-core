@@ -1119,22 +1119,28 @@ fn handle_conn(mut stream: TcpStream, node: SharedNode) -> io::Result<()> {
                     let peers = lock_node(&node).peers();
                     let fwd = bytes.clone();
                     thread::spawn(move || {
-                        // T17: forward compactly — peers that already hold the
-                        // block cost one 40-byte announce, not a whole block.
                         let (id, height) = header.expect("accepted block decodes");
+                        // Per peer: block first, then our vote for it — NOT all
+                        // blocks then all votes. `add_vote` drops a vote for a
+                        // block the receiver does not yet hold (it is not
+                        // queued), so the vote has to trail its own block to
+                        // that same peer. Doing every block before any vote
+                        // instead puts the whole forwarding loop, and each
+                        // unreachable peer's CONNECT_TIMEOUT, in front of
+                        // finality.
                         for p in &peers {
+                            // T17: forward compactly — peers that already hold
+                            // the block cost one 40-byte announce, not a block.
                             let _ = announce_block_compact(p.as_str(), &id, height, &fwd);
-                        }
-                        // Flood the vote (and any certificate it just completed)
-                        // the same way, so the quorum converges within the block.
-                        if let Some((vote_bytes, cert)) = vote {
-                            for p in &peers {
-                                let _ = announce_vote(p.as_str(), &vote_bytes);
+                            if let Some((vote_bytes, _)) = &vote {
+                                let _ = announce_vote(p.as_str(), vote_bytes);
                             }
-                            if let Some(cert) = cert {
-                                for p in &peers {
-                                    let _ = announce_cert(p.as_str(), &cert);
-                                }
+                        }
+                        // A certificate is worth having even without the block:
+                        // it is verified against the receiver's own chain.
+                        if let Some((_, Some(cert))) = &vote {
+                            for p in &peers {
+                                let _ = announce_cert(p.as_str(), cert);
                             }
                         }
                     });
