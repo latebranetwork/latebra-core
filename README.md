@@ -44,6 +44,19 @@ BSD) — it does not derive from, or carry the license of, any other project.
 
 ## Quick start
 
+**Download a prebuilt binary** — no Rust toolchain needed — from the
+[latest release](https://github.com/latebranetwork/latebra-core/releases/latest)
+(Linux, Windows, macOS Intel + Apple silicon), then:
+
+```sh
+./latebrad --data ./latebra-data/chain.db --listen 0.0.0.0:4040 --peer <seed-host>:4040
+```
+
+[INSTALL.md](INSTALL.md) is the full walkthrough: verifying the download,
+joining the network, mining, wallet and explorer.
+
+### From source
+
 Requires a recent Rust toolchain. **Always build in release** — the elliptic-curve
 math is ~15× slower unoptimized.
 
@@ -65,6 +78,7 @@ cargo test
 
 | Doc | What it covers |
 |---|---|
+| [INSTALL.md](INSTALL.md) | Download a release binary and run a node, wallet & explorer |
 | [TESTNET.md](TESTNET.md) | Running & joining a node, wallet, explorer |
 | [DEPLOY.md](DEPLOY.md) | Full VPS deployment: chain, explorer, wallet, site, public API behind HTTPS |
 | [RPC.md](RPC.md) | The public JSON-RPC 2.0 developer API (methods, CORS, exposure model) |

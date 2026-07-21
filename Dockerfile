@@ -14,9 +14,11 @@ COPY crates ./crates
 RUN cargo build --release -p latebrad -p lat-explorer -p lat-wallet-cli -p lat-wallet-web
 
 FROM debian:bookworm-slim
-COPY --from=builder /src/target/release/latebrad      /usr/local/bin/
-COPY --from=builder /src/target/release/lat-explorer  /usr/local/bin/
-COPY --from=builder /src/target/release/lat-wallet-cli /usr/local/bin/
+# NB: the `lat-wallet-cli` package builds a binary named `lat-wallet` (see its
+# [[bin]] section) — copying `lat-wallet-cli` here fails the build.
+COPY --from=builder /src/target/release/latebrad       /usr/local/bin/
+COPY --from=builder /src/target/release/lat-explorer   /usr/local/bin/
+COPY --from=builder /src/target/release/lat-wallet     /usr/local/bin/
 COPY --from=builder /src/target/release/lat-wallet-web /usr/local/bin/
 VOLUME /data
 # P2P + RPC / HTTP metrics

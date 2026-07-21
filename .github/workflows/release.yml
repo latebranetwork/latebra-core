@@ -1,0 +1,163 @@
+# Latebra release: cross-platform binaries attached to a GitHub Release.
+#
+# Trigger by pushing a version tag:
+#
+#   git tag -a v0.1.0 -m "Latebra v0.1.0 (testnet)" && git push origin v0.1.0
+#
+# Produces one archive per platform, each containing the four binaries an
+# operator actually needs plus the docs and licences, and a SHA256SUMS.txt
+# covering every archive. `workflow_dispatch` builds the same artifacts without
+# publishing, so the pipeline can be exercised before a real tag exists.
+#
+# Deliberately NOT shipped: `latfun` (launchpad backend — its own repo/deploy),
+# `lat-node` (scripted local demo) and `lat-attack` (internal load/fuzz tooling).
+#
+# Linux builds on ubuntu-22.04 rather than 24.04 on purpose: the binary links
+# against the builder's glibc, and 22.04's 2.35 runs on every still-supported
+# distro. Building on 24.04 would emit binaries that refuse to start on Ubuntu
+# 22.04 / Debian 12 VPSes, which is most of them.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: ".exe"
+            archive: zip
+          - os: macos-14
+            target: aarch64-apple-darwin
+            ext: ""
+            archive: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            ext: ""
+            archive: tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      # Release builds only. The curve arithmetic is ~15x slower unoptimised, so
+      # a debug binary would look like a broken node rather than a slow one.
+      - name: build
+        shell: bash
+        run: >
+          cargo build --release --locked --target ${{ matrix.target }}
+          -p latebrad -p lat-wallet-cli -p lat-explorer -p lat-wallet-web
+
+      - name: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            ver="${GITHUB_REF_NAME#v}"
+          else
+            ver="dev-${GITHUB_SHA:0:7}"
+          fi
+          name="latebra-${ver}-${{ matrix.target }}"
+          out="target/${{ matrix.target }}/release"
+          mkdir -p "dist/${name}"
+
+          # `lat-wallet-cli` builds a binary called `lat-wallet`.
+          for b in latebrad lat-wallet lat-explorer lat-wallet-web; do
+            cp "${out}/${b}${{ matrix.ext }}" "dist/${name}/"
+          done
+          cp README.md TESTNET.md RPC.md LICENSE-MIT LICENSE-APACHE "dist/${name}/"
+
+          cd dist
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a -tzip "${name}.zip" "${name}" > /dev/null
+          else
+            tar czf "${name}.tar.gz" "${name}"
+          fi
+          echo "ARCHIVE=${name}.${{ matrix.archive }}" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # One checksum file over every archive, so `sha256sum -c SHA256SUMS.txt`
+      # verifies a download without needing to know which platform it came from.
+      - name: checksums
+        run: cd dist && sha256sum ./* | sed 's| \./| |' > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      # Only a real tag publishes. A workflow_dispatch run stops here with the
+      # artifacts attached to the run, which is how you rehearse a release.
+      - name: publish release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            ## Latebra ${{ github.ref_name }} — testnet
+
+            > **Testnet only.** Latebra has **not** been through a professional
+            > security audit. Do not hold real value on it. Testnet LAT is
+            > worthless by design and the chain may be reset without notice.
+
+            ### Install
+
+            Download the archive for your platform below, verify it, and unpack:
+
+            ```sh
+            sha256sum -c SHA256SUMS.txt --ignore-missing
+            tar xzf latebra-*-x86_64-unknown-linux-gnu.tar.gz
+            cd latebra-*/
+            ```
+
+            ### Run a node
+
+            ```sh
+            ./latebrad --data ./latebra-data/chain.db --listen 0.0.0.0:4040
+            ```
+
+            See [INSTALL.md](INSTALL.md) for the full walkthrough (joining the
+            network, mining, wallet, explorer) and [TESTNET.md](TESTNET.md) for
+            operating notes. **Sync first, mine second** — starting a fresh node
+            with `--mine` forks you onto your own private chain.
+
+            Each archive contains `latebrad` (node daemon), `lat-wallet` (CLI
+            wallet), `lat-explorer` (block explorer) and `lat-wallet-web` (web
+            wallet).
