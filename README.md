@@ -87,6 +87,7 @@ cargo test
 | [SECURITY.md](SECURITY.md) | Reporting a vulnerability privately, and what's in scope |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Building, the CI gate, and the bar for consensus/crypto changes |
 | [CHANGELOG.md](CHANGELOG.md) | What changed in each release |
+| [BENCHMARK.md](BENCHMARK.md) | End-to-end soak results: every tx type, measured costs, known limits |
 
 ## Architecture
 

@@ -25,6 +25,12 @@ path = "examples/bench.rs"
 name = "loadtest"
 path = "examples/loadtest.rs"
 
+# End-to-end soak over every transaction type the chain accepts.
+# Run with: cargo run --release --example soak -p lat-attack
+[[example]]
+name = "soak"
+path = "examples/soak.rs"
+
 [dependencies]
 lat-crypto.workspace = true
 lat-types.workspace = true
@@ -34,3 +40,4 @@ lat-wallet.workspace = true
 lat-vm.workspace = true
 lat-p2p.workspace = true
 rand.workspace = true
+sha2.workspace = true
