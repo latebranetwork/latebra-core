@@ -5,8 +5,8 @@ every transaction type the chain accepts through the real wallet, cryptography
 and consensus code — no mocks — mines them into real proof-of-work blocks, and
 checks the ledger's invariants afterwards.
 
-**Run date:** 2026-07-21 · **Build:** release · **Machine:** Windows 11, single
-node, in-process (no network) · **Parameters:** 300 wallets, 12 rounds.
+**Run date:** 2026-07-21 (10k soak + live 2-node testnet) · **Build:** release · **Machine:** Windows 11, single
+node, in-process (no network) · **Parameters:** 500 wallets, 20 rounds.
 
 > These are **single-machine, in-process** numbers. There is no gossip, no
 > propagation delay and no competing miners, so they are an upper bound on the
@@ -16,15 +16,15 @@ node, in-process (no network) · **Parameters:** 300 wallets, 12 rounds.
 ## Result
 
 ```
-transactions attempted : 3415
-transactions applied   : 3415
-blocks mined           : 33
-wall clock             : 76.88s
-mine+apply per block   : 490.9 ms
+transactions attempted : 9634
+transactions applied   : 9634
+blocks mined           : 41
+wall clock             : 80.09s
+mine+apply per block   : 395.0 ms
 ERRORS: none
 ```
 
-**3415 of 3415 transactions applied. No errors.** All invariants held:
+**9634 of 9634 transactions applied. No errors.** All invariants held:
 confidential balances all decrypted cleanly, all 12 bonding curves kept sane
 reserves, and all 12 AMM pools kept both sides funded.
 

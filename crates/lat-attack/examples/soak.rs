@@ -280,8 +280,17 @@ fn main() {
                         (tokens.get(i % tokens.len().max(1)), chain.nonce(&w.id()))
                     {
                         let holding = chain.public_balance(&w.id(), tok).unwrap_or(0);
+                        // A curve locks for good once it has collected
+                        // GRADUATE_LAT (500 LAT), after which every trade is
+                        // correctly refused — trading has moved to the AMM pool.
+                        // At scale the curves do reach it, so skip them rather
+                        // than bank thousands of expected rejections.
+                        let graduated = chain.curve(tok).map(|c| c.graduated).unwrap_or(false);
+                        if graduated {
+                            // nothing to do on this curve any more
+                        }
                         // Sell back only what we actually hold, else buy more.
-                        if holding > 1_000 && round % 3 == 2 {
+                        else if holding > 1_000 && round % 3 == 2 {
                             if let Some(tx) = build(&mut rep, "CurveTrade(sell)", || {
                                 Some(w.curve_trade(tok, false, holding / 2, 1, FEE, n))
                             }) {

@@ -119,12 +119,13 @@ lat-wallet rollover  --seed <hex> --node 127.0.0.1:4040  # make received funds s
 Point `--node` at any reachable node's `ip:port`. Keys never leave the wallet; the
 node only sees ciphertexts. Received funds land in *pending* until you `rollover`.
 
-`anon-send` hides **who pays whom**: you spend from inside a ring of decoy
-accounts and the receiver is a one-time stealth address, so no on-chain field
-names either party (the amount is still public in this phase). It needs a few
-other funded accounts on-chain to hide among, and is limited to one anonymous
-spend per account per epoch (20 blocks). This path is **unaudited** — testnet
-only. The receiver detects incoming anonymous funds with `scan-stealth`.
+`anon-send` hides **who pays whom, and how much**: you spend from inside a ring
+of decoy accounts, the receiver is a one-time stealth address, and the amount is
+a Pedersen commitment — so no on-chain field names either party or the value
+(v3; see §9). Only the fee is public. It needs a few other funded accounts
+on-chain to hide among, and is limited to one anonymous spend per account per
+epoch (20 blocks). This path is **unaudited** — testnet only. The receiver
+detects incoming anonymous funds with `scan-stealth`.
 
 ## 6. Run the explorer
 

@@ -77,7 +77,7 @@ fn usage() {
     println!("  balance       --seed <hex> [--node]   show public + private + pending balance");
     println!("  register      --seed <hex> [--node]   register the account on-chain");
     println!("  send          --seed <hex> --to <addr> --amount <LAT> [--fee] [--node]   confidential transfer");
-    println!("  anon-send     --seed <hex> --to <addr> --amount <LAT> [--fee] [--ring <n>] [--node]  anonymous: sender hidden in a ring, receiver stealth (amount public)");
+    println!("  anon-send     --seed <hex> --to <addr> --amount <LAT> [--fee] [--ring <n>] [--node]  anonymous: sender hidden in a ring, receiver stealth, amount hidden (only the fee is public)");
     println!("  public-send   --seed <hex> --to <addr> --amount <LAT> [--fee] [--node]   transparent transfer");
     println!("  shield        --seed <hex> [--to <addr>] --amount <LAT> [--fee] [--node] public → private");
     println!("  shield-stealth--seed <hex> --to <addr> --amount <LAT> [--fee] [--node]   public → private, recipient hidden");
@@ -283,9 +283,15 @@ fn cmd_anon_send(flags: &HashMap<String, String>, network: Network, node: &str) 
         lat_types::Transaction::AnonTransfer { xfer, .. } => xfer.ring.len(),
         _ => 0,
     };
+    // The amount has been hidden since AnonTransfer v3 (a Pedersen `c_debit`
+    // commitment plus an aggregated range proof — it never appears in
+    // plaintext). This line still said "amount is public", which was left over
+    // from v2 and understated the protocol's actual privacy.
     println!(
-        "Sending {} anonymously — you hide among {ring} accounts; the receiver is a one-time stealth address (amount is public; fee {}).",
-        lat(amount), lat(fee)
+        "Sending {} anonymously — you hide among {ring} accounts; the receiver is a one-time \
+         stealth address, and the amount is hidden. Only the fee ({}) is public.",
+        lat(amount),
+        lat(fee)
     );
     println!("Note: one anonymous spend per epoch ({} blocks); if it misses the epoch, just resend.", lat_chain::EPOCH_BLOCKS);
     submit(node, &tx, "anonymous transfer")
