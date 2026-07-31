@@ -435,6 +435,7 @@ dependencies = [
  "lat-types",
  "lat-wallet",
  "rand",
+ "sha2",
 ]
 
 [[package]]

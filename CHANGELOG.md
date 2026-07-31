@@ -11,6 +11,17 @@ after one means starting from a new genesis.
 
 ## [Unreleased]
 
+### Added
+
+- **The CLI wallet can now reach every consensus feature.** `create-token`,
+  `market`, `curve-buy`, `curve-sell`, `swap`, `add-liquidity`,
+  `remove-liquidity`, `htlc-lock`, `htlc-claim`, `htlc-refund`,
+  `deploy-contract` and `call-contract`. Tokens, the native DEX, atomic swaps
+  and contracts have always been in consensus, but no shipped binary could
+  build those transactions — only the launchpad, which the release does not
+  include. A user who downloaded a release could not mint a token or trade,
+  despite both being advertised.
+
 ### Fixed
 
 - **Finality latency was bounded by a 15-second heartbeat, not by the block
@@ -28,6 +39,18 @@ after one means starting from a new genesis.
   block and the vote back to back. The ordering matters and is deliberate: a
   vote for a block the receiver does not yet hold is dropped rather than
   queued, so a vote must trail its own block to that same peer.
+- **The explorer defaulted to calling a testnet node "Mainnet".** `--mainnet`
+  defaulted to `127.0.0.1:4041`, which on a local testnet is the second testnet
+  node, so the switcher happily labelled testnet data as mainnet. Mainnet is now
+  off unless an operator names a node; the switch is hidden when unset, and
+  `?net=mainnet` falls back to testnet rather than mislabel the chain.
+- **`scripts/local-testnet.ps1` left the second node with no RPC.** Both nodes
+  used the default metrics port, so the second failed to bind and silently ran
+  with metrics and JSON-RPC disabled. Each node now gets its own port.
+- **`anon-send` no longer implies an anonymity it does not have.** A young chain
+  has few funded accounts to hide among, so the wallet would quietly build a
+  ring of 3 and still call the transfer anonymous. It now warns when the ring is
+  small and states the actual guess probability.
 
 ## [0.1.0] — 2026-07-21
 

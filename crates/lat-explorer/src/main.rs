@@ -32,7 +32,16 @@ const IC_CLOCK: &str = "<svg viewBox='0 0 24 24' fill='none' stroke='currentColo
 const IC_NET: &str = "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.7'><circle cx='12' cy='12' r='9'/><path d='M3 12h18M12 3c2.6 3 2.6 15 0 18M12 3c-2.6 3-2.6 15 0 18'/></svg>";
 const IC_TX: &str = "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'><path d='M17 3v12M17 15l4-4M17 15l-4-4M7 21V9M7 9 3 13M7 9l4 4'/></svg>";
 
+/// Whether a mainnet node was configured. Read by [`page`] (which has no access
+/// to [`Config`]) to decide whether to offer the Mainnet switch at all.
+static MAINNET_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn mainnet_enabled() -> bool {
+    *MAINNET_ENABLED.get().unwrap_or(&false)
+}
+
 struct Config {
+    /// Empty (or `off`) means no mainnet node — the switcher is hidden.
     mainnet: String,
     testnet: String,
     listen: String,
@@ -40,13 +49,22 @@ struct Config {
 
 impl Config {
     fn node(&self, net: &str) -> &str {
-        if net == "mainnet" { &self.mainnet } else { &self.testnet }
+        if net == "mainnet" && !self.mainnet.is_empty() {
+            &self.mainnet
+        } else {
+            &self.testnet
+        }
     }
 }
 
 fn main() {
+    // Mainnet is OFF unless an operator names a node. It used to default to
+    // 127.0.0.1:4041, which on a local testnet is the SECOND TESTNET NODE — so
+    // the explorer would happily label testnet data "Mainnet". Silently
+    // mislabelling which chain a balance is on is worse than offering no
+    // switcher, so there is no default any more.
     let mut cfg = Config {
-        mainnet: "127.0.0.1:4041".to_string(),
+        mainnet: String::new(),
         testnet: "127.0.0.1:4040".to_string(),
         listen: "127.0.0.1:8080".to_string(),
     };
@@ -54,7 +72,11 @@ fn main() {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--mainnet" => { i += 1; cfg.mainnet = args.get(i).cloned().unwrap_or(cfg.mainnet); }
+            "--mainnet" => {
+                i += 1;
+                let v = args.get(i).cloned().unwrap_or_default();
+                cfg.mainnet = if v == "off" { String::new() } else { v };
+            }
             "--testnet" => { i += 1; cfg.testnet = args.get(i).cloned().unwrap_or(cfg.testnet); }
             "--listen" => { i += 1; cfg.listen = args.get(i).cloned().unwrap_or(cfg.listen); }
             _ => {}
@@ -65,7 +87,12 @@ fn main() {
     let listener = TcpListener::bind(&cfg.listen).expect("bind explorer listen address");
     println!("Latscan explorer  →  http://{}", cfg.listen);
     println!("  testnet node: {}", cfg.testnet);
-    println!("  mainnet node: {}", cfg.mainnet);
+    if cfg.mainnet.is_empty() {
+        println!("  mainnet node: (none — pass --mainnet <host:port> to enable the switcher)");
+    } else {
+        println!("  mainnet node: {}", cfg.mainnet);
+    }
+    let _ = MAINNET_ENABLED.set(!cfg.mainnet.is_empty());
 
     let cfg = std::sync::Arc::new(cfg);
     for stream in listener.incoming().flatten() {
@@ -81,8 +108,10 @@ fn handle(stream: TcpStream, cfg: &Config) -> std::io::Result<()> {
     let target = line.split_whitespace().nth(1).unwrap_or("/").to_string();
 
     let (path, params) = parse_target(&target);
+    // ?net=mainnet only means anything if a mainnet node was configured;
+    // otherwise fall back to testnet rather than label testnet data "Mainnet".
     let net = match params.get("net").map(String::as_str) {
-        Some("mainnet") => "mainnet",
+        Some("mainnet") if mainnet_enabled() => "mainnet",
         _ => "testnet",
     };
     let node = cfg.node(net);
@@ -745,7 +774,8 @@ fn page(title: &str, body: &str, net: &str, status: &str, refresh: bool) -> Stri
          </div></footer>
          </body></html>",
         if status.is_empty() { "" } else { " · " },
-        pill("mainnet", "Mainnet"),
+        // Only offer the Mainnet switch when a mainnet node actually exists.
+        if mainnet_enabled() { pill("mainnet", "Mainnet") } else { String::new() },
         pill("testnet", "Testnet"),
         css = css(),
         logo = LOGO,

@@ -59,6 +59,21 @@ fn main() {
         "stake" => cmd_stake(&flags, network, &node),
         "unstake" => cmd_unstake(&flags, network, &node),
         "staking" => cmd_staking(&flags, network, &node),
+        // Tokens, the native DEX, HTLC swaps and contracts. These transaction
+        // types have always been in consensus, but until now no shipped client
+        // could build them — only the launchpad, which is not in the release.
+        "create-token" => cmd_create_token(&flags, network, &node),
+        "market" => cmd_market(&flags, network, &node),
+        "curve-buy" => cmd_curve_trade(&flags, network, &node, true),
+        "curve-sell" => cmd_curve_trade(&flags, network, &node, false),
+        "swap" => cmd_swap(&flags, network, &node),
+        "add-liquidity" => cmd_add_liquidity(&flags, network, &node),
+        "remove-liquidity" => cmd_remove_liquidity(&flags, network, &node),
+        "htlc-lock" => cmd_htlc_lock(&flags, network, &node),
+        "htlc-claim" => cmd_htlc_claim(&flags, network, &node),
+        "htlc-refund" => cmd_htlc_refund(&flags, network, &node),
+        "deploy-contract" => cmd_deploy_contract(&flags, network, &node),
+        "call-contract" => cmd_call_contract(&flags, network, &node),
         _ => {
             usage();
             Ok(())
@@ -88,6 +103,22 @@ fn usage() {
     println!("                                        (--amount 0 claims matured unbonding funds)");
     println!("  unstake       --seed <hex> --amount <LAT> [--node]  begin unbonding stake");
     println!("  staking       --seed <hex> [--node]   show bonded stake + unbonding entries");
+    println!();
+    println!(" tokens & the native DEX");
+    println!("  create-token  --seed <hex> --ticker <SYM> --supply <units>   mint a token (supply is yours)");
+    println!("  market        --seed <hex> --token <id>   show the bonding curve + AMM pool");
+    println!("  curve-buy     --seed <hex> --token <id> --amount <LAT> [--min-out <units>]");
+    println!("  curve-sell    --seed <hex> --token <id> --amount <units> [--min-out <units>]");
+    println!("  swap          --seed <hex> --token <id> [--in lat|token] --amount <n> [--min-out <n>]");
+    println!("  add-liquidity --seed <hex> --token <id> --lat <LAT> --tokens <units>");
+    println!("  remove-liquidity --seed <hex> --token <id> --shares <n>");
+    println!();
+    println!(" atomic swaps (HTLC) & contracts");
+    println!("  htlc-lock     --seed <hex> --to <addr> --amount <LAT> [--token <id>] [--secret <hex>] [--expiry <blocks>]");
+    println!("  htlc-claim    --seed <hex> --id <hex> --secret <hex>");
+    println!("  htlc-refund   --seed <hex> --id <hex>       reclaim after expiry");
+    println!("  deploy-contract --seed <hex> --code <hex>");
+    println!("  call-contract --seed <hex> --contract <hex> [--input <n>]");
     println!("  (add --network mainnet for mainnet addresses; default testnet)");
 }
 
@@ -293,6 +324,19 @@ fn cmd_anon_send(flags: &HashMap<String, String>, network: Network, node: &str) 
         lat(amount),
         lat(fee)
     );
+    // Sender anonymity IS the ring size — a ring of 2 means a 50/50 guess. On a
+    // young chain there are barely any funded accounts to hide among, so the
+    // wallet silently produces a tiny ring. Say so rather than let the word
+    // "anonymous" imply a strength the set does not have.
+    if ring < 5 {
+        println!(
+            "WARNING: only {ring} accounts in your ring — an observer has a 1-in-{ring} guess at the sender."
+        );
+        println!(
+            "         This chain does not yet have enough funded accounts to hide among. Wait for more \
+             activity, or raise --ring once it does, before treating this as private."
+        );
+    }
     println!("Note: one anonymous spend per epoch ({} blocks); if it misses the epoch, just resend.", lat_chain::EPOCH_BLOCKS);
     submit(node, &tx, "anonymous transfer")
 }
@@ -380,6 +424,293 @@ fn cmd_scan_stealth(flags: &HashMap<String, String>, network: Network, node: &st
         println!("(These are held in one-time accounts only this wallet can derive; CLI claiming is a follow-up.)");
     }
     Ok(())
+}
+
+// --------------------------------------------------------------------------
+// Tokens, DEX, HTLC swaps, contracts
+// --------------------------------------------------------------------------
+
+/// A token id. There is no ticker→id lookup in the node's binary RPC, so these
+/// commands take the numeric id; `create-token` prints it, and the JSON-RPC
+/// `lat_token` method resolves a ticker if you have the metrics port.
+fn require_token(flags: &HashMap<String, String>) -> Result<u32, String> {
+    flags
+        .get("token")
+        .ok_or("missing --token <id> (the numeric token id; see `create-token` output)")?
+        .parse()
+        .map_err(|_| "bad --token: expected a number".to_string())
+}
+
+/// A raw count of token units (NOT LAT — tokens carry their own supply and are
+/// not scaled by the 5-decimal LAT unit).
+fn require_units(flags: &HashMap<String, String>, flag: &str) -> Result<u64, String> {
+    flags
+        .get(flag)
+        .ok_or(format!("missing --{flag} <units>"))?
+        .parse()
+        .map_err(|_| format!("bad --{flag}: expected a whole number of units"))
+}
+
+fn parse_hex32(s: &str, what: &str) -> Result<[u8; 32], String> {
+    let bytes = (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2).unwrap_or("zz"), 16))
+        .collect::<Result<Vec<u8>, _>>()
+        .map_err(|_| format!("bad --{what}: expected hex"))?;
+    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| format!("bad --{what}: expected 64 hex chars"))
+}
+
+fn hex32(b: &[u8; 32]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn cmd_create_token(
+    flags: &HashMap<String, String>,
+    network: Network,
+    node: &str,
+) -> Result<(), String> {
+    let w = wallet(flags, network)?;
+    let ticker = flags.get("ticker").ok_or("missing --ticker <SYMBOL>")?;
+    let supply = require_units(flags, "supply")?;
+    if supply == 0 {
+        return Err("--supply must be greater than zero".to_string());
+    }
+    let tx = w.create_token(ticker, supply);
+    println!(
+        "Creating token ${} with a fixed supply of {supply} units — the whole supply goes to you.",
+        ticker.to_uppercase()
+    );
+    println!("Tickers are globally unique and case-insensitive: $doge, DOGE and Doge are one token.");
+    submit(node, &tx, "token creation")
+}
+
+/// Read-only: the AMM pool and bonding curve for a token, plus your LP shares.
+fn cmd_market(flags: &HashMap<String, String>, network: Network, node: &str) -> Result<(), String> {
+    let w = wallet(flags, network)?;
+    let token = require_token(flags)?;
+
+    match lat_p2p::get_curve(node, token).map_err(net_err(node))? {
+        Some((vlat, vtok, real_lat, graduated)) => {
+            println!("Bonding curve for token {token}:");
+            println!("  virtual reserves : {vlat} LAT-units / {vtok} token-units");
+            println!("  real LAT held    : {}", lat(real_lat));
+            println!(
+                "  status           : {}",
+                if graduated {
+                    "GRADUATED — the curve is locked; trade the AMM pool instead"
+                } else {
+                    "open for buys and sells"
+                }
+            );
+        }
+        None => println!("Bonding curve for token {token}: none yet (the first buy opens it)."),
+    }
+
+    match lat_p2p::get_pool(node, token).map_err(net_err(node))? {
+        Some((lat_res, tok_res, lp_supply)) => {
+            println!("AMM pool for token {token}:");
+            println!("  reserves   : {} / {tok_res} token-units", lat(lat_res));
+            println!("  LP supply  : {lp_supply}");
+            let mine = lat_p2p::get_lp_shares(node, token, w.id()).map_err(net_err(node))?;
+            println!("  your shares: {mine}");
+        }
+        None => println!("AMM pool for token {token}: none yet (add liquidity to open it)."),
+    }
+    Ok(())
+}
+
+fn cmd_curve_trade(
+    flags: &HashMap<String, String>,
+    network: Network,
+    node: &str,
+    is_buy: bool,
+) -> Result<(), String> {
+    let w = wallet(flags, network)?;
+    let token = require_token(flags)?;
+    let fee = fee_from(flags)?;
+    // A buy spends LAT; a sell spends token units.
+    let amount = if is_buy { require_amount(flags)? } else { require_units(flags, "amount")? };
+    let min_out = flags.get("min-out").map(|s| s.parse().unwrap_or(1)).unwrap_or(1);
+
+    if let Some((.., graduated)) = lat_p2p::get_curve(node, token).map_err(net_err(node))? {
+        if graduated {
+            return Err(format!(
+                "token {token}'s curve has graduated and is locked — use `swap` against the AMM pool"
+            ));
+        }
+    }
+
+    let nonce = nonce_of(node, &w)?;
+    let tx = w.curve_trade(token, is_buy, amount, min_out, fee, nonce);
+    if is_buy {
+        println!("Buying token {token} on its bonding curve with {} (fee {})", lat(amount), lat(fee));
+    } else {
+        println!("Selling {amount} units of token {token} back to its curve (fee {})", lat(fee));
+    }
+    submit(node, &tx, "curve trade")
+}
+
+fn cmd_swap(flags: &HashMap<String, String>, network: Network, node: &str) -> Result<(), String> {
+    let w = wallet(flags, network)?;
+    let token = require_token(flags)?;
+    let fee = fee_from(flags)?;
+    // --in says which side you are paying with.
+    let lat_in = match flags.get("in").map(String::as_str) {
+        Some("lat") | None => true,
+        Some("token") => false,
+        Some(other) => return Err(format!("bad --in {other}: expected `lat` or `token`")),
+    };
+    let amount_in = if lat_in { require_amount(flags)? } else { require_units(flags, "amount")? };
+    let min_out = flags.get("min-out").map(|s| s.parse().unwrap_or(1)).unwrap_or(1);
+
+    if lat_p2p::get_pool(node, token).map_err(net_err(node))?.is_none() {
+        return Err(format!("token {token} has no AMM pool yet — `add-liquidity` opens one"));
+    }
+    let nonce = nonce_of(node, &w)?;
+    let tx = w.swap(token, lat_in, amount_in, min_out, fee, nonce);
+    println!(
+        "Swapping {} for token {token} (fee {}); min out {min_out} units",
+        if lat_in { lat(amount_in) } else { format!("{amount_in} token-units") },
+        lat(fee)
+    );
+    if min_out <= 1 {
+        println!("NOTE: --min-out is unset, so this accepts ANY price. Set it to bound slippage.");
+    }
+    submit(node, &tx, "swap")
+}
+
+fn cmd_add_liquidity(
+    flags: &HashMap<String, String>,
+    network: Network,
+    node: &str,
+) -> Result<(), String> {
+    let w = wallet(flags, network)?;
+    let token = require_token(flags)?;
+    let fee = fee_from(flags)?;
+    let lat_amount = parse_lat(flags.get("lat").ok_or("missing --lat <LAT>")?)?;
+    let tok_amount = require_units(flags, "tokens")?;
+    let nonce = nonce_of(node, &w)?;
+    let tx = w.add_liquidity(token, lat_amount, tok_amount, fee, nonce);
+    println!("Adding {} + {tok_amount} units of token {token} as liquidity (fee {})", lat(lat_amount), lat(fee));
+    if lat_p2p::get_pool(node, token).map_err(net_err(node))?.is_some() {
+        println!("NOTE: this pool exists, so your deposit must match its CURRENT ratio or it is rejected.");
+    }
+    submit(node, &tx, "add liquidity")
+}
+
+fn cmd_remove_liquidity(
+    flags: &HashMap<String, String>,
+    network: Network,
+    node: &str,
+) -> Result<(), String> {
+    let w = wallet(flags, network)?;
+    let token = require_token(flags)?;
+    let fee = fee_from(flags)?;
+    let shares = require_units(flags, "shares")?;
+    let nonce = nonce_of(node, &w)?;
+    let tx = w.remove_liquidity(token, shares, fee, nonce);
+    println!("Redeeming {shares} LP shares from token {token}'s pool (fee {})", lat(fee));
+    submit(node, &tx, "remove liquidity")
+}
+
+fn cmd_htlc_lock(
+    flags: &HashMap<String, String>,
+    network: Network,
+    node: &str,
+) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    let w = wallet(flags, network)?;
+    let token = flags.get("token").map(|s| s.parse().unwrap_or(LAT_TOKEN)).unwrap_or(LAT_TOKEN);
+    let to = require_addr(flags)?;
+    let fee = fee_from(flags)?;
+    let amount = if token == LAT_TOKEN { require_amount(flags)? } else { require_units(flags, "amount")? };
+    // The secret is the preimage; the chain only ever sees its SHA-256 hash
+    // until the claim reveals it. Generated here unless supplied.
+    let secret = match flags.get("secret") {
+        Some(s) => parse_hex32(s, "secret")?,
+        None => {
+            let mut b = [0u8; 32];
+            use rand::RngCore;
+            OsRng.fill_bytes(&mut b);
+            b
+        }
+    };
+    let hashlock: [u8; 32] = Sha256::digest(secret).into();
+    let blocks: u64 = flags.get("expiry").map(|s| s.parse().unwrap_or(200)).unwrap_or(200);
+    let height = lat_p2p::get_height(node).map_err(net_err(node))?;
+    let expiry = height + blocks;
+    let nonce = nonce_of(node, &w)?;
+    let (tx, id) = w.htlc_lock(token, &to, amount, hashlock, expiry, fee, nonce);
+
+    println!("Locking {} for {} until height {expiry}", if token == LAT_TOKEN { lat(amount) } else { format!("{amount} units") }, to.encode());
+    println!("  htlc id : {}", hex32(&id));
+    println!("  secret  : {}  <- KEEP THIS. The receiver needs it to claim.", hex32(&secret));
+    println!("  hashlock: {}", hex32(&hashlock));
+    println!("If it is never claimed, reclaim your funds after height {expiry} with `htlc-refund --id <id>`.");
+    submit(node, &tx, "htlc lock")
+}
+
+fn cmd_htlc_claim(
+    flags: &HashMap<String, String>,
+    network: Network,
+    node: &str,
+) -> Result<(), String> {
+    let _ = wallet(flags, network)?; // seed is required for symmetry/validation
+    let id = parse_hex32(flags.get("id").ok_or("missing --id <hex>")?, "id")?;
+    let secret = parse_hex32(flags.get("secret").ok_or("missing --secret <hex>")?, "secret")?;
+    let tx = Wallet::htlc_claim(id, secret);
+    println!("Claiming HTLC {} by revealing the secret.", hex32(&id));
+    submit(node, &tx, "htlc claim")
+}
+
+fn cmd_htlc_refund(
+    flags: &HashMap<String, String>,
+    network: Network,
+    node: &str,
+) -> Result<(), String> {
+    let _ = wallet(flags, network)?;
+    let id = parse_hex32(flags.get("id").ok_or("missing --id <hex>")?, "id")?;
+    let tx = Wallet::htlc_refund(id);
+    println!("Refunding expired HTLC {} to its sender.", hex32(&id));
+    submit(node, &tx, "htlc refund")
+}
+
+fn cmd_deploy_contract(
+    flags: &HashMap<String, String>,
+    network: Network,
+    node: &str,
+) -> Result<(), String> {
+    let w = wallet(flags, network)?;
+    let code_hex = flags.get("code").ok_or("missing --code <hex bytecode>")?;
+    let code = (0..code_hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(code_hex.get(i..i + 2).unwrap_or("zz"), 16))
+        .collect::<Result<Vec<u8>, _>>()
+        .map_err(|_| "bad --code: expected hex bytecode".to_string())?;
+    if code.is_empty() {
+        return Err("--code is empty".to_string());
+    }
+    let tx = w.deploy_contract(code.clone());
+    println!("Deploying a {}-byte contract to the lat-vm.", code.len());
+    submit(node, &tx, "contract deploy")
+}
+
+fn cmd_call_contract(
+    flags: &HashMap<String, String>,
+    network: Network,
+    node: &str,
+) -> Result<(), String> {
+    let w = wallet(flags, network)?;
+    let contract = parse_hex32(flags.get("contract").ok_or("missing --contract <hex>")?, "contract")?;
+    let input: u64 = flags
+        .get("input")
+        .map(|s| s.parse().map_err(|_| "bad --input".to_string()))
+        .transpose()?
+        .unwrap_or(0);
+    let nonce = nonce_of(node, &w)?;
+    let tx = w.call_contract(contract, input, nonce);
+    println!("Calling contract {} with input {input}.", hex32(&contract));
+    submit(node, &tx, "contract call")
 }
 
 fn submit(node: &str, tx: &lat_types::Transaction, what: &str) -> Result<(), String> {

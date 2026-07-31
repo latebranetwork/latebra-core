@@ -30,19 +30,19 @@ New-Item -ItemType Directory -Force -Path $data | Out-Null
 
 Write-Host "Starting mining node on 127.0.0.1:4040..." -ForegroundColor Cyan
 $miner = Start-Process "$rel/latebrad.exe" `
-    -ArgumentList "--mine", "--data", "$data/a/chain.db", "--listen", "127.0.0.1:4040" `
+    -ArgumentList "--mine", "--data", "$data/a/chain.db", "--listen", "127.0.0.1:4040", "--metrics", "127.0.0.1:4090" `
     -PassThru -WindowStyle Hidden
 
 Start-Sleep -Seconds 2
 
 Write-Host "Starting syncing node on 127.0.0.1:4041 (peer of the miner)..." -ForegroundColor Cyan
 $peer = Start-Process "$rel/latebrad.exe" `
-    -ArgumentList "--data", "$data/b/chain.db", "--listen", "127.0.0.1:4041", "--peer", "127.0.0.1:4040" `
+    -ArgumentList "--data", "$data/b/chain.db", "--listen", "127.0.0.1:4041", "--metrics", "127.0.0.1:4091", "--peer", "127.0.0.1:4040" `
     -PassThru -WindowStyle Hidden
 
 Write-Host "Starting explorer on http://127.0.0.1:8080..." -ForegroundColor Cyan
 $exp = Start-Process "$rel/lat-explorer.exe" `
-    -ArgumentList "--testnet", "127.0.0.1:4040", "--listen", "127.0.0.1:8080" `
+    -ArgumentList "--testnet", "127.0.0.1:4040", "--mainnet", "off", "--listen", "127.0.0.1:8080" `
     -PassThru -WindowStyle Hidden
 
 Write-Host "Starting web wallet on http://127.0.0.1:8090..." -ForegroundColor Cyan
@@ -54,8 +54,8 @@ Write-Host ""
 Write-Host "Local testnet is running." -ForegroundColor Green
 Write-Host "  Explorer  : http://127.0.0.1:8080"
 Write-Host "  Web wallet: http://127.0.0.1:8090"
-Write-Host "  Miner RPC : 127.0.0.1:4040     (PID $($miner.Id))"
-Write-Host "  Peer RPC  : 127.0.0.1:4041     (PID $($peer.Id))"
+Write-Host "  Miner P2P : 127.0.0.1:4040   JSON-RPC/metrics: http://127.0.0.1:4090  (PID $($miner.Id))"
+Write-Host "  Peer  P2P : 127.0.0.1:4041   JSON-RPC/metrics: http://127.0.0.1:4091  (PID $($peer.Id))"
 Write-Host ""
 Write-Host "Open the web wallet, click 'Create new wallet', then get testnet coins" -ForegroundColor Yellow
 Write-Host "from the genesis faucet with the CLI:" -ForegroundColor Yellow

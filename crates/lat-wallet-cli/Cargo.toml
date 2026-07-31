@@ -16,3 +16,4 @@ lat-wallet.workspace = true
 lat-p2p.workspace = true
 lat-chain.workspace = true
 rand.workspace = true
+sha2.workspace = true
